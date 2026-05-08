@@ -138,7 +138,7 @@ async fn any_transaction_fires_webhook() {
         struct OpsEmb  { records: Vec<serde_json::Value> }
         let _ops: OpsPage = client.get(&ops_url).send().await.unwrap().json().await.unwrap();
 
-        let enriched = EnrichedTransaction::from_horizon(raw, None, None).unwrap();
+        let enriched = EnrichedTransaction::from_horizon(raw, None, None, None).unwrap();
         let payloads = evaluate(
             &contract.label,
             &contract.contract_id,
@@ -209,7 +209,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
                 successful: true, paging_token: "1".into(),
                 envelope_xdr: None, result_xdr: None,
             },
-            None, None,
+            None, None, None,
         ).unwrap(),
         EnrichedTransaction::from_horizon(
             txwatch_rules::HorizonTransaction {
@@ -217,7 +217,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
                 successful: false, paging_token: "2".into(),
                 envelope_xdr: None, result_xdr: None,
             },
-            None, None,
+            None, None, None,
         ).unwrap(),
     ];
 
@@ -261,6 +261,7 @@ async fn large_transfer_fires_above_threshold() {
         },
         None,
         Some(100_000_000_000),
+        None,
     ).unwrap();
 
     let payloads = evaluate(
@@ -301,7 +302,7 @@ async fn function_called_rule_fires_on_exact_match() {
                 successful: true, paging_token: "1".into(),
                 envelope_xdr: None, result_xdr: None,
             },
-            Some("deposit".into()), None,
+            Some("deposit".into()), None, None,
         ).unwrap(),
         // "withdraw" — SHOULD fire
         EnrichedTransaction::from_horizon(
@@ -310,7 +311,7 @@ async fn function_called_rule_fires_on_exact_match() {
                 successful: true, paging_token: "2".into(),
                 envelope_xdr: None, result_xdr: None,
             },
-            Some("withdraw".into()), None,
+            Some("withdraw".into()), None, None,
         ).unwrap(),
     ];
 

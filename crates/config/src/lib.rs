@@ -58,6 +58,8 @@ pub enum AlertRule {
     LargeTransfer       { threshold_xlm: u64 },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
+    /// Fires when the transaction's fee (in stroops) exceeds the threshold.
+    HighFee             { threshold_stroops: u64 },
 }
 
 impl AlertRule {
@@ -96,6 +98,14 @@ impl AlertRule {
                 }
             }
             AlertRule::AnyTransaction | AlertRule::TransactionFailed => {}
+            AlertRule::HighFee { threshold_stroops } => {
+                if *threshold_stroops == 0 {
+                    bail!(
+                        "contract '{}': HighFee threshold_stroops must be > 0",
+                        contract_label
+                    );
+                }
+            }
         }
         Ok(())
     }

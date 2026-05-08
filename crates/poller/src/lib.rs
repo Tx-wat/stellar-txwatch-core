@@ -140,7 +140,7 @@ async fn poll_contract(
             };
 
         // Build enriched transaction — timestamp parse errors are logged, not fatal.
-        let enriched = match EnrichedTransaction::from_horizon(raw_tx, function_name, amount_stroops) {
+        let enriched = match EnrichedTransaction::from_horizon(raw_tx, function_name, amount_stroops, None) {
             Ok(t)  => t,
             Err(e) => {
                 warn!(

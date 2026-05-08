@@ -36,6 +36,8 @@ pub struct EnrichedTransaction {
     pub function_name: Option<String>,
     /// Transfer amount in stroops (1 XLM = 10_000_000 stroops), if detected.
     pub amount_stroops: Option<u64>,
+    /// Fee charged for this transaction in stroops.
+    pub fee_charged_stroops: Option<u64>,
 }
 
 impl EnrichedTransaction {
@@ -44,6 +46,7 @@ impl EnrichedTransaction {
         tx: HorizonTransaction,
         function_name: Option<String>,
         amount_stroops: Option<u64>,
+        fee_charged_stroops: Option<u64>,
     ) -> Result<Self> {
         let timestamp = tx
             .created_at
@@ -59,6 +62,7 @@ impl EnrichedTransaction {
             paging_token: tx.paging_token,
             function_name,
             amount_stroops,
+            fee_charged_stroops,
         })
     }
 }
@@ -158,6 +162,11 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .as_deref()
             .map(|f| function_names.iter().any(|n| n == f))
             .unwrap_or(false),
+
+        AlertRule::HighFee { threshold_stroops } => tx
+            .fee_charged_stroops
+            .map(|f| f >= *threshold_stroops)
+            .unwrap_or(false),
     })
 }
 
@@ -170,6 +179,7 @@ fn rule_label(rule: &AlertRule) -> String {
         AlertRule::AdminFunctionCalled { function_names } => {
             format!("AdminFunctionCalled([{}])", function_names.join(", "))
         }
+        AlertRule::HighFee { threshold_stroops } => format!("HighFee(>={} stroops)", threshold_stroops),
     }
 }
 
@@ -194,12 +204,13 @@ mod tests {
         amount_stroops: Option<u64>,
     ) -> EnrichedTransaction {
         EnrichedTransaction {
-            hash:          "abc123".into(),
-            timestamp:     "2024-01-15T12:00:00Z".parse().unwrap(),
+            hash:                "abc123".into(),
+            timestamp:           "2024-01-15T12:00:00Z".parse().unwrap(),
             successful,
-            paging_token:  "100".into(),
-            function_name: function_name.map(str::to_string),
+            paging_token:        "100".into(),
+            function_name:       function_name.map(str::to_string),
             amount_stroops,
+            fee_charged_stroops: None,
         }
     }
 
@@ -314,6 +325,30 @@ mod tests {
     }
 
     #[test]
+    fn high_fee_fires_at_threshold() {
+        let mut tx = make_tx(true, None, None);
+        tx.fee_charged_stroops = Some(10_000);
+        let payloads = run(&[AlertRule::HighFee { threshold_stroops: 10_000 }], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].rule_triggered.contains("HighFee"));
+    }
+
+    #[test]
+    fn high_fee_does_not_fire_below_threshold() {
+        let mut tx = make_tx(true, None, None);
+        tx.fee_charged_stroops = Some(9_999);
+        let payloads = run(&[AlertRule::HighFee { threshold_stroops: 10_000 }], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn high_fee_no_fee_does_not_fire() {
+        let tx = make_tx(true, None, None);
+        let payloads = run(&[AlertRule::HighFee { threshold_stroops: 1 }], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
     fn enriched_transaction_parses_timestamp() {
         let raw = HorizonTransaction {
             hash:         "h1".into(),
@@ -323,7 +358,7 @@ mod tests {
             envelope_xdr: None,
             result_xdr:   None,
         };
-        let enriched = EnrichedTransaction::from_horizon(raw, None, None).unwrap();
+        let enriched = EnrichedTransaction::from_horizon(raw, None, None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
     }
 }
