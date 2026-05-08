@@ -1,4 +1,9 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -41,39 +46,71 @@ struct OpsEmbedded {
     records: Vec<HorizonOperation>,
 }
 
+// ── Summary counters ──────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct Counters {
+    transactions: AtomicU64,
+    alerts:       AtomicU64,
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Run the polling loop forever. Each contract is polled sequentially;
 /// a single bad transaction never stops the loop.
+/// Logs a summary every 60 seconds: contracts watched, transactions processed,
+/// alerts fired.
 pub async fn run(cfg: AppConfig) -> Result<()> {
     let client = Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
         .context("failed to build HTTP client")?;
 
-    // Start each contract cursor at "now" so we only see new transactions.
     let mut cursors: HashMap<String, String> = cfg
         .contracts
         .iter()
         .map(|c| (c.contract_id.clone(), "now".to_string()))
         .collect();
 
-    let interval = Duration::from_secs(cfg.poll_interval_seconds);
+    let interval      = Duration::from_secs(cfg.poll_interval_seconds);
+    let summary_every = Duration::from_secs(60);
+    let counters      = Arc::new(Counters::default());
+    let n_contracts   = cfg.contracts.len();
 
     info!(
-        contracts = cfg.contracts.len(),
+        contracts     = n_contracts,
         interval_secs = cfg.poll_interval_seconds,
         "TxWatch polling engine started"
     );
 
+    // Spawn the summary logger task.
+    let counters_clone = Arc::clone(&counters);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(summary_every).await;
+            info!(
+                contracts    = n_contracts,
+                transactions = counters_clone.transactions.load(Ordering::Relaxed),
+                alerts       = counters_clone.alerts.load(Ordering::Relaxed),
+                "60-second summary"
+            );
+        }
+    });
+
     loop {
         for contract in &cfg.contracts {
-            if let Err(e) = poll_contract(&client, contract, &mut cursors).await {
-                error!(
-                    contract = %contract.label,
-                    error    = %e,
-                    "poll cycle error — will retry next interval"
-                );
+            match poll_contract(&client, contract, &mut cursors).await {
+                Ok((txs, alerts)) => {
+                    counters.transactions.fetch_add(txs, Ordering::Relaxed);
+                    counters.alerts.fetch_add(alerts, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error!(
+                        contract = %contract.label,
+                        error    = %e,
+                        "poll cycle error — will retry next interval"
+                    );
+                }
             }
         }
         tokio::time::sleep(interval).await;
@@ -82,11 +119,12 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
+/// Returns `(transactions_processed, alerts_fired)`.
 async fn poll_contract(
     client:   &Client,
     contract: &WatchedContract,
     cursors:  &mut HashMap<String, String>,
-) -> Result<()> {
+) -> Result<(u64, u64)> {
     let cursor = cursors
         .get(&contract.contract_id)
         .cloned()
@@ -117,14 +155,15 @@ async fn poll_contract(
         );
     }
 
+    let mut tx_count    = 0u64;
+    let mut alert_count = 0u64;
+
     for raw_tx in records {
         let paging_token = raw_tx.paging_token.clone();
         let tx_hash      = raw_tx.hash.clone();
 
-        // Advance cursor regardless of whether enrichment succeeds.
         cursors.insert(contract.contract_id.clone(), paging_token.clone());
 
-        // Enrich with Soroban operation details — errors are logged, not fatal.
         let (function_name, amount_stroops) =
             match fetch_soroban_details(client, base, &tx_hash).await {
                 Ok(details) => details,
@@ -139,7 +178,6 @@ async fn poll_contract(
                 }
             };
 
-        // Build enriched transaction — timestamp parse errors are logged, not fatal.
         let enriched = match EnrichedTransaction::from_horizon(raw_tx, function_name, amount_stroops, None) {
             Ok(t)  => t,
             Err(e) => {
@@ -153,6 +191,8 @@ async fn poll_contract(
             }
         };
 
+        tx_count += 1;
+
         let payloads = evaluate(
             &contract.label,
             &contract.contract_id,
@@ -164,13 +204,19 @@ async fn poll_contract(
         );
 
         for payload in payloads {
+            alert_count += 1;
             info!(
                 contract = %contract.label,
                 rule     = %payload.rule_triggered,
                 tx       = %payload.transaction_hash,
                 "rule fired — sending webhook"
             );
-            if let Err(e) = send_webhook(client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref()).await {
+            if let Err(e) = send_webhook(
+                client,
+                &contract.webhook_url,
+                &payload,
+                contract.webhook_secret.as_deref(),
+            ).await {
                 error!(
                     contract = %contract.label,
                     rule     = %payload.rule_triggered,
@@ -182,20 +228,15 @@ async fn poll_contract(
         }
     }
 
-    Ok(())
+    Ok((tx_count, alert_count))
 }
 
 // ── Soroban operation enrichment ──────────────────────────────────────────────
 
-/// Fetch the operations for a transaction and extract:
-/// - the Soroban function name (from `invoke_host_function` ops)
-/// - the payment amount in stroops (from `payment` ops)
-///
-/// Returns `(None, None)` if the transaction has no relevant operations.
 async fn fetch_soroban_details(
-    client:   &Client,
-    base:     &str,
-    tx_hash:  &str,
+    client:  &Client,
+    base:    &str,
+    tx_hash: &str,
 ) -> Result<(Option<String>, Option<u64>)> {
     let url = format!("{}/transactions/{}/operations", base, tx_hash);
 
@@ -219,8 +260,6 @@ async fn fetch_soroban_details(
         }
         if op.op_type == "payment" {
             if let Some(amt_str) = op.amount {
-                // Horizon returns amounts as decimal strings with 7 decimal places.
-                // e.g. "1000.0000000" → 10_000_000_000 stroops
                 if let Ok(xlm) = amt_str.parse::<f64>() {
                     amount_stroops = Some((xlm * 10_000_000.0) as u64);
                 }
@@ -239,7 +278,6 @@ mod tests {
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Build a minimal Horizon transactions page JSON.
     #[allow(dead_code)]
     fn tx_page(hash: &str, paging_token: &str, successful: bool) -> serde_json::Value {
         serde_json::json!({
@@ -249,7 +287,7 @@ mod tests {
                     "created_at":   "2024-01-15T12:00:00Z",
                     "successful":   successful,
                     "paging_token": paging_token,
-                    "fee_charged": "100",
+                    "fee_charged":  "100",
                     "envelope_xdr": null,
                     "result_xdr":   null
                 }]
@@ -257,7 +295,6 @@ mod tests {
         })
     }
 
-    /// Build a minimal Horizon operations page JSON for an invoke_host_function.
     fn ops_page(function_name: &str) -> serde_json::Value {
         serde_json::json!({
             "_embedded": {
@@ -269,7 +306,6 @@ mod tests {
         })
     }
 
-    /// Empty transactions page.
     fn empty_page() -> serde_json::Value {
         serde_json::json!({ "_embedded": { "records": [] } })
     }
@@ -284,27 +320,10 @@ mod tests {
             .await;
 
         let client = Client::new();
-        let contract = txwatch_config::WatchedContract {
-            label:       "Test".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network:     txwatch_config::Network::Testnet,
-            rules:       vec![txwatch_config::AlertRule::AnyTransaction],
-            webhook_url: "https://example.com/hook".into(),
-            webhook_secret: None,
-        };
-
-        // Override the horizon URL by pointing the contract at our mock server.
-        // We test poll_contract indirectly via the public run() path; here we
-        // test the HTTP layer by calling the internal helper directly.
-        let mut cursors = HashMap::new();
-        cursors.insert(contract.contract_id.clone(), "now".to_string());
-
-        // We can't call poll_contract directly (it's private), so we verify
-        // the HTTP client parses an empty page without error.
         let url = format!(
             "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200",
             server.uri(),
-            contract.contract_id
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         );
         let page: HorizonPage = client.get(&url).send().await.unwrap().json().await.unwrap();
         assert!(page._embedded.records.is_empty());
@@ -315,17 +334,13 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path_regex("/transactions/.*/operations"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(ops_page("withdraw")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(ops_page("withdraw")))
             .mount(&server)
             .await;
 
         let client = Client::new();
         let (fn_name, amount) =
-            fetch_soroban_details(&client, &server.uri(), "abc123")
-                .await
-                .unwrap();
+            fetch_soroban_details(&client, &server.uri(), "abc123").await.unwrap();
 
         assert_eq!(fn_name.as_deref(), Some("withdraw"));
         assert!(amount.is_none());
@@ -335,12 +350,7 @@ mod tests {
     async fn fetch_soroban_details_extracts_payment_amount() {
         let server = MockServer::start().await;
         let ops = serde_json::json!({
-            "_embedded": {
-                "records": [{
-                    "type":   "payment",
-                    "amount": "1000.0000000"
-                }]
-            }
+            "_embedded": { "records": [{ "type": "payment", "amount": "1000.0000000" }] }
         });
         Mock::given(method("GET"))
             .and(path_regex("/transactions/.*/operations"))
@@ -350,9 +360,7 @@ mod tests {
 
         let client = Client::new();
         let (fn_name, amount) =
-            fetch_soroban_details(&client, &server.uri(), "abc123")
-                .await
-                .unwrap();
+            fetch_soroban_details(&client, &server.uri(), "abc123").await.unwrap();
 
         assert!(fn_name.is_none());
         assert_eq!(amount, Some(10_000_000_000));
@@ -370,9 +378,7 @@ mod tests {
 
         let client = Client::new();
         let (fn_name, amount) =
-            fetch_soroban_details(&client, &server.uri(), "abc123")
-                .await
-                .unwrap();
+            fetch_soroban_details(&client, &server.uri(), "abc123").await.unwrap();
 
         assert!(fn_name.is_none());
         assert!(amount.is_none());
