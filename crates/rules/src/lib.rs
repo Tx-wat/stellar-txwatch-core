@@ -168,6 +168,14 @@ fn rule_label(rule: &AlertRule) -> String {
     }
 }
 
+impl AlertPayload {
+    /// Builder helper to override the label (used by test-webhook).
+    pub fn with_label(mut self, label: String) -> Self {
+        self.label = label;
+        self
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
