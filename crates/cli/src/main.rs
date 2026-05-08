@@ -62,12 +62,15 @@ async fn main() -> Result<()> {
             for c in &cfg.contracts {
                 println!(
                     "  [{network}] {label}",
-                    network = c.network.as_str(),
+                    network = c.network.display_name(),
                     label   = c.label
                 );
-                println!("    contract_id : {}", c.contract_id);
-                println!("    webhook_url : {}", c.webhook_url);
-                println!("    rules       : {}", c.rules.len());
+                println!("    contract_id  : {}", c.contract_id);
+                println!("    webhook_url  : {}", c.webhook_url);
+                println!("    secret       : {}", if c.webhook_secret.is_some() { "set" } else { "none" });
+                println!("    rules        : {}", c.rules.len());
+                println!("    horizon      : {}", c.network.horizon_base_url());
+                println!("    explorer     : {}/contract/{}", c.network.explorer_base_url(), c.contract_id);
             }
         }
 
