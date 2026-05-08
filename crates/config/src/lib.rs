@@ -28,6 +28,24 @@ impl Network {
             Network::Futurenet => "futurenet",
         }
     }
+
+    /// Human-readable display name shown in logs and CLI output.
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Network::Mainnet   => "Stellar Mainnet",
+            Network::Testnet   => "Stellar Testnet",
+            Network::Futurenet => "Stellar Futurenet",
+        }
+    }
+
+    /// Stellar Expert explorer base URL for this network.
+    pub fn explorer_base_url(&self) -> &'static str {
+        match self {
+            Network::Mainnet   => "https://stellar.expert/explorer/public",
+            Network::Testnet   => "https://stellar.expert/explorer/testnet",
+            Network::Futurenet => "https://stellar.expert/explorer/futurenet",
+        }
+    }
 }
 
 // ── AlertRule ─────────────────────────────────────────────────────────────────
@@ -43,7 +61,7 @@ pub enum AlertRule {
 }
 
 impl AlertRule {
-    fn validate(&self, contract_label: &str) -> Result<()> {
+    pub fn validate(&self, contract_label: &str) -> Result<()> {
         match self {
             AlertRule::LargeTransfer { threshold_xlm } => {
                 if *threshold_xlm == 0 {
@@ -95,7 +113,7 @@ pub struct WatchedContract {
 }
 
 impl WatchedContract {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.label.trim().is_empty() {
             bail!("a contract has an empty label");
         }
@@ -148,9 +166,12 @@ impl AppConfig {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.poll_interval_seconds == 0 {
             bail!("poll_interval_seconds must be > 0");
+        }
+        if self.poll_interval_seconds > 3600 {
+            bail!("poll_interval_seconds must be <= 3600 (1 hour)");
         }
         if self.contracts.is_empty() {
             bail!("at least one [[contracts]] entry is required");
@@ -238,5 +259,34 @@ mod tests {
         assert!(Network::Mainnet.horizon_base_url().contains("horizon.stellar.org"));
         assert!(Network::Testnet.horizon_base_url().contains("testnet"));
         assert!(Network::Futurenet.horizon_base_url().contains("futurenet"));
+    }
+
+    #[test]
+    fn network_display_names() {
+        assert_eq!(Network::Mainnet.display_name(), "Stellar Mainnet");
+        assert_eq!(Network::Testnet.display_name(), "Stellar Testnet");
+        assert_eq!(Network::Futurenet.display_name(), "Stellar Futurenet");
+    }
+
+    #[test]
+    fn network_explorer_urls() {
+        assert!(Network::Mainnet.explorer_base_url().contains("public"));
+        assert!(Network::Testnet.explorer_base_url().contains("testnet"));
+    }
+
+    #[test]
+    fn rejects_poll_interval_over_max() {
+        let raw = r#"
+            poll_interval_seconds = 9999
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert!(cfg.validate().is_err());
     }
 }
