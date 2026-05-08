@@ -249,6 +249,7 @@ mod tests {
                     "created_at":   "2024-01-15T12:00:00Z",
                     "successful":   successful,
                     "paging_token": paging_token,
+                    "fee_charged": "100",
                     "envelope_xdr": null,
                     "result_xdr":   null
                 }]

@@ -207,7 +207,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
             txwatch_rules::HorizonTransaction {
                 hash: "ok_tx".into(), created_at: "2024-06-01T10:00:00Z".into(),
                 successful: true, paging_token: "1".into(),
-                envelope_xdr: None, result_xdr: None,
+                fee_charged: None, envelope_xdr: None, result_xdr: None,
             },
             None, None, None,
         ).unwrap(),
@@ -215,7 +215,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
             txwatch_rules::HorizonTransaction {
                 hash: "fail_tx".into(), created_at: "2024-06-01T10:01:00Z".into(),
                 successful: false, paging_token: "2".into(),
-                envelope_xdr: None, result_xdr: None,
+                fee_charged: None, envelope_xdr: None, result_xdr: None,
             },
             None, None, None,
         ).unwrap(),
@@ -257,7 +257,7 @@ async fn large_transfer_fires_above_threshold() {
         txwatch_rules::HorizonTransaction {
             hash: "big_tx".into(), created_at: "2024-06-01T10:00:00Z".into(),
             successful: true, paging_token: "1".into(),
-            envelope_xdr: None, result_xdr: None,
+            fee_charged: None, envelope_xdr: None, result_xdr: None,
         },
         None,
         Some(100_000_000_000),
@@ -300,7 +300,7 @@ async fn function_called_rule_fires_on_exact_match() {
             txwatch_rules::HorizonTransaction {
                 hash: "t1".into(), created_at: "2024-06-01T10:00:00Z".into(),
                 successful: true, paging_token: "1".into(),
-                envelope_xdr: None, result_xdr: None,
+                fee_charged: None, envelope_xdr: None, result_xdr: None,
             },
             Some("deposit".into()), None, None,
         ).unwrap(),
@@ -309,7 +309,7 @@ async fn function_called_rule_fires_on_exact_match() {
             txwatch_rules::HorizonTransaction {
                 hash: "t2".into(), created_at: "2024-06-01T10:01:00Z".into(),
                 successful: true, paging_token: "2".into(),
-                envelope_xdr: None, result_xdr: None,
+                fee_charged: None, envelope_xdr: None, result_xdr: None,
             },
             Some("withdraw".into()), None, None,
         ).unwrap(),

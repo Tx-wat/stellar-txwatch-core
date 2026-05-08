@@ -12,10 +12,10 @@ pub struct HorizonTransaction {
     pub created_at:   String,   // RFC 3339
     pub successful:   bool,
     pub paging_token: String,
-
+    /// Fee charged in stroops (Horizon returns this as a string).
+    pub fee_charged:  Option<String>,
     /// Base64-encoded XDR transaction envelope.
     pub envelope_xdr: Option<String>,
-
     /// Base64-encoded XDR transaction result.
     pub result_xdr:   Option<String>,
 }
@@ -62,7 +62,11 @@ impl EnrichedTransaction {
             paging_token: tx.paging_token,
             function_name,
             amount_stroops,
-            fee_charged_stroops,
+            fee_charged_stroops: fee_charged_stroops.or_else(|| {
+                tx.fee_charged
+                    .as_deref()
+                    .and_then(|s| s.parse::<u64>().ok())
+            }),
         })
     }
 }
@@ -355,6 +359,7 @@ mod tests {
             created_at:   "2024-06-01T00:00:00Z".into(),
             successful:   true,
             paging_token: "1".into(),
+            fee_charged:  Some("100".into()),
             envelope_xdr: None,
             result_xdr:   None,
         };
