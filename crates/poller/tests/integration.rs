@@ -150,7 +150,7 @@ async fn any_transaction_fires_webhook() {
         assert_eq!(payloads.len(), 1);
 
         for payload in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, payload)
+            txwatch_notifier::send_webhook(&client, &contract.webhook_url, payload, None)
                 .await
                 .unwrap();
         }
@@ -228,7 +228,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
             &contract.rules, tx,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p)
+            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
                 .await.unwrap();
         }
     }
@@ -271,7 +271,7 @@ async fn large_transfer_fires_above_threshold() {
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].amount_xlm, Some(10_000));
 
-    txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0])
+    txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None)
         .await.unwrap();
 }
 
@@ -321,7 +321,7 @@ async fn function_called_rule_fires_on_exact_match() {
             &contract.rules, tx,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p)
+            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
                 .await.unwrap();
         }
     }

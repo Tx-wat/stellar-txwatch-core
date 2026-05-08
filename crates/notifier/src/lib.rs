@@ -9,19 +9,28 @@ const MAX_RETRIES: u32 = 3;
 
 /// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
 /// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
-pub async fn send_webhook(client: &Client, url: &str, payload: &AlertPayload) -> Result<()> {
+/// If `secret` is Some, adds an `X-TxWatch-Secret` header to every request.
+pub async fn send_webhook(
+    client:  &Client,
+    url:     &str,
+    payload: &AlertPayload,
+    secret:  Option<&str>,
+) -> Result<()> {
     let body = serde_json::to_string(payload)?;
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_RETRIES {
         let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
 
-        match client
+        let mut req = client
             .post(url)
             .header("Content-Type", "application/json")
-            .body(body.clone())
-            .send()
-            .await
+            .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
+            .body(body.clone());
+        if let Some(s) = secret {
+            req = req.header("X-TxWatch-Secret", s);
+        }
+        match req.send().await
         {
             Ok(resp) if resp.status().is_success() => {
                 info!(
@@ -129,7 +138,7 @@ mod tests {
 
         let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload()).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None).await;
         assert!(result.is_ok());
     }
 
@@ -151,7 +160,7 @@ mod tests {
 
         let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload()).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None).await;
         assert!(result.is_ok());
     }
 
@@ -166,7 +175,7 @@ mod tests {
 
         let client = Client::new();
         let url = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload()).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None).await;
         assert!(result.is_err());
     }
 

@@ -170,7 +170,7 @@ async fn poll_contract(
                 tx       = %payload.transaction_hash,
                 "rule fired — sending webhook"
             );
-            if let Err(e) = send_webhook(client, &contract.webhook_url, &payload).await {
+            if let Err(e) = send_webhook(client, &contract.webhook_url, &payload, None).await {
                 error!(
                     contract = %contract.label,
                     rule     = %payload.rule_triggered,

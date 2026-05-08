@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
                 .context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");
-            send_webhook(&client, &url, &payload)
+            send_webhook(&client, &url, &payload, None)
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
             println!("Test webhook delivered successfully to {}", url);
