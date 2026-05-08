@@ -2,13 +2,13 @@
 
 Real-time Soroban contract monitoring and webhook alert engine for Stellar.
 
-Part of the [Veritas Vaults Network](https://github.com/Veritas-Vaults-Network) ecosystem.
+Part of the [Tx-wat](https://github.com/Tx-wat) ecosystem.
 
 ## Quickstart
 
 ```bash
-# 1. Clone
-git clone https://github.com/Veritas-Vaults-Network/stellar-txwatch-core
+# 1. Clone https://github.com/Tx-wat/stellar-txwatch-core
+git clone 
 cd stellar-txwatch-core
 
 # 2. Copy and edit the example config
