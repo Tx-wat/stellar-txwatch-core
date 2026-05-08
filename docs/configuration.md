@@ -18,6 +18,7 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `contract_id` | string | yes      | Stellar C-address (56 chars, starts with `C`).               |
 | `network`     | string | yes      | `mainnet`, `testnet`, or `futurenet`.                        |
 | `webhook_url` | string | yes      | `http://` or `https://` endpoint that receives alert JSON.   |
+| `webhook_secret` | string | no    | If set, sent as `X-TxWatch-Secret` header on every POST.     |
 
 ## `[[contracts.rules]]`
 

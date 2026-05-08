@@ -5,6 +5,7 @@ label       = "My Escrow Contract"
 contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/my-webhook"
+# webhook_secret = "my-secret-token"   # optional: sent as X-TxWatch-Secret header
 
   [[contracts.rules]]
   type          = "LargeTransfer"
