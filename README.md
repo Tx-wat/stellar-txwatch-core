@@ -2,7 +2,7 @@
 
 > Real-time Soroban smart contract monitoring and webhook alert engine for the Stellar network.
 
-Part of the [Veritas Vaults Network](https://github.com/Veritas-Vaults-Network) ecosystem.
+Part of the [TxWatch](https://github.com/Tx-wat) ecosystem.
 
 ---
 
