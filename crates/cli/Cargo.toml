@@ -8,8 +8,12 @@ name = "txwatch"
 path = "src/main.rs"
 
 [dependencies]
-txwatch-config = { path = "../config" }
-txwatch-poller = { path = "../poller" }
-clap           = { workspace = true }
-tokio          = { workspace = true }
-anyhow         = { workspace = true }
+txwatch-config   = { path = "../config" }
+txwatch-poller   = { path = "../poller" }
+txwatch-notifier = { path = "../notifier" }
+clap             = { workspace = true }
+tokio            = { workspace = true }
+anyhow           = { workspace = true }
+reqwest          = { workspace = true }
+tracing          = { workspace = true }
+tracing-subscriber = { workspace = true }

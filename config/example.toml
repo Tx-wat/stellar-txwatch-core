@@ -2,7 +2,7 @@ poll_interval_seconds = 10
 
 [[contracts]]
 label       = "My Escrow Contract"
-contract_id = "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/my-webhook"
 
@@ -19,7 +19,7 @@ webhook_url = "https://hooks.example.com/my-webhook"
 
 [[contracts]]
 label       = "Mainnet Vault"
-contract_id = "CYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
+contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 network     = "mainnet"
 webhook_url = "https://hooks.example.com/vault-webhook"
 
