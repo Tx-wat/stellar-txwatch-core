@@ -1,0 +1,31 @@
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "My Escrow Contract"
+contract_id = "CXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/my-webhook"
+
+  [[contracts.rules]]
+  type          = "LargeTransfer"
+  threshold_xlm = 10000
+
+  [[contracts.rules]]
+  type           = "AdminFunctionCalled"
+  function_names = ["set_admin", "upgrade", "initialize"]
+
+  [[contracts.rules]]
+  type = "TransactionFailed"
+
+[[contracts]]
+label       = "Mainnet Vault"
+contract_id = "CYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY"
+network     = "mainnet"
+webhook_url = "https://hooks.example.com/vault-webhook"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+
+  [[contracts.rules]]
+  type          = "FunctionCalled"
+  function_name = "withdraw"

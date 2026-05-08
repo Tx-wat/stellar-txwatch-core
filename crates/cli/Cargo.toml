@@ -1,0 +1,15 @@
+[package]
+name    = "txwatch"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "txwatch"
+path = "src/main.rs"
+
+[dependencies]
+txwatch-config = { path = "../config" }
+txwatch-poller = { path = "../poller" }
+clap           = { workspace = true }
+tokio          = { workspace = true }
+anyhow         = { workspace = true }
