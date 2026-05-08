@@ -87,6 +87,7 @@ pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
             "https://horizon-testnet.stellar.org/transactions/\
              0000000000000000000000000000000000000000000000000000000000000000"
         ),
+        explorer_link:    "https://stellar.expert/explorer/testnet/tx/0000000000000000000000000000000000000000000000000000000000000000".into(),
     }
     // suppress unused webhook_url warning — callers use it to POST
     // but we include it in the payload label for clarity
@@ -112,6 +113,7 @@ mod tests {
             amount_xlm:       None,
             timestamp:        1_700_000_000,
             horizon_link:     "https://horizon-testnet.stellar.org/transactions/abc123".into(),
+            explorer_link:    "https://stellar.expert/explorer/testnet/tx/abc123".into(),
         }
     }
 

@@ -79,6 +79,8 @@ pub struct AlertPayload {
     /// Unix timestamp (seconds).
     pub timestamp:        i64,
     pub horizon_link:     String,
+    /// Stellar Expert explorer link for the transaction.
+    pub explorer_link:    String,
 }
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
@@ -87,15 +89,17 @@ pub struct AlertPayload {
 /// Returns one `AlertPayload` per matching rule.
 /// Never panics — errors in individual rule evaluation are logged and skipped.
 pub fn evaluate(
-    label:        &str,
-    contract_id:  &str,
-    network:      &str,
-    horizon_base: &str,
-    rules:        &[AlertRule],
-    tx:           &EnrichedTransaction,
+    label:         &str,
+    contract_id:   &str,
+    network:       &str,
+    horizon_base:  &str,
+    explorer_base: &str,
+    rules:         &[AlertRule],
+    tx:            &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
-    let horizon_link = format!("{}/transactions/{}", horizon_base, tx.hash);
-    let timestamp    = tx.timestamp.timestamp();
+    let horizon_link  = format!("{}/transactions/{}", horizon_base, tx.hash);
+    let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
+    let timestamp     = tx.timestamp.timestamp();
 
     rules
         .iter()
@@ -111,6 +115,7 @@ pub fn evaluate(
                     amount_xlm:       tx.amount_stroops.map(|s| s / 10_000_000),
                     timestamp,
                     horizon_link:     horizon_link.clone(),
+                    explorer_link:    explorer_link.clone(),
                 }),
                 Ok(false) => None,
                 Err(e) => {
@@ -200,7 +205,8 @@ mod tests {
 
     fn run(rules: &[AlertRule], tx: &EnrichedTransaction) -> Vec<AlertPayload> {
         evaluate("Label", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                 "testnet", "https://horizon-testnet.stellar.org", rules, tx)
+                 "testnet", "https://horizon-testnet.stellar.org",
+                 "https://stellar.expert/explorer/testnet", rules, tx)
     }
 
     #[test]

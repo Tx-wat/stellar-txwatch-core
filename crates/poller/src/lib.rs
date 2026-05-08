@@ -158,6 +158,7 @@ async fn poll_contract(
             &contract.contract_id,
             contract.network.as_str(),
             base,
+            contract.network.explorer_base_url(),
             &contract.rules,
             &enriched,
         );
