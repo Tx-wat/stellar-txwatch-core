@@ -170,7 +170,7 @@ async fn poll_contract(
                 tx       = %payload.transaction_hash,
                 "rule fired — sending webhook"
             );
-            if let Err(e) = send_webhook(client, &contract.webhook_url, &payload, None).await {
+            if let Err(e) = send_webhook(client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref()).await {
                 error!(
                     contract = %contract.label,
                     rule     = %payload.rule_triggered,
@@ -289,6 +289,7 @@ mod tests {
             network:     txwatch_config::Network::Testnet,
             rules:       vec![txwatch_config::AlertRule::AnyTransaction],
             webhook_url: "https://example.com/hook".into(),
+            webhook_secret: None,
         };
 
         // Override the horizon URL by pointing the contract at our mock server.

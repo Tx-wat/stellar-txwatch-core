@@ -110,6 +110,8 @@ pub struct WatchedContract {
     pub network:     Network,
     pub rules:       Vec<AlertRule>,
     pub webhook_url: String,
+    /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
+    pub webhook_secret: Option<String>,
 }
 
 impl WatchedContract {
@@ -191,11 +193,12 @@ mod tests {
 
     fn valid_contract() -> WatchedContract {
         WatchedContract {
-            label:       "Test".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network:     Network::Testnet,
-            rules:       vec![AlertRule::AnyTransaction],
-            webhook_url: "https://example.com/hook".into(),
+            label:          "Test".into(),
+            contract_id:    "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network:        Network::Testnet,
+            rules:          vec![AlertRule::AnyTransaction],
+            webhook_url:    "https://example.com/hook".into(),
+            webhook_secret: None,
         }
     }
 
