@@ -233,6 +233,14 @@ mod tests {
     }
 
     #[test]
+    fn any_transaction_fires_on_failed_transaction() {
+        let tx = make_tx(false, None, None);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_triggered, "AnyTransaction");
+    }
+
+    #[test]
     fn transaction_failed_fires_on_failure() {
         let tx = make_tx(false, None, None);
         let payloads = run(&[AlertRule::TransactionFailed], &tx);
