@@ -10,7 +10,6 @@ serde_json    = { workspace = true }
 anyhow        = { workspace = true }
 tokio         = { workspace = true }
 tracing       = { workspace = true }
-chrono        = { workspace = true }
 
 [dev-dependencies]
 wiremock      = "0.6"

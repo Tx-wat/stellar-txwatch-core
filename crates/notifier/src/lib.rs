@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use reqwest::Client;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 use txwatch_rules::AlertPayload;
 
@@ -20,7 +19,10 @@ pub async fn send_webhook(
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_RETRIES {
-        let ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
         let mut req = client
             .post(url)
@@ -91,7 +93,10 @@ pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
         transaction_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         function_name:    Some("test".into()),
         amount_xlm:       None,
-        timestamp:        Utc::now().timestamp(),
+        timestamp:        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64,
         horizon_link:     format!(
             "https://horizon-testnet.stellar.org/transactions/\
              0000000000000000000000000000000000000000000000000000000000000000"
