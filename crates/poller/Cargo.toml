@@ -16,5 +16,5 @@ tracing          = { workspace = true }
 chrono           = { workspace = true }
 
 [dev-dependencies]
-wiremock         = { workspace = true }
+wiremock         = "0.6"
 tokio            = { workspace = true }
