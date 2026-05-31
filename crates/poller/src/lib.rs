@@ -125,6 +125,10 @@ async fn poll_contract(
     contract: &WatchedContract,
     cursors:  &mut HashMap<String, String>,
 ) -> Result<(u64, u64)> {
+    // Use contract_id as the cursor map key: contract IDs are unique per Stellar network,
+    // making them a stable and collision-free key. Using label instead would be unsafe
+    // since label uniqueness is only validated at config load time, and labels could
+    // theoretically collide if that validation is bypassed.
     let cursor = cursors
         .get(&contract.contract_id)
         .cloned()
