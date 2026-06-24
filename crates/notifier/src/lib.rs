@@ -196,10 +196,6 @@ mod tests {
         }
     }
 
-    fn dummy_shutdown() -> oneshot::Receiver<()> {
-        oneshot::channel().1
-    }
-
     #[tokio::test]
     async fn delivers_on_first_attempt() {
         let server = MockServer::start().await;

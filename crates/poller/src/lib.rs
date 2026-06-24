@@ -2,9 +2,9 @@
 //! and sends webhook alerts through `txwatch-notifier`.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::atomic::{AtomicU64, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -81,6 +81,33 @@ struct Counters {
     interval_alerts: AtomicU64,
 }
 
+// ── Webhook deduplication cache ───────────────────────────────────────────────
+
+/// In-memory cache for webhook deduplication. Tracks (transaction_hash, rule_triggered)
+/// pairs to prevent duplicate webhooks from being sent when the same alert is evaluated
+/// multiple times (e.g., after a restart or during re-evaluation).
+#[derive(Default)]
+struct DeduplicationCache {
+    /// Set of (transaction_hash, rule_triggered) pairs that have already fired.
+    /// Uses a simple HashSet with a size cap for memory safety.
+    fired: Mutex<HashSet<(String, String)>>,
+}
+
+impl DeduplicationCache {
+    /// Check if a (transaction_hash, rule_triggered) pair has already fired.
+    /// Returns true if it has; false if this is a new pair.
+    fn has_fired(&self, tx_hash: &str, rule: &str) -> bool {
+        let fired = self.fired.lock().unwrap();
+        fired.contains(&(tx_hash.to_string(), rule.to_string()))
+    }
+
+    /// Mark a (transaction_hash, rule_triggered) pair as having fired.
+    fn mark_fired(&self, tx_hash: &str, rule: &str) {
+        let mut fired = self.fired.lock().unwrap();
+        fired.insert((tx_hash.to_string(), rule.to_string()));
+    }
+}
+
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Backwards-compatible wrapper: default (non-dry) run.
@@ -140,6 +167,7 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     let interval      = Duration::from_secs(cfg.poll_interval_seconds);
     let summary_every = Duration::from_secs(60);
     let counters      = Arc::new(Counters::default());
+    let cache         = Arc::new(DeduplicationCache::default());
     let n_contracts   = cfg.contracts.len();
 
     let contracts_list = cfg.contracts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
@@ -199,7 +227,7 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
 
     loop {
         for contract in &cfg.contracts {
-            match poll_contract(&client, contract, &mut cursors, dry_run).await {
+            match poll_contract(&client, contract, &mut cursors, dry_run, Arc::clone(&cache)).await {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
@@ -230,7 +258,7 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
 /// operations inline, eliminating one HTTP request per transaction (#23).
 /// Falls back to a separate `/transactions/{hash}/operations` fetch only when
 /// the inline `operations` array is absent (older Horizon versions).
-#[tracing::instrument(skip(client, contract, cursors), fields(
+#[tracing::instrument(skip(client, contract, cursors, cache), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
     network     = %contract.network.as_str()
@@ -240,6 +268,7 @@ async fn poll_contract(
     contract: &WatchedContract,
     cursors:  &mut HashMap<String, String>,
     dry_run:  bool,
+    cache:    Arc<DeduplicationCache>,
 ) -> Result<(u64, u64)> {
     let cursor = cursors
         .get(&contract.contract_id)
@@ -373,9 +402,17 @@ async fn poll_contract(
         }
 
         for payload in payloads {
-            alert_count += 1;
             info!(contract = %contract.label, rule = %payload.rule_triggered,
                 tx = %payload.transaction_hash, "rule matched");
+
+            // Issue #12: Check deduplication cache before sending webhook.
+            if cache.has_fired(&payload.transaction_hash, &payload.rule_triggered) {
+                debug!(contract = %contract.label, rule = %payload.rule_triggered,
+                    tx = %payload.transaction_hash, "webhook already fired for this (tx, rule) pair; skipping");
+                continue;
+            }
+
+            alert_count += 1;
 
             if dry_run {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
@@ -390,6 +427,9 @@ async fn poll_contract(
                         tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
                     #[cfg(feature = "metrics")]
                     metrics::inc_webhook_failures();
+                } else {
+                    // Mark this (tx, rule) pair as having fired (successful delivery).
+                    cache.mark_fired(&payload.transaction_hash, &payload.rule_triggered);
                 }
             }
         }
@@ -548,7 +588,8 @@ mod tests {
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+        let cache = Arc::new(DeduplicationCache::default());
+        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false, cache).await.unwrap();
         assert_eq!(txs, 1);
         assert_eq!(alerts, 1, "FunctionCalled(withdraw) should fire from inline operations");
 
@@ -652,13 +693,15 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
-        let result = poll_contract(&client, &contract, &mut cursors).await;
+        let cache = Arc::new(DeduplicationCache::default());
+        let result = poll_contract(&client, &contract, &mut cursors, false, cache).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0));
     }
@@ -681,12 +724,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
+        let cache = Arc::new(DeduplicationCache::default());
+        let err = poll_contract(&client, &contract, &mut cursors, false, cache).await.unwrap_err();
         assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
@@ -717,7 +762,8 @@ mod tests {
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let result = poll_contract(&client, &contract, &mut cursors, false).await;
+        let cache = Arc::new(DeduplicationCache::default());
+        let result = poll_contract(&client, &contract, &mut cursors, false, cache).await;
         assert!(result.is_err(), "expected Err when Horizon returns 500");
         assert_eq!(
             cursors.get(contract_id).map(String::as_str),
@@ -733,6 +779,7 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            cursor_file: None,
             contracts: vec![
                 WatchedContract {
                     label:       "Contract A".into(),
@@ -822,8 +869,49 @@ mod tests {
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+        let cache = Arc::new(DeduplicationCache::default());
+        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false, cache).await.unwrap();
         assert_eq!(txs, 201);
         assert_eq!(alerts, 201);
+    }
+
+    /// Issue #12: webhook deduplication ensures the same (tx, rule) pair only fires once.
+    /// When the same transaction and rule are encountered again, the webhook is not re-sent.
+    #[test]
+    fn deduplication_cache_blocks_duplicate_tx_rule_pairs() {
+        let cache = DeduplicationCache::default();
+
+        // First check: cache should report not fired
+        assert!(
+            !cache.has_fired("tx123", "WithdrawRule"),
+            "cache should not have (tx123, WithdrawRule) initially"
+        );
+
+        // Mark as fired
+        cache.mark_fired("tx123", "WithdrawRule");
+
+        // Second check: cache should now report fired
+        assert!(
+            cache.has_fired("tx123", "WithdrawRule"),
+            "cache should have (tx123, WithdrawRule) after marking"
+        );
+
+        // Different rule should not be cached
+        assert!(
+            !cache.has_fired("tx123", "DifferentRule"),
+            "cache should not have (tx123, DifferentRule) - different rule"
+        );
+
+        // Different tx should not be cached
+        assert!(
+            !cache.has_fired("tx456", "WithdrawRule"),
+            "cache should not have (tx456, WithdrawRule) - different tx"
+        );
+
+        // Same pair again should return true
+        assert!(
+            cache.has_fired("tx123", "WithdrawRule"),
+            "cache should still have (tx123, WithdrawRule)"
+        );
     }
 }
