@@ -104,9 +104,10 @@ pub struct AlertPayload {
     pub function_name: Option<String>,
     /// All invoked function names in this transaction.
     pub function_names: Vec<String>,
-    /// Amount in whole XLM (stroops / 10_000_000), present for LargeTransfer.
+    /// Amount in XLM with 7 decimal places (e.g. "1.5000000" for 1.5 XLM),
+    /// present for LargeTransfer. Preserved as a string to avoid precision loss.
     #[serde(rename = "amount_xlm")]
-    pub amount_xlm: Option<u64>,
+    pub amount_xlm: Option<String>,
     /// Fee charged in stroops.
     pub fee_charged_stroops: Option<u64>,
     /// Unix timestamp (seconds).
@@ -132,8 +133,8 @@ pub fn evaluate(
     rules: &[AlertRule],
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
-    let horizon_link  = format!("{}/transactions/{}", horizon_base, tx.hash);
-    let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
+    let horizon_link  = format!("{}/transactions/{}", horizon_base.trim_end_matches('/'), tx.hash);
+    let explorer_link = format!("{}/tx/{}", explorer_base.trim_end_matches('/'), tx.hash);
     let timestamp = tx.timestamp.timestamp();
     let timestamp_iso = tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
@@ -149,7 +150,7 @@ pub fn evaluate(
                 transaction_hash: tx.hash.clone(),
                 function_name: tx.function_names.first().cloned(),
                 function_names: tx.function_names.clone(),
-                amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+                amount_xlm: tx.amount_stroops.map(|s| format!("{:.7}", s as f64 / 10_000_000.0)),
                 fee_charged_stroops: tx.fee_charged_stroops,
                 timestamp,
                 timestamp_iso: timestamp_iso.clone(),
@@ -344,7 +345,7 @@ mod tests {
             &tx,
         );
         assert_eq!(payloads.len(), 1);
-        assert_eq!(payloads[0].amount_xlm, Some(10_000));
+        assert_eq!(payloads[0].amount_xlm, Some("10000.0000000".to_string()));
     }
 
     #[test]
@@ -380,7 +381,7 @@ mod tests {
         let tx = make_tx(true, &[], Some(10_000 * 10_000_000));
         let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
         assert_eq!(payloads.len(), 1);
-        assert_eq!(payloads[0].amount_xlm, Some(10_000));
+        assert_eq!(payloads[0].amount_xlm, Some("10000.0000000".to_string()));
     }
 
     #[test]
@@ -388,6 +389,20 @@ mod tests {
         let tx = make_tx(true, &[], Some(10_000 * 10_000_000 - 1));
         let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
         assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn large_transfer_preserves_fractional_xlm() {
+        // Issue #21: 1.5 XLM = 15_000_000 stroops should produce "1.5000000" not "1"
+        let tx = make_tx(true, &[], Some(15_000_000));
+        let payloads = run(
+            &[AlertRule::LargeTransfer {
+                threshold_xlm: 1,
+            }],
+            &tx,
+        );
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].amount_xlm, Some("1.5000000".to_string()));
     }
 
     #[test]
@@ -671,7 +686,7 @@ mod tests {
             transaction_hash: "abc123".into(),
             function_name: Some("transfer".into()),
             function_names: vec!["transfer".into()],
-            amount_xlm: Some(15000),
+            amount_xlm: Some("15000.0000000".to_string()),
             fee_charged_stroops: Some(50000),
             timestamp: 1705316096,
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
@@ -690,7 +705,7 @@ mod tests {
         assert_eq!(obj["transaction_hash"].as_str(), Some("abc123"));
         assert_eq!(obj["function_name"].as_str(), Some("transfer"));
         assert_eq!(obj["function_names"].as_array().map(|a| a.len()), Some(1));
-        assert_eq!(obj["amount_xlm"].as_u64(), Some(15000));
+        assert_eq!(obj["amount_xlm"].as_str(), Some("15000.0000000"));
         assert_eq!(obj["fee_charged_stroops"].as_u64(), Some(50000));
         assert_eq!(obj["timestamp"].as_i64(), Some(1705316096));
         assert_eq!(obj["timestamp_iso"].as_str(), Some("2024-01-15T12:00:00Z"));
