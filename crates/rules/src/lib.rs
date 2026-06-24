@@ -188,10 +188,13 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
                 .unwrap_or(false)
         }
 
-        AlertRule::FunctionCalled { function_name } => tx
-            .function_names
-            .iter()
-            .any(|f| f == function_name.as_str()),
+        AlertRule::FunctionCalled { function_name } => {
+            // Case-insensitive comparison: normalize both sides to lowercase for matching.
+            let fn_lower = function_name.to_lowercase();
+            tx.function_names
+                .iter()
+                .any(|f| f.to_lowercase() == fn_lower)
+        }
 
         AlertRule::AdminFunctionCalled { function_names } => tx
             .function_names
@@ -313,7 +316,7 @@ mod tests {
         assert_eq!(rule_label(&AlertRule::LargeTransfer { threshold_xlm: 10_000 }), "LargeTransfer(>=10000XLM)");
         assert_eq!(rule_label(&AlertRule::FunctionCalled { function_name: "withdraw".into() }), "FunctionCalled(withdraw)");
         assert_eq!(rule_label(&AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] }), "AdminFunctionCalled([set_admin, upgrade])");
-        assert_eq!(rule_label(&AlertRule::HighFee { threshold_stroops: 10_000 }), "HighFee(>=10000 stroops)");
+        assert_eq!(rule_label(&AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }), "HighFee(>=10000 stroops)");
     }
 
     #[test]
@@ -410,6 +413,20 @@ mod tests {
             &tx,
         );
         assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn function_called_fires_on_case_insensitive_match() {
+        // Verify case-insensitive matching: rule "Withdraw" matches on-chain function "withdraw"
+        let tx = make_tx(true, &["withdraw"], None);
+        let payloads = run(
+            &[AlertRule::FunctionCalled {
+                function_name: "Withdraw".into(),
+            }],
+            &tx,
+        );
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].function_name.as_deref(), Some("withdraw"));
     }
 
     #[test]
