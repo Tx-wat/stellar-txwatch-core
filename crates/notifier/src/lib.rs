@@ -9,7 +9,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, span, warn, Level};
 use txwatch_rules::AlertPayload;
 
-const MAX_RETRIES: u32 = 3;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    pub max_retries: u32,
+    pub backoff_base: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            backoff_base: 2,
+        }
+    }
+}
 
 /// Structured result returned by a successful `send_webhook` call.
 #[derive(Debug, PartialEq)]
@@ -42,7 +55,7 @@ pub async fn send_webhook(
     url: &str,
     payload: &AlertPayload,
     secret: Option<&str>,
-    mut shutdown: oneshot::Receiver<()>,
+    retry_policy: RetryPolicy,
 ) -> Result<DeliveryResult> {
     let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
     let _enter = span.enter();
@@ -50,7 +63,7 @@ pub async fn send_webhook(
     let body = serde_json::to_string(payload)?;
     let mut last_err: Option<anyhow::Error> = None;
 
-    for attempt in 1..=MAX_RETRIES {
+    for attempt in 1..=retry_policy.max_retries {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
@@ -116,17 +129,12 @@ pub async fn send_webhook(
             }
         }
 
-        if attempt < MAX_RETRIES {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))) => {}
-                _ = &mut shutdown => {
-                    return Err(anyhow!("webhook retry aborted: shutdown signal received"));
-                }
-            }
+        if attempt < retry_policy.max_retries {
+            tokio::time::sleep(Duration::from_secs(retry_policy.backoff_base.pow(attempt as u32))).await;
         }
     }
 
-    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", MAX_RETRIES));
+    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", retry_policy.max_retries));
     error!(
         url  = %url,
         rule = %payload.rule_triggered,
@@ -199,10 +207,6 @@ mod tests {
         }
     }
 
-    fn dummy_shutdown() -> oneshot::Receiver<()> {
-        oneshot::channel().1
-    }
-
     #[tokio::test]
     async fn delivers_on_first_attempt() {
         let server = MockServer::start().await;
@@ -215,7 +219,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, RetryPolicy::default()).await;
         assert!(result.is_ok());
         let delivery = result.unwrap();
         assert_eq!(delivery.attempts, 1);
@@ -239,7 +243,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, RetryPolicy::default()).await;
         assert!(result.is_ok());
     }
 
@@ -260,7 +264,7 @@ mod tests {
 
         let client   = Client::new();
         let url      = format!("{}/hook", server.uri());
-        let delivery = send_webhook(&client, &url, &sample_payload(), None)
+        let delivery = send_webhook(&client, &url, &sample_payload(), None, RetryPolicy::default())
             .await
             .expect("should succeed on second attempt");
         assert_eq!(delivery.attempts, 2);
@@ -284,7 +288,7 @@ mod tests {
 
         let client   = build_client().unwrap();
         let url      = format!("{}/hook", server.uri());
-        let delivery = send_webhook(&client, &url, &sample_payload(), None)
+        let delivery = send_webhook(&client, &url, &sample_payload(), None, RetryPolicy::default())
             .await
             .expect("200 with error body should be treated as success");
         assert_eq!(delivery.final_status, 200);
@@ -302,7 +306,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &sample_payload(), Some("mysecret")).await.unwrap();
+        send_webhook(&client, &url, &sample_payload(), Some("mysecret"), RetryPolicy::default()).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
@@ -321,7 +325,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &sample_payload(), None).await.unwrap();
+        send_webhook(&client, &url, &sample_payload(), None, RetryPolicy::default()).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
@@ -347,7 +351,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &payload, Some(secret)).await.unwrap();
+        send_webhook(&client, &url, &payload, Some(secret), RetryPolicy::default()).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         let sig = requests[0].headers.get("x-txwatch-signature").unwrap();
@@ -365,10 +369,10 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, RetryPolicy::default()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("shutdown"), "error should mention shutdown, got: {}", msg);
+        assert!(msg.contains("retries"), "error should mention retries, got: {}", msg);
     }
 
     /// Issue #13: test_payload produces a structurally valid AlertPayload (56-char contract ID).
@@ -409,7 +413,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, RetryPolicy::default()).await;
         assert!(result.is_ok());
     }
 
@@ -428,7 +432,7 @@ mod tests {
 
         let client = Client::new();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, RetryPolicy::default()).await;
         assert!(result.is_ok());
     }
 }

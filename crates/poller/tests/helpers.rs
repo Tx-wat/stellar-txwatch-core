@@ -8,6 +8,10 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         network: Network::Testnet,
         rules,
         webhook_url: webhook_url.to_string(),
+        webhook_urls: None,
+        enabled: true,
+        webhook_max_retries: None,
+        webhook_backoff_base: None,
         webhook_secret: None,
         horizon_base_url_override: None,
     }

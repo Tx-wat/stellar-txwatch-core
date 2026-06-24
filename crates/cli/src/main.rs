@@ -6,7 +6,7 @@ use reqwest::Client;
 use tokio::sync::watch;
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
-use txwatch_notifier::{build_client, send_webhook, test_payload_with_network};
+use txwatch_notifier::{build_client, send_webhook, test_payload_with_network, RetryPolicy};
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
                     label = c.label
                 );
                 println!("    contract_id  : {}", c.contract_id);
+                println!("    enabled      : {}", if c.enabled { "true" } else { "false" });
                 println!("    webhook_url  : {}", c.webhook_url);
                 println!(
                     "    secret       : {}",
@@ -140,7 +141,7 @@ async fn main() -> Result<()> {
             let client  = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");
-            send_webhook(&client, &url, &payload, None)
+            send_webhook(&client, &url, &payload, None, RetryPolicy::default())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
             println!("Test webhook delivered successfully to {}", url);

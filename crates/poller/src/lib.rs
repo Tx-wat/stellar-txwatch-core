@@ -15,7 +15,7 @@ use serde_json;
 use std::fs;
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
-use txwatch_notifier::send_webhook;
+use txwatch_notifier::{send_webhook, RetryPolicy};
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
 // ── Optional Prometheus metrics ───────────────────────────────────────────────
@@ -140,9 +140,9 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     let interval      = Duration::from_secs(cfg.poll_interval_seconds);
     let summary_every = Duration::from_secs(60);
     let counters      = Arc::new(Counters::default());
-    let n_contracts   = cfg.contracts.len();
+    let n_contracts   = cfg.contracts.iter().filter(|c| c.enabled).count();
 
-    let contracts_list = cfg.contracts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
+    let contracts_list = cfg.contracts.iter().filter(|c| c.enabled).map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
     let mut networks: Vec<&str> = cfg.contracts.iter().map(|c| c.network.as_str()).collect();
     networks.sort(); networks.dedup();
     let networks_str = networks.join(", ");
@@ -199,6 +199,9 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
 
     loop {
         for contract in &cfg.contracts {
+            if !contract.enabled {
+                continue;
+            }
             match poll_contract(&client, contract, &mut cursors, dry_run).await {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
@@ -385,11 +388,22 @@ async fn poll_contract(
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
-                if let Err(e) = send_webhook(
-                    client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
-                ).await {
-                    error!(contract = %contract.label, rule = %payload.rule_triggered,
-                        tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
+                let retry_policy = RetryPolicy {
+                    max_retries: contract.effective_max_retries(cfg.webhook_retry.max_retries),
+                    backoff_base: contract.effective_backoff_base(cfg.webhook_retry.backoff_base),
+                };
+                let mut any_success = false;
+                for url in contract.webhook_targets() {
+                    if let Err(e) = send_webhook(
+                        client, &url, &payload, contract.webhook_secret.as_deref(), retry_policy,
+                    ).await {
+                        error!(contract = %contract.label, rule = %payload.rule_triggered,
+                            tx = %payload.transaction_hash, url = %url, error = %e, "webhook delivery failed");
+                    } else {
+                        any_success = true;
+                    }
+                }
+                if !any_success {
                     #[cfg(feature = "metrics")]
                     metrics::inc_webhook_failures();
                 }

@@ -10,6 +10,18 @@ use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
 
+fn default_enabled() -> bool {
+    true
+}
+
+fn default_webhook_retry_max_retries() -> u32 {
+    3
+}
+
+fn default_webhook_retry_backoff_base() -> u64 {
+    2
+}
+
 // ── Network ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -189,6 +201,14 @@ pub struct WatchedContract {
     pub network: Network,
     pub rules: Vec<AlertRule>,
     pub webhook_url: String,
+    #[serde(default)]
+    pub webhook_urls: Option<Vec<String>>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub webhook_max_retries: Option<u32>,
+    #[serde(default)]
+    pub webhook_backoff_base: Option<u64>,
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
     pub webhook_secret: Option<String>,
@@ -198,6 +218,21 @@ pub struct WatchedContract {
 }
 
 impl WatchedContract {
+    pub fn webhook_targets(&self) -> Vec<String> {
+        if let Some(urls) = &self.webhook_urls {
+            return urls.iter().filter(|u| !u.trim().is_empty()).cloned().collect();
+        }
+        vec![self.webhook_url.clone()]
+    }
+
+    pub fn effective_max_retries(&self, fallback: u32) -> u32 {
+        self.webhook_max_retries.unwrap_or(fallback)
+    }
+
+    pub fn effective_backoff_base(&self, fallback: u64) -> u64 {
+        self.webhook_backoff_base.unwrap_or(fallback)
+    }
+
     pub fn validate(&mut self) -> Result<()> {
         if self.label.trim().is_empty() {
             bail!("a contract has an empty label");
@@ -213,27 +248,58 @@ impl WatchedContract {
             );
         }
 
-        let parsed_url = Url::parse(&self.webhook_url).map_err(|e| {
-            anyhow::anyhow!(
-                "contract '{}': webhook_url '{}' is not a valid URL: {}",
-                self.label,
-                self.webhook_url,
-                e
-            )
-        })?;
-        if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
-            bail!(
-                "contract '{}': webhook_url '{}' must use http or https scheme",
-                self.label,
-                self.webhook_url
-            );
+        let webhook_targets = if let Some(urls) = self.webhook_urls.as_ref() {
+            if urls.is_empty() {
+                bail!("contract '{}': at least one webhook URL is required", self.label);
+            }
+            urls.iter().map(|u| u.as_str()).collect::<Vec<_>>()
+        } else {
+            if self.webhook_url.trim().is_empty() {
+                bail!("contract '{}': at least one webhook URL is required", self.label);
+            }
+            vec![self.webhook_url.as_str()]
+        };
+
+        for webhook_url in webhook_targets {
+            let parsed_url = Url::parse(webhook_url).map_err(|e| {
+                anyhow::anyhow!(
+                    "contract '{}': webhook_url '{}' is not a valid URL: {}",
+                    self.label,
+                    webhook_url,
+                    e
+                )
+            })?;
+            if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
+                bail!(
+                    "contract '{}': webhook_url '{}' must use http or https scheme",
+                    self.label,
+                    webhook_url
+                );
+            }
+            if parsed_url.host().is_none() {
+                bail!(
+                    "contract '{}': webhook_url '{}' has no host",
+                    self.label,
+                    webhook_url
+                );
+            }
         }
-        if parsed_url.host().is_none() {
-            bail!(
-                "contract '{}': webhook_url '{}' has no host",
-                self.label,
-                self.webhook_url
-            );
+
+        if let Some(retries) = self.webhook_max_retries {
+            if !(1..=10).contains(&retries) {
+                bail!(
+                    "contract '{}': webhook_max_retries must be between 1 and 10",
+                    self.label
+                );
+            }
+        }
+        if let Some(backoff) = self.webhook_backoff_base {
+            if !(1..=60).contains(&backoff) {
+                bail!(
+                    "contract '{}': webhook_backoff_base must be between 1 and 60",
+                    self.label
+                );
+            }
         }
 
         if self.rules.is_empty() {
@@ -255,6 +321,24 @@ impl WatchedContract {
 /// Exceeding this limit would create too many concurrent Horizon polling tasks,
 /// potentially exhausting memory or file descriptors.
 pub const MAX_CONTRACTS: usize = 100;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookRetryConfig {
+    #[serde(default = "default_webhook_retry_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_webhook_retry_backoff_base")]
+    pub backoff_base: u64,
+}
+
+impl Default for WebhookRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_webhook_retry_max_retries(),
+            backoff_base: default_webhook_retry_backoff_base(),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,6 +366,8 @@ pub struct AppConfig {
     /// Default: false.
     #[serde(default)]
     pub http_connection_verbose: Option<bool>,
+    #[serde(default)]
+    pub webhook_retry: WebhookRetryConfig,
 }
 
 fn default_http_pool_max_idle_per_host() -> Option<usize> {
@@ -325,6 +411,12 @@ fn resolve_env_interpolation(value: &str) -> Result<String> {
 impl AppConfig {
     fn resolve_env_vars(&mut self) -> Result<()> {
         for contract in &mut self.contracts {
+            contract.webhook_url = resolve_env_interpolation(&contract.webhook_url)?;
+            if let Some(urls) = &mut contract.webhook_urls {
+                for url in urls.iter_mut() {
+                    *url = resolve_env_interpolation(url)?;
+                }
+            }
             if let Some(secret) = &contract.webhook_secret {
                 contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
             }
@@ -348,6 +440,12 @@ impl AppConfig {
         }
         if self.poll_interval_seconds > 3600 {
             bail!("poll_interval_seconds must be <= 3600 (1 hour)");
+        }
+        if !(1..=10).contains(&self.webhook_retry.max_retries) {
+            bail!("webhook_retry.max_retries must be between 1 and 10");
+        }
+        if !(1..=60).contains(&self.webhook_retry.backoff_base) {
+            bail!("webhook_retry.backoff_base must be between 1 and 60");
         }
         if self.contracts.is_empty() {
             bail!("at least one [[contracts]] entry is required");
@@ -379,6 +477,10 @@ mod tests {
             network: Network::Testnet,
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://example.com/hook".into(),
+            webhook_urls: None,
+            enabled: true,
+            webhook_max_retries: None,
+            webhook_backoff_base: None,
             webhook_secret: None,
             horizon_base_url_override: None,
         }
@@ -451,6 +553,38 @@ mod tests {
         let mut c = valid_contract();
         c.webhook_url = "https://hooks.example.com/alerts?token=abc123".into();
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_multiple_webhook_urls() {
+        let mut c = valid_contract();
+        c.webhook_url = "https://example.com/legacy".into();
+        c.webhook_urls = Some(vec!["https://example.com/a".into(), "https://example.com/b".into()]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn resolves_webhook_url_from_env() {
+        let original = std::env::var("TXWATCH_TEST_WEBHOOK").ok();
+        std::env::set_var("TXWATCH_TEST_WEBHOOK", "https://hooks.example.com/from-env");
+        let mut c = valid_contract();
+        c.webhook_url = "${TXWATCH_TEST_WEBHOOK}".into();
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![c],
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            webhook_retry: WebhookRetryConfig::default(),
+            cursor_file: None,
+        };
+        cfg.resolve_env_vars().unwrap();
+        assert_eq!(cfg.contracts[0].webhook_url, "https://hooks.example.com/from-env");
+        assert!(cfg.contracts[0].validate().is_ok());
+        match original {
+            Some(value) => std::env::set_var("TXWATCH_TEST_WEBHOOK", value),
+            None => std::env::remove_var("TXWATCH_TEST_WEBHOOK"),
+        }
     }
 
     #[test]
@@ -561,6 +695,7 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            webhook_retry: WebhookRetryConfig::default(),
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -575,6 +710,7 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            webhook_retry: WebhookRetryConfig::default(),
             cursor_file: None,
         };
         let err = cfg.validate().unwrap_err();
@@ -627,6 +763,7 @@ mod tests {
                 http_pool_max_idle_per_host: None,
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
+                webhook_retry: WebhookRetryConfig::default(),
             };
             let err = cfg.validate().unwrap_err();
                 err.to_string().contains("poll_interval_seconds must be >= 5"),
