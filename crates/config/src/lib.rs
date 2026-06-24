@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "assertion failed")]
+    #[should_panic(expected = "expected poll interval error message")]
     fn poll_interval_assertion_fails_without_error_message() {
         let err_msg = "some other error message";
         assert!(

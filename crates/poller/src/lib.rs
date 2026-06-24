@@ -726,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "assertion failed")]
+    #[should_panic(expected = "error must indicate parsing failure")]
     async fn horizon_503_assertion_fails_without_parsing_error() {
         let err_msg = "Some other error message";
         assert!(
