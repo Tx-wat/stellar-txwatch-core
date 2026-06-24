@@ -11,7 +11,6 @@ use std::{
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json;
 use std::fs;
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
@@ -291,8 +290,6 @@ async fn poll_contract(
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
 
         let records = page._embedded.records;
-
-        let records = page._embedded.records;
         if records.is_empty() {
             break;
         }
@@ -385,8 +382,9 @@ async fn poll_contract(
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
+                let (_tx, rx) = tokio::sync::oneshot::channel();
                 if let Err(e) = send_webhook(
-                    client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
+                    client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(), rx,
                 ).await {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,
                         tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
@@ -654,13 +652,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
-        let result = poll_contract(&client, &contract, &mut cursors).await;
+        let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0));
     }
@@ -683,14 +682,26 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+        let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
+        assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "assertion failed")]
+    async fn horizon_503_assertion_fails_without_503() {
+        let err_msg = "Some other error message";
+        assert!(
+            err_msg.contains("503"),
+            "error must contain HTTP status 503, got: {}", err_msg
         );
     }
 
@@ -731,6 +742,7 @@ mod tests {
     fn startup_log_includes_version_contracts_list_and_networks() {
         let cfg = AppConfig {
             poll_interval_seconds: 10,
+            cursor_file: None,
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
