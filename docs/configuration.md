@@ -21,13 +21,52 @@ Config is a TOML file passed via `--config` (default: `config/example.toml`).
 
 Each entry defines one watched Soroban contract. At least one entry is required.
 
-| Field         | Type   | Required | Description                                                  |
-|---------------|--------|----------|--------------------------------------------------------------|
-| `label`       | string | yes      | Human-readable name shown in logs and alert payloads.        |
-| `contract_id` | string | yes      | Stellar C-address (56 chars, starts with `C`).               |
-| `network`     | string | yes      | `mainnet`, `testnet`, or `futurenet`.                        |
-| `webhook_url` | string | yes      | `http://` or `https://` endpoint that receives alert JSON.   |
-| `webhook_secret` | string | no    | If set, an HMAC-SHA256 signature of the request body is sent as `X-TxWatch-Signature: sha256=<hmac>`. Never sends the raw secret over the wire. |
+| Field                  | Type     | Required | Description                                                         |
+|------------------------|----------|----------|---------------------------------------------------------------------|
+| `label`                | string   | yes      | Human-readable name shown in logs and alert payloads.               |
+| `contract_id`          | string   | yes      | Stellar C-address (56 chars, starts with `C`).                      |
+| `network`              | string   | yes      | `mainnet`, `testnet`, or `futurenet`.                               |
+| `webhook_url`          | string   | one of   | Single `http://` or `https://` endpoint. Supports `${ENV_VAR}`.    |
+| `webhook_urls`         | array    | one of   | Multiple endpoints for fan-out delivery. Each supports `${ENV_VAR}`.|
+| `webhook_secret`       | string   | no       | HMAC-SHA256 secret; supports `${ENV_VAR}` interpolation.            |
+| `enabled`              | bool     | no       | Default `true`. Set to `false` to skip polling without removing.    |
+| `webhook_max_retries`  | integer  | no       | Per-contract retry override (1–10). Overrides `[webhook_retry]`.    |
+
+Either `webhook_url` or `webhook_urls` must be present. `webhook_urls` takes precedence when both are set.
+
+### Environment variable interpolation
+
+Both `webhook_url` and `webhook_secret` support `${ENV_VAR}` syntax. The variable must be set in the environment at startup; an unset variable is a hard error.
+
+```toml
+[[contracts]]
+webhook_url    = "${SLACK_WEBHOOK_URL}"
+webhook_secret = "${WEBHOOK_HMAC_SECRET}"
+```
+
+### Multiple webhook URLs
+
+Use `webhook_urls` to fan-out alerts to multiple endpoints simultaneously. A delivery failure on one URL is logged individually and does not prevent delivery to the others.
+
+```toml
+[[contracts]]
+webhook_urls = [
+  "https://hooks.slack.com/...",
+  "https://events.pagerduty.com/...",
+  "https://api.myapp.com/alerts",
+]
+```
+
+### Disabling a contract
+
+Set `enabled = false` to skip polling without removing the entry. Disabled contracts are still parsed and validated; the `validate` subcommand shows them with a `[disabled]` marker.
+
+```toml
+[[contracts]]
+label   = "Archived Contract"
+enabled = false
+# ... other fields ...
+```
 
 ### Network field values
 
@@ -124,6 +163,21 @@ function_names = ["set_admin", "upgrade", "initialize"]
 Note: setting `RUST_LOG=debug` will show per-contract idle poll cycles — the
 poller emits `"no new transactions"` debug logs with the contract `label` and
 current `cursor` when a poll returns an empty page.
+
+## `[webhook_retry]`
+
+Optional global webhook retry configuration. All values can be overridden per contract with `webhook_max_retries`.
+
+| Field          | Type    | Default | Description                                               |
+|----------------|---------|---------|-----------------------------------------------------------|
+| `max_retries`  | integer | `3`     | Maximum delivery attempts (1–10).                         |
+| `backoff_base` | integer | `2`     | Exponential backoff base in seconds (1–60). Attempt N waits `backoff_base^N` seconds. |
+
+```toml
+[webhook_retry]
+max_retries  = 5
+backoff_base = 3   # attempt 1 waits 3s, attempt 2 waits 9s, attempt 3 waits 27s
+```
 
 ## Full example
 

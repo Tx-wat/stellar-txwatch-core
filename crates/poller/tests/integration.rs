@@ -14,7 +14,7 @@ use std::time::Duration;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use txwatch_config::{AlertRule, AppConfig};
+use txwatch_config::{AlertRule, AppConfig, RetryPolicy};
 use txwatch_rules::{evaluate, EnrichedTransaction};
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -71,6 +71,7 @@ async fn run_polls_once_and_fires_webhook() {
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
+        webhook_retry: RetryPolicy::default(),
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -129,6 +130,7 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
+        webhook_retry: RetryPolicy::default(),
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -165,6 +167,7 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
+        webhook_retry: RetryPolicy::default(),
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -247,7 +250,7 @@ async fn any_transaction_fires_webhook() {
         assert_eq!(payloads.len(), 1);
 
         for payload in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, payload, None)
+            txwatch_notifier::send_webhook(&client, &contract.resolved_webhook_urls()[0], payload, None)
                 .await
                 .unwrap();
         }
@@ -338,7 +341,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
             tx,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
+            txwatch_notifier::send_webhook(&client, &contract.resolved_webhook_urls()[0], p, None)
                 .await
                 .unwrap();
         }
@@ -392,7 +395,7 @@ async fn large_transfer_fires_above_threshold() {
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].amount_xlm, Some(10_000));
 
-    txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None)
+    txwatch_notifier::send_webhook(&client, &contract.resolved_webhook_urls()[0], &payloads[0], None)
         .await
         .unwrap();
 }
@@ -460,7 +463,7 @@ async fn function_called_rule_fires_on_exact_match() {
             tx,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
+            txwatch_notifier::send_webhook(&client, &contract.resolved_webhook_urls()[0], p, None)
                 .await
                 .unwrap();
         }
@@ -525,7 +528,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
         .mount(&receiver)
         .await;
 
-    let client   = Client::new();
+    let client   = txwatch_notifier::build_client().unwrap();
     let contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }],
@@ -543,6 +546,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
         },
         vec![],
         None,
+        None,
     )
     .unwrap();
 
@@ -559,7 +563,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
     assert!(payloads[0].rule_triggered.contains("HighFee"));
     assert_eq!(payloads[0].fee_charged_stroops, Some(50_000));
 
-    txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None)
+    txwatch_notifier::send_webhook(&client, &contract.resolved_webhook_urls()[0], &payloads[0], None)
         .await
         .unwrap();
 }
@@ -619,6 +623,10 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+        webhook_retry: RetryPolicy::default(),
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -673,6 +681,8 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
+        cursor_file: None,
+        webhook_retry: RetryPolicy::default(),
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -739,6 +749,7 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
+        webhook_retry: RetryPolicy::default(),
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -836,6 +847,7 @@ async fn contracts_polled_concurrently() {
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
         cursor_file: None,
+        webhook_retry: RetryPolicy::default(),
     };
 
     let start = std::time::Instant::now();

@@ -4,12 +4,14 @@
 //! exposing `send_webhook` and `test_payload` helpers for webhook delivery.
 
 use anyhow::{anyhow, Result};
+use chrono::Utc;
+use hmac::{Hmac, Mac};
 use reqwest::Client;
+use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, span, warn, Level};
+use txwatch_config::RetryPolicy;
 use txwatch_rules::AlertPayload;
-
-const MAX_RETRIES: u32 = 3;
 
 /// Structured result returned by a successful `send_webhook` call.
 #[derive(Debug, PartialEq)]
@@ -28,13 +30,9 @@ pub fn build_client() -> Result<Client> {
         .map_err(|e| anyhow!("failed to build HTTP client: {}", e))
 }
 
-/// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
-/// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
-/// If `secret` is Some, adds an `X-TxWatch-Secret` header to every request.
-///
-/// Delivery semantics: HTTP 2xx = success. The response body is logged at
-/// debug level but is otherwise ignored — a 200 OK with an error body is
-/// still treated as a successful delivery (#24).
+/// POST `payload` to `url`, retrying up to `policy.max_retries` times with
+/// exponential backoff (`policy.backoff_base^attempt` seconds). Logs each attempt.
+/// If `secret` is Some, adds an `X-TxWatch-Signature` HMAC header to every request.
 ///
 /// Returns a [`DeliveryResult`] describing how many attempts were needed.
 pub async fn send_webhook(
@@ -42,7 +40,17 @@ pub async fn send_webhook(
     url: &str,
     payload: &AlertPayload,
     secret: Option<&str>,
-    mut shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    send_webhook_with_policy(client, url, payload, secret, &RetryPolicy::default()).await
+}
+
+/// Like [`send_webhook`] but uses the supplied [`RetryPolicy`] instead of the default.
+pub async fn send_webhook_with_policy(
+    client: &Client,
+    url: &str,
+    payload: &AlertPayload,
+    secret: Option<&str>,
+    policy: &RetryPolicy,
 ) -> Result<DeliveryResult> {
     let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
     let _enter = span.enter();
@@ -50,7 +58,7 @@ pub async fn send_webhook(
     let body = serde_json::to_string(payload)?;
     let mut last_err: Option<anyhow::Error> = None;
 
-    for attempt in 1..=MAX_RETRIES {
+    for attempt in 1..=policy.max_retries {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| Duration::from_secs(0))
@@ -71,10 +79,6 @@ pub async fn send_webhook(
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 let final_status = resp.status().as_u16();
-                // Issue #24: log response body at debug level.
-                // HTTP 2xx = delivery success regardless of body content.
-                // Some receivers return 200 OK with an error body; we treat
-                // any 2xx as a successful delivery (body is informational only).
                 let body_text = resp.text().await.unwrap_or_default();
                 debug!(
                     timestamp     = %ts,
@@ -116,17 +120,12 @@ pub async fn send_webhook(
             }
         }
 
-        if attempt < MAX_RETRIES {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))) => {}
-                _ = &mut shutdown => {
-                    return Err(anyhow!("webhook retry aborted: shutdown signal received"));
-                }
-            }
+        if attempt < policy.max_retries {
+            tokio::time::sleep(Duration::from_secs(policy.backoff_base.pow(attempt))).await;
         }
     }
 
-    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", MAX_RETRIES));
+    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", policy.max_retries));
     error!(
         url  = %url,
         rule = %payload.rule_triggered,
@@ -197,10 +196,6 @@ mod tests {
             horizon_link:        "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link:       "https://stellar.expert/explorer/testnet/tx/abc123".into(),
         }
-    }
-
-    fn dummy_shutdown() -> oneshot::Receiver<()> {
-        oneshot::channel().1
     }
 
     #[tokio::test]
@@ -368,7 +363,7 @@ mod tests {
         let result = send_webhook(&client, &url, &sample_payload(), None).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("shutdown"), "error should mention shutdown, got: {}", msg);
+        assert!(msg.contains("HTTP 500") || msg.contains("retries"), "error should mention failure, got: {}", msg);
     }
 
     /// Issue #13: test_payload produces a structurally valid AlertPayload (56-char contract ID).
@@ -430,5 +425,30 @@ mod tests {
         let url    = format!("{}/hook", server.uri());
         let result = send_webhook(&client, &url, &sample_payload(), None).await;
         assert!(result.is_ok());
+    }
+
+    /// Issue #209: custom retry count via RetryPolicy.
+    #[tokio::test]
+    async fn custom_retry_count_is_respected() {
+        let server = MockServer::start().await;
+        // Fail twice, succeed on third
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let policy = RetryPolicy { max_retries: 5, backoff_base: 1 };
+        let client = build_client().unwrap();
+        let url    = format!("{}/hook", server.uri());
+        let result = send_webhook_with_policy(&client, &url, &sample_payload(), None, &policy).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().attempts, 3);
     }
 }

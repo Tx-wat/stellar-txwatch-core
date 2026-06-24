@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
@@ -77,25 +77,34 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Validate { check_webhooks } => {
             let cfg = AppConfig::from_file(&cli.config)?;
+            let enabled_count = cfg.contracts.iter().filter(|c| c.enabled).count();
+            let disabled_count = cfg.contracts.len() - enabled_count;
             println!("Config is valid.");
             println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
-            println!("  contracts             : {}", cfg.contracts.len());
+            println!("  contracts             : {} ({} enabled, {} disabled)",
+                cfg.contracts.len(), enabled_count, disabled_count);
             println!();
             for c in &cfg.contracts {
+                let disabled_tag = if c.enabled { "" } else { " [disabled]" };
                 println!(
-                    "  [{network}] {label}",
+                    "  [{network}] {label}{disabled_tag}",
                     network = c.network.display_name(),
-                    label = c.label
+                    label = c.label,
+                    disabled_tag = disabled_tag,
                 );
                 println!("    contract_id  : {}", c.contract_id);
-                println!("    webhook_url  : {}", c.webhook_url);
+                let urls = c.resolved_webhook_urls();
+                if urls.len() == 1 {
+                    println!("    webhook_url  : {}", urls[0]);
+                } else {
+                    println!("    webhook_urls : {} endpoints", urls.len());
+                    for url in urls {
+                        println!("      - {}", url);
+                    }
+                }
                 println!(
                     "    secret       : {}",
-                    if c.webhook_secret.is_some() {
-                        "set"
-                    } else {
-                        "none"
-                    }
+                    if c.webhook_secret.is_some() { "set" } else { "none" }
                 );
                 println!("    rules        : {}", c.rules.len());
                 for rule in &c.rules {
@@ -116,11 +125,13 @@ async fn main() -> Result<()> {
                     .context("failed to build HTTP client")?;
 
                 for c in &cfg.contracts {
-                    let reachable = check_webhook_reachable(&client, &c.webhook_url).await;
-                    if let Err(e) = reachable {
-                        warn!(webhook_url = %c.webhook_url, contract = %c.label, error = %e, "webhook reachability check failed");
-                    } else if !reachable.unwrap() {
-                        warn!(webhook_url = %c.webhook_url, contract = %c.label, "webhook endpoint is unreachable");
+                    for url in c.resolved_webhook_urls() {
+                        let reachable = check_webhook_reachable(&client, url).await;
+                        if let Err(e) = reachable {
+                            warn!(webhook_url = %url, contract = %c.label, error = %e, "webhook reachability check failed");
+                        } else if !reachable.unwrap() {
+                            warn!(webhook_url = %url, contract = %c.label, "webhook endpoint is unreachable");
+                        }
                     }
                 }
             }

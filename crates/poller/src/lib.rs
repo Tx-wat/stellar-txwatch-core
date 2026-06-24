@@ -14,8 +14,8 @@ use serde::Deserialize;
 use serde_json;
 use std::fs;
 use tracing::{debug, error, info, warn};
-use txwatch_config::{AppConfig, WatchedContract};
-use txwatch_notifier::send_webhook;
+use txwatch_config::{AppConfig, RetryPolicy, WatchedContract};
+use txwatch_notifier::send_webhook_with_policy;
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
 // ── Optional Prometheus metrics ───────────────────────────────────────────────
@@ -86,6 +86,52 @@ struct Counters {
 /// Backwards-compatible wrapper: default (non-dry) run.
 pub async fn run(cfg: AppConfig) -> Result<()> {
     run_with(cfg, false).await
+}
+
+/// Run with a graceful shutdown signal. When `shutdown_rx` receives `true`, the
+/// current poll cycle is allowed to finish before the function returns.
+pub async fn run_with_shutdown(
+    cfg: AppConfig,
+    dry_run: bool,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
+    let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(max_idle)
+        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let interval = Duration::from_secs(cfg.poll_interval_seconds);
+    let mut cursors: HashMap<String, String> = cfg.contracts
+        .iter()
+        .map(|c| (c.contract_id.clone(), "now".to_string()))
+        .collect();
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        for contract in &cfg.contracts {
+            if !contract.enabled {
+                continue;
+            }
+            if let Err(e) = poll_contract(&client, contract, &mut cursors, dry_run, &cfg.webhook_retry).await {
+                error!(error = %e, "contract polling task failed");
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() { break; }
+            }
+        }
+    }
+    info!("TxWatch polling engine stopped cleanly");
+    Ok(())
 }
 
 /// Run the polling loop forever. Each contract is polled concurrently via a
@@ -199,7 +245,11 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
 
     loop {
         for contract in &cfg.contracts {
-            match poll_contract(&client, contract, &mut cursors, dry_run).await {
+            if !contract.enabled {
+                debug!(contract = %contract.label, "contract is disabled — skipping");
+                continue;
+            }
+            match poll_contract(&client, contract, &mut cursors, dry_run, &cfg.webhook_retry).await {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
@@ -236,10 +286,11 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     network     = %contract.network.as_str()
 ))]
 async fn poll_contract(
-    client:   &Client,
-    contract: &WatchedContract,
-    cursors:  &mut HashMap<String, String>,
-    dry_run:  bool,
+    client:        &Client,
+    contract:      &WatchedContract,
+    cursors:       &mut HashMap<String, String>,
+    dry_run:       bool,
+    global_retry:  &RetryPolicy,
 ) -> Result<(u64, u64)> {
     let cursor = cursors
         .get(&contract.contract_id)
@@ -289,8 +340,6 @@ async fn poll_contract(
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
 
         let records = page._embedded.records;
         if records.is_empty() {
@@ -383,15 +432,19 @@ async fn poll_contract(
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "dry-run enabled: not sending webhook");
             } else {
-                info!(contract = %contract.label, rule = %payload.rule_triggered,
-                    tx = %payload.transaction_hash, "rule fired — sending webhook");
-                if let Err(e) = send_webhook(
-                    client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
-                ).await {
-                    error!(contract = %contract.label, rule = %payload.rule_triggered,
-                        tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
-                    #[cfg(feature = "metrics")]
-                    metrics::inc_webhook_failures();
+                let retry_policy = contract.effective_retry_policy(global_retry);
+                for url in contract.resolved_webhook_urls() {
+                    info!(contract = %contract.label, rule = %payload.rule_triggered,
+                        tx = %payload.transaction_hash, url = %url, "rule fired — sending webhook");
+                    if let Err(e) = send_webhook_with_policy(
+                        client, url, &payload, contract.webhook_secret.as_deref(), &retry_policy,
+                    ).await {
+                        error!(contract = %contract.label, rule = %payload.rule_triggered,
+                            tx = %payload.transaction_hash, url = %url, error = %e,
+                            "webhook delivery failed");
+                        #[cfg(feature = "metrics")]
+                        metrics::inc_webhook_failures();
+                    }
                 }
             }
         }
@@ -476,7 +529,7 @@ fn startup_log_fields(cfg: &AppConfig) -> (String, String, String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use txwatch_config::{AlertRule, Network};
+    use txwatch_config::{AlertRule, Network, RetryPolicy};
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -543,14 +596,17 @@ mod tests {
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network:     Network::Testnet,
             rules:       vec![AlertRule::FunctionCalled { function_name: "withdraw".into() }],
-            webhook_url: format!("{}/hook", receiver.uri()),
+            webhook_url: Some(format!("{}/hook", receiver.uri())),
+            webhook_urls: vec![],
             webhook_secret: None,
+            enabled: true,
+            webhook_max_retries: None,
             horizon_base_url_override: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false, &RetryPolicy::default()).await.unwrap();
         assert_eq!(txs, 1);
         assert_eq!(alerts, 1, "FunctionCalled(withdraw) should fire from inline operations");
 
@@ -654,13 +710,17 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
-            webhook_url: "https://hooks.example.com/test".into(),
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: Some("https://hooks.example.com/test".into()),
+            webhook_urls: vec![],
             webhook_secret: None,
+            enabled: true,
+            webhook_max_retries: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
-        let result = poll_contract(&client, &contract, &mut cursors).await;
+        let result = poll_contract(&client, &contract, &mut cursors, false, &RetryPolicy::default()).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0));
     }
@@ -683,12 +743,17 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
-            webhook_url: "https://hooks.example.com/test".into(),
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: Some("https://hooks.example.com/test".into()),
+            webhook_urls: vec![],
             webhook_secret: None,
+            enabled: true,
+            webhook_max_retries: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+        let err = poll_contract(&client, &contract, &mut cursors, false, &RetryPolicy::default()).await.unwrap_err();
+        assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
         );
@@ -713,12 +778,15 @@ mod tests {
             contract_id: contract_id.into(),
             network:     Network::Testnet,
             rules:       vec![AlertRule::AnyTransaction],
-            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_url: Some("https://hooks.example.com/test".into()),
+            webhook_urls: vec![],
             webhook_secret: None,
+            enabled: true,
+            webhook_max_retries: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let result = poll_contract(&client, &contract, &mut cursors, false).await;
+        let result = poll_contract(&client, &contract, &mut cursors, false, &RetryPolicy::default()).await;
         assert!(result.is_err(), "expected Err when Horizon returns 500");
         assert_eq!(
             cursors.get(contract_id).map(String::as_str),
@@ -734,14 +802,19 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            cursor_file: None,
+            webhook_retry: RetryPolicy::default(),
             contracts: vec![
                 WatchedContract {
                     label:       "Contract A".into(),
                     contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
                     network:     txwatch_config::Network::Testnet,
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
-                    webhook_url: "https://hooks.example.com/a".into(),
+                    webhook_url: Some("https://hooks.example.com/a".into()),
+                    webhook_urls: vec![],
                     webhook_secret: None,
+                    enabled: true,
+                    webhook_max_retries: None,
                     horizon_base_url_override: None,
                 },
                 WatchedContract {
@@ -749,8 +822,11 @@ mod tests {
                     contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
                     network:     txwatch_config::Network::Mainnet,
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
-                    webhook_url: "https://hooks.example.com/b".into(),
+                    webhook_url: Some("https://hooks.example.com/b".into()),
+                    webhook_urls: vec![],
                     webhook_secret: None,
+                    enabled: true,
+                    webhook_max_retries: None,
                     horizon_base_url_override: None,
                 },
                 WatchedContract {
@@ -758,8 +834,11 @@ mod tests {
                     contract_id: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
                     network:     txwatch_config::Network::Mainnet,
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
-                    webhook_url: "https://hooks.example.com/c".into(),
+                    webhook_url: Some("https://hooks.example.com/c".into()),
+                    webhook_urls: vec![],
                     webhook_secret: None,
+                    enabled: true,
+                    webhook_max_retries: None,
                     horizon_base_url_override: None,
                 },
             ],
@@ -816,14 +895,17 @@ mod tests {
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network:     Network::Testnet,
             rules:       vec![AlertRule::AnyTransaction],
-            webhook_url: format!("{}/hooks", server.uri()),
+            webhook_url: Some(format!("{}/hooks", server.uri())),
+            webhook_urls: vec![],
             webhook_secret: None,
+            enabled: true,
+            webhook_max_retries: None,
             horizon_base_url_override: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false, &RetryPolicy::default()).await.unwrap();
         assert_eq!(txs, 201);
         assert_eq!(alerts, 201);
     }

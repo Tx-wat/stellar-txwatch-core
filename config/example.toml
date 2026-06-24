@@ -1,12 +1,24 @@
 poll_interval_seconds = 10
 
+# Optional: global webhook retry policy (defaults shown)
+# [webhook_retry]
+# max_retries  = 3   # 1–10
+# backoff_base = 2   # seconds; attempt N waits backoff_base^N seconds
+
 [[contracts]]
 label       = "My Escrow Contract"
 # Replace with your actual Soroban contract address (56 characters, starts with 'C')
 contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/my-webhook"
-# webhook_secret = "my-secret-token"   # optional: HMAC-SHA256 signature sent as X-TxWatch-Signature header
+# webhook_url = "${SLACK_WEBHOOK_URL}"   # env var interpolation supported
+# webhook_urls = [                       # multiple endpoints for fan-out
+#   "https://hooks.slack.com/...",
+#   "https://events.pagerduty.com/...",
+# ]
+# webhook_secret = "${MY_SECRET}"        # optional HMAC-SHA256 secret
+# enabled = false                        # set to false to skip polling without removing
+# webhook_max_retries = 2               # per-contract retry override (1–10)
 
   [[contracts.rules]]
   type          = "LargeTransfer"
@@ -33,25 +45,15 @@ webhook_url = "https://hooks.example.com/vault-webhook"
   type          = "FunctionCalled"
   function_name = "withdraw"
 
-# Each [[contracts]] block is independent: rules, webhook_url, and network settings
-# apply only to that contract. You can define different webhook receivers and alert
-# rules per contract, even if they share the same network.
-# Example: HighFee rule (threshold in stroops)
-#  [[contracts.rules]]
-#  type               = "HighFee"
-#  threshold_stroops  = 100000
 [[contracts]]
 label       = "Mainnet Bridge Gateway"
 # Replace with your actual Soroban contract address (56 characters, starts with 'C')
 contract_id = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-# network must be one of: mainnet / testnet / futurenet
 network     = "mainnet"
-# webhook_url can differ per contract — this allows routing alerts to different endpoints
 webhook_url = "https://hooks.example.com/bridge-webhook"
-# webhook_secret = "another-secret-token"
 
   [[contracts.rules]]
-  type          = "HighFee"
+  type              = "HighFee"
   threshold_stroops = 100000
 
   [[contracts.rules]]
