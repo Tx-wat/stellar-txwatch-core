@@ -87,20 +87,23 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
     run_with(cfg, false).await
 }
 
-/// Run the polling loop forever. Each contract is polled concurrently via a
-/// tokio JoinSet; one slow or failing contract never blocks the others.
-/// Logs a summary every 60 seconds: contracts watched, transactions processed,
-/// alerts fired.
+/// Run the polling loop forever. Each iteration, all contracts are polled concurrently
+/// via a tokio::JoinSet; one slow or failing contract never blocks the others.
+/// Each contract maintains its own cursor position, and all cursor updates are merged
+/// back after all tasks complete. Logs a summary every 60 seconds: contracts watched,
+/// transactions processed, alerts fired.
 pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .pool_max_idle_per_host(max_idle)
-        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
-        .build()
-        .context("failed to build HTTP client")?;
+    let client = Arc::new(
+        Client::builder()
+            .timeout(Duration::from_secs(15))
+            .pool_max_idle_per_host(max_idle)
+            .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
+            .build()
+            .context("failed to build HTTP client")?,
+    );
 
     let mut cursors: HashMap<String, String> = if let Some(path) = &cfg.cursor_file {
         match fs::read_to_string(path) {
@@ -197,9 +200,34 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     });
 
     loop {
+        let mut join_set = tokio::task::JoinSet::new();
+
+        // Spawn a concurrent task for each contract
         for contract in &cfg.contracts {
-            match poll_contract(&client, contract, &mut cursors, dry_run).await {
-                Ok((txs, alerts)) => {
+            let contract = contract.clone();
+            let cursor = cursors
+                .get(&contract.contract_id)
+                .cloned()
+                .unwrap_or_else(|| "now".to_string());
+            let client = Arc::clone(&client);
+
+            join_set.spawn(async move {
+                let mut local_cursors = HashMap::new();
+                local_cursors.insert(contract.contract_id.clone(), cursor);
+                poll_contract(&client, &contract, &mut local_cursors, dry_run).await
+                    .map(|(txs, alerts)| (contract.contract_id.clone(), txs, alerts, local_cursors))
+            });
+        }
+
+        // Collect results from all spawned tasks
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok((contract_id, txs, alerts, local_cursors))) => {
+                    // Update cursors from completed task
+                    if let Some(new_cursor) = local_cursors.get(&contract_id) {
+                        cursors.insert(contract_id, new_cursor.clone());
+                    }
+                    // Increment counters
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
                     counters.interval_transactions.fetch_add(txs, Ordering::Relaxed);
@@ -211,9 +239,11 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
                         metrics::inc_alerts(alerts);
                     }
                 }
-                Err(e) => error!(error = %e, "contract polling task failed"),
+                Ok(Err(e)) => error!(error = %e, "contract polling task failed"),
+                Err(e) => error!(error = %e, "contract polling task join failed"),
             }
         }
+
         tokio::time::sleep(interval).await;
     }
 
