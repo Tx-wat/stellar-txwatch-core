@@ -765,6 +765,84 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
     );
 }
 
+/// TransactionFailed rule fires on failed transaction through the full poll → webhook pipeline.
+/// Issue #20: Integration test verifying that a failed transaction (successful: false) triggers
+/// the TransactionFailed rule and fires a webhook during the polling cycle.
+#[tokio::test]
+async fn transaction_failed_on_failed_tx_fires_webhook_integration() {
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // Horizon: single transaction with successful: false
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "_embedded": {
+                    "records": [{
+                        "hash":         "failed_tx_001",
+                        "created_at":   "2024-06-01T10:00:00Z",
+                        "successful":   false,
+                        "paging_token": "500",
+                        "fee_charged":  "100",
+                        "envelope_xdr": null,
+                        "result_xdr":   null
+                    }]
+                }
+            })),
+        )
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+
+    // All subsequent transaction requests return an empty page.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    // Operations for the failed tx: no Soroban operations
+    Mock::given(method("GET"))
+        .and(path("/transactions/failed_tx_001/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    // Webhook receiver: expect exactly 1 POST with rule_triggered: "TransactionFailed"
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::TransactionFailed],
+    );
+    contract.horizon_base_url_override = Some(horizon.uri());
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        cursor_file: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    // Drive the loop for one full poll cycle.
+    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+
+    // Verify the webhook was called and contains the correct rule.
+    let webhook_requests = receiver.received_requests().await.unwrap();
+    assert_eq!(webhook_requests.len(), 1, "expected exactly one webhook POST for failed transaction");
+
+    let body: serde_json::Value = serde_json::from_slice(&webhook_requests[0].body).expect("webhook body is JSON");
+    assert_eq!(body["rule_triggered"].as_str(), Some("TransactionFailed"));
+}
+
 /// Two contracts polled concurrently: total wall time must be less than
 /// the sum of each contract's individual response delay, proving that a
 /// slow Horizon response for contract A does not delay contract B. Closes #36.
