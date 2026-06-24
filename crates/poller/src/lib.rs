@@ -690,18 +690,18 @@ mod tests {
 
         let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
         assert!(
-            err.to_string().contains("503"),
-            "error must contain HTTP status 503, got: {}", err
+            err.to_string().contains("failed to parse"),
+            "error must indicate parsing failure on error response, got: {}", err
         );
     }
 
     #[tokio::test]
     #[should_panic(expected = "assertion failed")]
-    async fn horizon_503_assertion_fails_without_503() {
+    async fn horizon_503_assertion_fails_without_parsing_error() {
         let err_msg = "Some other error message";
         assert!(
-            err_msg.contains("503"),
-            "error must contain HTTP status 503, got: {}", err_msg
+            err_msg.contains("failed to parse"),
+            "error must indicate parsing failure on error response, got: {}", err_msg
         );
     }
 
