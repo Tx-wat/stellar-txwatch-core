@@ -328,6 +328,7 @@ impl AppConfig {
             if let Some(secret) = &contract.webhook_secret {
                 contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
             }
+            contract.webhook_url = resolve_env_interpolation(&contract.webhook_url)?;
         }
         Ok(())
     }
@@ -371,6 +372,30 @@ impl AppConfig {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_url_env_interpolation_resolves_and_is_validated() {
+        std::env::set_var("TXWATCH_TEST_WEBHOOK_URL", "https://hooks.example.com/abc");
+        let path = std::env::temp_dir().join("txwatch_webhook_url_interp_test_config.toml");
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "${TXWATCH_TEST_WEBHOOK_URL}"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        std::fs::write(&path, raw).unwrap();
+        let cfg = AppConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.contracts[0].webhook_url, "https://hooks.example.com/abc");
+
+        // The resolved value must still pass the existing URL checks.
+        std::env::set_var("TXWATCH_TEST_WEBHOOK_URL", "ftp://bad.example.com/hook");
+        assert!(AppConfig::from_file(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn valid_contract() -> WatchedContract {
         WatchedContract {

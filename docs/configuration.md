@@ -29,6 +29,8 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `webhook_url` | string | yes      | `http://` or `https://` endpoint that receives alert JSON.   |
 | `webhook_secret` | string | no    | If set, an HMAC-SHA256 signature of the request body is sent as `X-TxWatch-Signature: sha256=<hmac>`. Never sends the raw secret over the wire. |
 
+> **Env var interpolation:** `webhook_url` supports `${VAR_NAME}` interpolation, like `webhook_secret`: if the whole value is `${VAR_NAME}`, it is replaced by that environment variable at load time. The resolved URL must still be a valid `http://` or `https://` URL. Startup fails if the variable is not set.
+
 ### Network field values
 
 Valid `network` values and their corresponding Horizon endpoints:

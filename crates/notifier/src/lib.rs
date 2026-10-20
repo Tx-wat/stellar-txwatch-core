@@ -151,6 +151,8 @@ pub fn test_payload_with_network(
 ) -> AlertPayload {
     let now     = Utc::now();
     let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+    // Stellar Expert names the mainnet explorer path "public".
+    let explorer_network = if network == "mainnet" { "public" } else { network };
     AlertPayload {
         label:               label.to_string(),
         contract_id:         "CTEST000000000000000000000000000000000000000000000000000".into(),
@@ -165,7 +167,7 @@ pub fn test_payload_with_network(
         timestamp:           now.timestamp(),
         timestamp_iso:       now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         horizon_link:        format!("{}/transactions/{}", horizon_base_url, tx_hash),
-        explorer_link:       format!("https://stellar.expert/explorer/{}/tx/{}", network, tx_hash),
+        explorer_link:       format!("https://stellar.expert/explorer/{}/tx/{}", explorer_network, tx_hash),
     }
     .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }
@@ -393,7 +395,18 @@ mod tests {
             "https://horizon.stellar.org",
         );
         assert!(p.horizon_link.starts_with("https://horizon.stellar.org/transactions/"));
-        assert!(p.explorer_link.contains("/mainnet/"));
+        assert!(p.explorer_link.contains("/explorer/public/"));
+        assert!(!p.explorer_link.contains("/explorer/mainnet/"));
+        assert!(p.explorer_link.contains(&p.transaction_hash));
+
+        let t = test_payload_with_network(
+            "Label",
+            "https://example.com/hook",
+            "testnet",
+            "https://horizon-testnet.stellar.org",
+        );
+        assert!(t.explorer_link.contains("/explorer/testnet/"));
+        assert!(t.explorer_link.contains(&t.transaction_hash));
     }
 
     #[tokio::test]
