@@ -172,30 +172,7 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
         );
     }
 
-    let counters_for_summary = Arc::clone(&counters);
-    let _summary_guard = tokio::spawn(async move {
-        loop {
-            let c = Arc::clone(&counters_for_summary);
-            let handle = tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(summary_every).await;
-                    let interval_txs    = c.interval_transactions.swap(0, Ordering::Relaxed);
-                    let interval_alerts = c.interval_alerts.swap(0, Ordering::Relaxed);
-                    info!(
-                        contracts             = n_contracts,
-                        transactions_total    = c.transactions.load(Ordering::Relaxed),
-                        alerts_total          = c.alerts.load(Ordering::Relaxed),
-                        transactions_interval = interval_txs,
-                        alerts_interval       = interval_alerts,
-                        "60-second summary"
-                    );
-                }
-            });
-            if let Err(e) = handle.await {
-                error!(error = ?e, "summary logger panicked — restarting");
-            }
-        }
-    });
+    let _summary_guard = spawn_summary_logger(&counters, n_contracts, summary_every);
 
     loop {
         for contract in &cfg.contracts {
@@ -220,6 +197,43 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
 
     info!("TxWatch polling engine stopped cleanly");
     Ok(())
+}
+
+/// Spawn the periodic summary logger. It holds only a `Weak<Counters>`, so once
+/// the polling loop drops its last `Arc<Counters>` the task exits cleanly
+/// instead of keeping the counters alive. A panic inside the logger is logged
+/// and the logger is restarted.
+fn spawn_summary_logger(
+    counters:    &Arc<Counters>,
+    n_contracts: usize,
+    every:       Duration,
+) -> tokio::task::JoinHandle<()> {
+    let weak = Arc::downgrade(counters);
+    tokio::spawn(async move {
+        loop {
+            let weak = weak.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(every).await;
+                    let Some(c) = weak.upgrade() else { break };
+                    let interval_txs    = c.interval_transactions.swap(0, Ordering::Relaxed);
+                    let interval_alerts = c.interval_alerts.swap(0, Ordering::Relaxed);
+                    info!(
+                        contracts             = n_contracts,
+                        transactions_total    = c.transactions.load(Ordering::Relaxed),
+                        alerts_total          = c.alerts.load(Ordering::Relaxed),
+                        transactions_interval = interval_txs,
+                        alerts_interval       = interval_alerts,
+                        "60-second summary"
+                    );
+                }
+            });
+            match handle.await {
+                Ok(()) => break,
+                Err(e) => error!(error = ?e, "summary logger panicked — restarting"),
+            }
+        }
+    })
 }
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
@@ -250,7 +264,7 @@ async fn poll_contract(
     // `canonical_base` is always the production Horizon URL and is used only for
     // building horizon_link in payloads, so links always point to the real network.
     let poll_base = contract
-        .horizon_base_url_override
+        .test_horizon_base_url
         .as_deref()
         .unwrap_or_else(|| contract.network.horizon_base_url());
     let canonical_base = contract.network.horizon_base_url();
@@ -545,7 +559,7 @@ mod tests {
             rules:       vec![AlertRule::FunctionCalled { function_name: "withdraw".into() }],
             webhook_url: format!("{}/hook", receiver.uri()),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            test_horizon_base_url: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
@@ -656,7 +670,7 @@ mod tests {
             network: Network::Testnet,
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            test_horizon_base_url: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
@@ -685,7 +699,7 @@ mod tests {
             network: Network::Testnet,
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            test_horizon_base_url: Some(server.uri()),
         };
 
         let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
@@ -715,7 +729,7 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            test_horizon_base_url: Some(server.uri()),
         };
 
         let result = poll_contract(&client, &contract, &mut cursors, false).await;
@@ -725,6 +739,19 @@ mod tests {
             Some("now"),
             "cursor must not advance when the transactions fetch fails"
         );
+    }
+
+    #[tokio::test]
+    async fn summary_logger_terminates_when_counters_are_dropped() {
+        let counters = Arc::new(Counters::default());
+        let handle = spawn_summary_logger(&counters, 1, Duration::from_millis(10));
+
+        drop(counters);
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("summary logger must stop once the counters are dropped")
+            .expect("summary logger must not panic");
     }
 
     #[test]
@@ -742,7 +769,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/a".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    test_horizon_base_url: None,
                 },
                 WatchedContract {
                     label:       "Contract B".into(),
@@ -751,7 +778,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/b".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    test_horizon_base_url: None,
                 },
                 WatchedContract {
                     label:       "Contract C".into(),
@@ -760,7 +787,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/c".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    test_horizon_base_url: None,
                 },
             ],
         };
@@ -818,7 +845,7 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: format!("{}/hooks", server.uri()),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            test_horizon_base_url: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());

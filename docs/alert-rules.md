@@ -52,6 +52,8 @@ threshold_xlm = 10000
 
 Matches when the Soroban `invoke_host_function` operation calls exactly `function_name`.
 
+> **Case sensitivity:** `FunctionCalled` is **case-sensitive**: `function_name = "Withdraw"` never matches a transaction that calls `withdraw`. This is intentional, because Soroban function names are case-sensitive symbols and `Withdraw` and `withdraw` are different functions. `AdminFunctionCalled` is the exception: it is case-insensitive (names are lower-cased in validation and compared in lower case at runtime).
+
 ```toml
 [[contracts.rules]]
 type          = "FunctionCalled"
@@ -65,6 +67,7 @@ function_name = "withdraw"
 | `function_names` | [string] | yes      | Non-empty list of function names to watch |
 
 Matches when the invoked function is any entry in `function_names`.
+Unlike `FunctionCalled`, this match is **case-insensitive**.
 Equivalent to multiple `FunctionCalled` rules but produces a single
 `AdminFunctionCalled([...])` label in the alert.
 
