@@ -1,3 +1,31 @@
+# Build output
 /target
-Cargo.lock
+
+# Test snapshots (insta / similar snapshot testing frameworks)
+**/*.snap
+**/*.snap.new
+snapshots/
+**/snapshots/
+
+# Environment and secrets
+.env
+.env.*
+*.secret
+*.pem
+*.key
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Temporary and scratch files
+*.tmp
+*.bak
 vrickish.md

@@ -137,9 +137,9 @@ The webhook payload includes two rule-related fields:
 
 1. Add a variant to `AlertRule` in `crates/config/src/lib.rs`
 2. Add field validation in `AlertRule::validate()` in the same file
-3. Add the match arm in `eval_rule()` in `crates/rules/src/lib.rs`
-4. Add the label string in `rule_label()` in the same file
-5. Add a stable `rule_type` string in `rule_type()` in the same file
+3. Add a match arm in `AlertRule::label()` in the same file (human-readable description)
+4. Add a match arm in `AlertRule::rule_type()` in the same file (stable machine-readable name)
+5. Add the match arm in `eval_rule()` in `crates/rules/src/lib.rs`
 6. Add unit tests in `crates/rules/src/lib.rs`
 7. Update the rule type table in this section
 8. Update the webhook payload example in README.md (if adding a new example)

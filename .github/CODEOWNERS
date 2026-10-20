@@ -1,0 +1,7 @@
+# Default owners for everything
+* @chriz-cloud
+
+# Security-sensitive files require explicit review
+crates/notifier/src/lib.rs @chriz-cloud
+crates/config/src/lib.rs @chriz-cloud
+SECURITY.md @chriz-cloud
