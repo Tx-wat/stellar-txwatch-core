@@ -163,12 +163,19 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
         "TxWatch polling engine started"
     );
 
-    if cfg.poll_interval_seconds < 10 && cfg.contracts.len() > 5 {
+    if let Some(requests_per_minute) = rate_limit_warning(cfg.poll_interval_seconds, cfg.contracts.len()) {
         warn!(
             poll_interval_seconds = cfg.poll_interval_seconds,
             contracts = cfg.contracts.len(),
-            "polling interval is very short with many contracts — Horizon rate limits may apply; \
-             consider poll_interval_seconds >= 10"
+            estimated_requests_per_minute = requests_per_minute,
+            "polling interval is below {}s: estimated {} requests/minute ({} contract(s) x 60 / {}s). \
+             Public Horizon enforces a per-IP request quota and answers with 429 Too Many Requests \
+             when it is exceeded; consider poll_interval_seconds >= {}",
+            MIN_RECOMMENDED_POLL_INTERVAL_SECS,
+            requests_per_minute,
+            cfg.contracts.len(),
+            cfg.poll_interval_seconds,
+            MIN_RECOMMENDED_POLL_INTERVAL_SECS,
         );
     }
 
@@ -455,6 +462,18 @@ async fn fetch_soroban_details(
     Ok(extract_soroban_details(page._embedded.records))
 }
 
+/// Polling intervals below this many seconds trigger a startup rate-limit warning.
+const MIN_RECOMMENDED_POLL_INTERVAL_SECS: u64 = 10;
+
+/// Returns the estimated Horizon requests per minute when the configured interval is
+/// below [`MIN_RECOMMENDED_POLL_INTERVAL_SECS`] (for any number of contracts), else `None`.
+fn rate_limit_warning(poll_interval_seconds: u64, n_contracts: usize) -> Option<u64> {
+    if poll_interval_seconds >= MIN_RECOMMENDED_POLL_INTERVAL_SECS || poll_interval_seconds == 0 {
+        return None;
+    }
+    Some(n_contracts as u64 * 60 / poll_interval_seconds)
+}
+
 // ── Startup log field helpers (for testing) ──────────────────────────────────
 
 #[cfg(test)]
@@ -725,6 +744,72 @@ mod tests {
             Some("now"),
             "cursor must not advance when the transactions fetch fails"
         );
+    }
+
+    #[tokio::test]
+    async fn poll_contract_skips_tx_with_enrichment_error_and_advances_cursor() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "_embedded": { "records": [
+                {
+                    "hash": "bad_tx",
+                    "created_at": "not-a-timestamp",
+                    "successful": true,
+                    "paging_token": "1",
+                    "operations": [{ "type": "invoke_host_function", "function": "transfer" }]
+                },
+                {
+                    "hash": "good_tx",
+                    "created_at": "2024-06-01T10:00:00Z",
+                    "successful": true,
+                    "paging_token": "2",
+                    "operations": [{ "type": "invoke_host_function", "function": "transfer" }]
+                }
+            ] }
+        });
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let client      = Client::new();
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "now".to_string());
+
+        let contract = WatchedContract {
+            label:       "test".into(),
+            contract_id: contract_id.into(),
+            network:     Network::Testnet,
+            rules:       vec![AlertRule::AnyTransaction],
+            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+
+        let (tx_count, _alerts) = poll_contract(&client, &contract, &mut cursors, true)
+            .await
+            .expect("poll_contract should succeed");
+
+        assert_eq!(
+            cursors.get(contract_id).map(String::as_str),
+            Some("2"),
+            "cursor must advance to the second transaction's paging_token"
+        );
+        assert_eq!(tx_count, 1, "only the valid transaction counts");
+    }
+
+    #[test]
+    fn rate_limit_warning_fires_below_threshold_for_single_contract() {
+        assert_eq!(rate_limit_warning(5, 1), Some(12));
+        assert_eq!(rate_limit_warning(5, 6), Some(72));
+    }
+
+    #[test]
+    fn rate_limit_warning_silent_at_or_above_threshold() {
+        assert_eq!(rate_limit_warning(10, 100), None);
+        assert_eq!(rate_limit_warning(30, 1), None);
     }
 
     #[test]
