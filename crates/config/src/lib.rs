@@ -354,6 +354,47 @@ where
     })
 }
 
+/// Checks `cursor_file` before polling starts (#279).
+///
+/// - Existing file: must be readable and contain valid JSON.
+/// - Missing file: its parent directory must exist and be writable.
+fn validate_cursor_file(path: &str) -> Result<()> {
+    let cursor_path = Path::new(path);
+
+    if cursor_path.is_file() {
+        let raw = fs::read_to_string(cursor_path)
+            .with_context(|| format!("cursor_file '{}' cannot be read", path))?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .with_context(|| format!("cursor_file '{}' is not valid JSON", path))?;
+        return Ok(());
+    }
+
+    if cursor_path.exists() {
+        bail!("cursor_file '{}' exists but is not a regular file", path);
+    }
+
+    let dir = match cursor_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if !dir.is_dir() {
+        bail!("cursor_file directory '{}' does not exist", dir.display());
+    }
+    check_dir_writable(dir)
+}
+
+/// Probes writability by creating and removing a uniquely named file.
+fn check_dir_writable(dir: &Path) -> Result<()> {
+    let probe = dir.join(format!(".txwatch-write-probe-{}", std::process::id()));
+    match fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(_) => bail!("cursor_file directory '{}' is not writable", dir.display()),
+    }
+}
+
 // ── Env-var interpolation ─────────────────────────────────────────────────────
 
 /// Resolves a `${VAR_NAME}` reference to the corresponding environment variable.
@@ -399,6 +440,9 @@ impl AppConfig {
         for contract in &mut self.contracts {
             contract.validate()?;
         }
+        if let Some(path) = &self.cursor_file {
+            validate_cursor_file(path)?;
+        }
         let mut seen = std::collections::HashSet::new();
         for contract in &self.contracts {
             if !seen.insert(&contract.label) {
@@ -415,6 +459,7 @@ impl AppConfig {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn valid_contract() -> WatchedContract {
         WatchedContract {
@@ -575,6 +620,84 @@ mod tests {
             ca_cert: Some(fixture_path("client-cert.pem")),
         });
         assert!(c.validate().is_ok());
+    }
+
+    // ── Issue #279: cursor_file validation ───────────────────────────────────
+
+    fn cursor_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "txwatch-cursor-{}-{}",
+            name,
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn app_config_with_cursor(cursor_file: String) -> AppConfig {
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![valid_contract()],
+            cursor_file: Some(cursor_file),
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+        }
+    }
+
+    #[test]
+    fn cursor_file_existing_valid_json_is_accepted() {
+        let dir = cursor_test_dir("valid-json");
+        let file = dir.join("cursors.json");
+        fs::write(&file, r#"{"CABC": "123-1"}"#).unwrap();
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        assert!(cfg.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_existing_invalid_json_is_rejected() {
+        let dir = cursor_test_dir("invalid-json");
+        let file = dir.join("cursors.json");
+        fs::write(&file, "{ not json").unwrap();
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("is not valid JSON"), "got: {}", err);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_missing_file_in_existing_dir_is_accepted() {
+        let dir = cursor_test_dir("missing-file");
+        let file = dir.join("not-yet-created.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        assert!(cfg.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_missing_directory_is_rejected() {
+        let dir = cursor_test_dir("missing-dir").join("no-such-subdir");
+        let file = dir.join("cursors.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "got: {}", err);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_file_unwritable_directory_fails_with_clear_message() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = cursor_test_dir("readonly-dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let file = dir.join("cursors.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        // Restore permissions so cleanup succeeds.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(err.contains("is not writable"), "got: {}", err);
     }
 
     #[test]
