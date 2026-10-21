@@ -1797,7 +1797,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hex",
+ "hmac",
  "reqwest",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",

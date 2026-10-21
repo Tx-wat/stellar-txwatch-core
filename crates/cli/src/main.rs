@@ -62,6 +62,10 @@ enum Command {
         /// Label to include in the test payload
         #[arg(long, default_value = "TxWatch Test")]
         label: String,
+
+        /// Sign the payload with HMAC-SHA256 using this secret (sent as X-TxWatch-Signature)
+        #[arg(long)]
+        secret: Option<String>,
     },
 }
 
@@ -125,7 +129,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::TestWebhook { url, label } => {
+        Command::TestWebhook { url, label, secret } => {
             let cfg = AppConfig::from_file(&cli.config)?;
             if cfg.contracts.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -139,10 +143,11 @@ async fn main() -> Result<()> {
             let client  = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");
-            send_webhook(&client, &url, &payload, None)
+            send_webhook(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
-            println!("Test webhook delivered successfully to {}", url);
+            let signing = if secret.is_some() { "signed with HMAC-SHA256" } else { "unsigned" };
+            println!("Test webhook delivered successfully to {} ({})", url, signing);
         }
 
         Command::Watch { dry_run } => {
