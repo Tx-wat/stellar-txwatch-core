@@ -208,6 +208,8 @@ mod tests {
             timestamp_iso:       "2023-11-15T03:13:20Z".into(),
             horizon_link:        "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link:       "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            ledger_sequence:     None,
+            source_account:      None,
         }
     }
 

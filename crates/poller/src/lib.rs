@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json;
 use std::fs;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::send_webhook;
@@ -172,6 +173,40 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
 /// alerts fired.
 pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
+    run_with_shutdown(cfg, dry_run, watch::channel(false).1).await
+}
+
+/// Run the polling loop with graceful shutdown support.
+///
+/// The `from_beginning` flag is controlled via the `dry_run` parameter and the
+/// `shutdown_rx` channel. When `from_beginning` is `true`, all contracts start
+/// with cursor `"0"` (the Horizon keyword for the earliest available transaction)
+/// instead of `"now"`. Any persisted cursor_file values are ignored for this run
+/// (the file is not modified either).
+pub async fn run_with_shutdown(
+    cfg: AppConfig,
+    dry_run: bool,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    run_internal(cfg, dry_run, false, shutdown_rx).await
+}
+
+/// Full internal entry point with all options.
+pub async fn run_with_options(
+    cfg: AppConfig,
+    dry_run: bool,
+    from_beginning: bool,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    run_internal(cfg, dry_run, from_beginning, shutdown_rx).await
+}
+
+async fn run_internal(
+    cfg: AppConfig,
+    dry_run: bool,
+    from_beginning: bool,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
 
@@ -182,7 +217,15 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
-    let mut cursors: HashMap<String, String> = if let Some(path) = &cfg.cursor_file {
+    let mut cursors: HashMap<String, String> = if from_beginning {
+        // Issue #262: --from-beginning overrides any persisted cursor values.
+        // All contracts start from cursor "0" (earliest available transaction).
+        warn!("--from-beginning: replaying all historical transactions — this may generate many alerts");
+        cfg.contracts
+            .iter()
+            .map(|c| (c.contract_id.clone(), "0".to_string()))
+            .collect()
+    } else if let Some(path) = &cfg.cursor_file {
         match fs::read_to_string(path) {
             Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
                 Ok(mut map) => {
@@ -1061,6 +1104,7 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            cursor_file: None,
             contracts: vec![
                 WatchedContract {
                     label:       "Contract A".into(),

@@ -124,12 +124,16 @@ For local development with webhook testing, see [Local Development with Docker C
 txwatch [--config <path>] <command>
 
 Commands:
-  watch                        Start the polling engine
-  validate                     Validate the config file and print a summary
-  test-webhook --url <URL>     Send a test payload to a webhook URL and exit
+  watch [--dry-run] [--from-beginning]  Start the polling engine
+  validate [--check-webhooks]           Validate the config file and print a summary
+  test-webhook --url <URL>              Send a test payload to a webhook URL and exit
 ```
 
 `--config` defaults to `config/example.toml`.
+
+**watch flags:**
+- `--dry-run` — evaluate rules and log matches, but do not send any webhooks
+- `--from-beginning` — start polling from the earliest available transaction (cursor `0`) instead of `now`. Overrides any persisted `cursor_file` values for this run (does not modify the file). Warning: may generate many alerts for historical transactions.
 
 ---
 
@@ -194,7 +198,9 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "timestamp":        1705316096,
   "timestamp_iso":    "2024-01-15T12:00:00Z",
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
-  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123..."
+  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123...",
+  "ledger_sequence":  12345678,
+  "source_account":   "GABC..."
 }
 ```
 
@@ -213,6 +219,8 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `memo` — the transaction memo value (e.g. an order ID or payment reference), or `null` when the transaction has no memo.
 - `horizon_link` — direct Horizon REST API URL for the transaction (e.g. `https://horizon-testnet.stellar.org/transactions/<hash>`); useful for fetching raw XDR or operation details programmatically.
 - `explorer_link` — Stellar Expert web explorer URL for the transaction (e.g. `https://stellar.expert/explorer/testnet/tx/<hash>`); useful for human-readable inspection in a browser.
+- `ledger_sequence` — the Stellar ledger (block) sequence number this transaction was included in; always present when Horizon returns it, otherwise `null`. Use this to cross-reference with Stellar ledger data or detect gaps in monitored activity.
+- `source_account` — the Stellar account that signed and submitted the transaction (e.g. `"GABC..."`); always present when Horizon returns it, otherwise `null`. Useful for knowing which user or bot triggered the alert and for filtering alerts by caller in downstream systems.
 
 > **`horizon_link` vs `explorer_link`**: `horizon_link` points to the Horizon REST API endpoint and returns raw JSON — useful for programmatic access. `explorer_link` points to the [Stellar Expert](https://stellar.expert) web UI — useful for human inspection. Both are always present for every alert regardless of rule type.
 

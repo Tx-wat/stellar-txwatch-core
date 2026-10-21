@@ -41,6 +41,12 @@ enum Command {
         /// Do not actually send webhooks; only log matched rules
         #[arg(long)]
         dry_run: bool,
+
+        /// Start polling from the earliest available transaction (cursor = 0).
+        /// Overrides any persisted cursor_file values for this run (does not modify the file).
+        /// Warning: this may generate many alerts for historical transactions.
+        #[arg(long)]
+        from_beginning: bool,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -146,7 +152,7 @@ async fn main() -> Result<()> {
             println!("Test webhook delivered successfully to {}", url);
         }
 
-        Command::Watch { dry_run } => {
+        Command::Watch { dry_run, from_beginning } => {
             let cfg = AppConfig::from_file(&cli.config)?;
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
@@ -184,9 +190,10 @@ async fn main() -> Result<()> {
                 contracts      = cfg.contracts.len(),
                 interval_secs  = cfg.poll_interval_seconds,
                 dry_run        = dry_run,
+                from_beginning = from_beginning,
                 "starting TxWatch"
             );
-            txwatch_poller::run_with_shutdown(cfg, dry_run, shutdown_rx).await?;
+            txwatch_poller::run_with_options(cfg, dry_run, from_beginning, shutdown_rx).await?;
         }
     }
 

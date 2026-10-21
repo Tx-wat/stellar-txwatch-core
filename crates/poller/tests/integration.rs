@@ -621,6 +621,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
+        cursor_file: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -793,4 +794,152 @@ async fn contracts_polled_concurrently() {
         elapsed,
         DELAY_MS as f64 * 1.8 + 300.0,
     );
+}
+
+/// Issue #261: cursor_file is written atomically after each poll cycle.
+/// After two poll cycles (one transaction returned, then empty), the cursor
+/// file must exist and contain the latest paging token.
+#[tokio::test]
+async fn cursor_file_is_written_after_poll_cycle() {
+    use std::time::Duration;
+
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // First poll returns one transaction with paging_token "999".
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(helpers::tx_page("cursor_tx", "999", true)),
+        )
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+
+    // Subsequent polls return empty.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    // Operations endpoint (fallback, returns empty).
+    Mock::given(method("GET"))
+        .and(path_regex("/transactions/.*/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    // Webhook receiver.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![txwatch_config::AlertRule::AnyTransaction],
+    );
+    contract.horizon_base_url_override = Some(horizon.uri());
+    let contract_id = contract.contract_id.clone();
+
+    // Use a temp file for cursor persistence.
+    let cursor_path = std::env::temp_dir()
+        .join(format!("txwatch_cursor_test_{}.json", std::process::id()));
+    let cursor_path_str = cursor_path.to_string_lossy().to_string();
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        cursor_file: Some(cursor_path_str.clone()),
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    // Run two poll cycles (1.5 s > 1 s interval means at least one full cycle).
+    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+
+    // Cursor file must exist and contain paging token "999".
+    let raw = std::fs::read_to_string(&cursor_path)
+        .expect("cursor_file should be written after poll cycle");
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&raw).expect("cursor_file should be valid JSON");
+    assert_eq!(
+        map.get(&contract_id).map(String::as_str),
+        Some("999"),
+        "cursor_file should contain the latest paging token '999'"
+    );
+
+    // Cleanup.
+    let _ = std::fs::remove_file(&cursor_path);
+}
+
+/// Issue #261: cursor_file is written atomically after each poll cycle.
+#[tokio::test]
+async fn cursor_file_is_written_after_poll_cycle() {
+    use std::time::Duration;
+
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(helpers::tx_page("cursor_tx", "999", true)),
+        )
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/transactions/.*/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
+    contract.horizon_base_url_override = Some(horizon.uri());
+    let contract_id = contract.contract_id.clone();
+
+    let cursor_path = std::env::temp_dir()
+        .join(format!("txwatch_cursor_test_{}.json", std::process::id()));
+    let cursor_path_str = cursor_path.to_string_lossy().to_string();
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        cursor_file: Some(cursor_path_str.clone()),
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+
+    let raw = std::fs::read_to_string(&cursor_path)
+        .expect("cursor_file should be written after poll cycle");
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&raw).expect("cursor_file should be valid JSON");
+    assert_eq!(
+        map.get(&contract_id).map(String::as_str),
+        Some("999"),
+        "cursor_file should contain the latest paging token '999'"
+    );
+
+    let _ = std::fs::remove_file(&cursor_path);
 }

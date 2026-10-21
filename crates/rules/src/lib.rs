@@ -193,6 +193,10 @@ pub struct AlertPayload {
     pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
     pub explorer_link: String,
+    /// Ledger sequence number this transaction was included in.
+    pub ledger_sequence: Option<u32>,
+    /// Stellar account that signed and submitted this transaction.
+    pub source_account: Option<String>,
 }
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
@@ -234,6 +238,8 @@ pub fn evaluate(
                 timestamp_iso: timestamp_iso.clone(),
                 horizon_link: horizon_link.clone(),
                 explorer_link: explorer_link.clone(),
+                ledger_sequence: tx.ledger_sequence,
+                source_account: tx.source_account.clone(),
             }),
             Ok(false) => None,
             Err(e) => {
@@ -704,6 +710,8 @@ mod tests {
             fee_charged:  None,
             envelope_xdr: None,
             result_xdr:   None,
+            ledger: None,
+            source_account: None,
         };
         let result = EnrichedTransaction::from_horizon(raw, vec![], None, None);
         assert!(result.is_err(), "expected Err for invalid timestamp");
@@ -784,6 +792,8 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            ledger_sequence: Some(12345678),
+            source_account: Some("GABC123".into()),
         };
 
         let json = serde_json::to_value(payload).expect("serialize AlertPayload to JSON");
@@ -803,6 +813,72 @@ mod tests {
         assert_eq!(obj["timestamp_iso"].as_str(), Some("2024-01-15T12:00:00Z"));
         assert_eq!(obj["horizon_link"].as_str(), Some("https://horizon-testnet.stellar.org/transactions/abc123"));
         assert_eq!(obj["explorer_link"].as_str(), Some("https://stellar.expert/explorer/testnet/tx/abc123"));
+        assert_eq!(obj["ledger_sequence"].as_u64(), Some(12345678));
+        assert_eq!(obj["source_account"].as_str(), Some("GABC123"));
+    }
+
+    // ── Issue #263: source_account propagation ────────────────────────────────
+
+    #[test]
+    fn source_account_is_propagated_to_alert_payload() {
+        let raw = HorizonTransaction {
+            hash: "src_test".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            ledger: None,
+            source_account: Some("GABC1234567890".into()),
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.source_account.as_deref(), Some("GABC1234567890"));
+
+        let payloads = run(&[AlertRule::AnyTransaction], &EnrichedTransaction {
+            source_account: Some("GABC1234567890".into()),
+            ..make_tx(true, &[], None)
+        });
+        assert_eq!(payloads[0].source_account.as_deref(), Some("GABC1234567890"));
+    }
+
+    #[test]
+    fn source_account_is_null_when_not_provided() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert!(payloads[0].source_account.is_none());
+    }
+
+    // ── Issue #264: ledger_sequence propagation ───────────────────────────────
+
+    #[test]
+    fn ledger_sequence_is_propagated_to_alert_payload() {
+        let raw = HorizonTransaction {
+            hash: "ledger_test".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            ledger: Some(99887766),
+            source_account: None,
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.ledger_sequence, Some(99887766));
+
+        let payloads = run(&[AlertRule::AnyTransaction], &EnrichedTransaction {
+            ledger_sequence: Some(99887766),
+            ..make_tx(true, &[], None)
+        });
+        assert_eq!(payloads[0].ledger_sequence, Some(99887766));
+    }
+
+    #[test]
+    fn ledger_sequence_is_null_when_not_provided() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert!(payloads[0].ledger_sequence.is_none());
     }
 
     // ── #253: extract_soroban_details unit tests ─────────────────────────────

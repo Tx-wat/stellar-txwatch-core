@@ -705,6 +705,8 @@ mod tests {
                 http_pool_max_idle_per_host: None,
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
+                cursor_file: None,
+                contracts: vec![],
             };
             let err = cfg.validate().unwrap_err();
             assert!(
