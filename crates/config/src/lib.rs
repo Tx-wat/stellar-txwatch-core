@@ -353,10 +353,24 @@ impl AppConfig {
         for contract in &mut self.contracts {
             contract.validate()?;
         }
-        let mut seen = std::collections::HashSet::new();
+        // Labels are display names, so duplicates are rejected across all networks.
+        let mut seen_labels = std::collections::HashSet::new();
         for contract in &self.contracts {
-            if !seen.insert(&contract.label) {
+            if !seen_labels.insert(&contract.label) {
                 bail!("duplicate contract label '{}'", contract.label);
+            }
+        }
+        // The same contract_id is valid on different networks (mainnet vs testnet),
+        // but not twice on the same network.
+        let mut seen_ids = std::collections::HashSet::new();
+        for contract in &self.contracts {
+            let key = (contract.contract_id.as_str(), contract.network.as_str());
+            if !seen_ids.insert(key) {
+                bail!(
+                    "duplicate contract_id '{}' on network '{}'",
+                    contract.contract_id,
+                    contract.network.as_str()
+                );
             }
         }
         Ok(())
@@ -563,6 +577,51 @@ mod tests {
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
+    }
+
+    fn config_with(contracts: Vec<WatchedContract>) -> AppConfig {
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts,
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+        }
+    }
+
+    #[test]
+    fn rejects_same_label_with_different_contract_ids() {
+        let first = valid_contract();
+        let mut second = valid_contract();
+        second.contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+        let err = config_with(vec![first, second]).validate().unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate contract label 'Test'"),
+            "error should name the label, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn accepts_same_contract_id_on_different_networks() {
+        let testnet = valid_contract();
+        let mut mainnet = valid_contract();
+        mainnet.label = "Mainnet copy".into();
+        mainnet.network = Network::Mainnet;
+        assert!(config_with(vec![testnet, mainnet]).validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_same_contract_id_on_same_network() {
+        let first = valid_contract();
+        let mut second = valid_contract();
+        second.label = "Other label".into();
+        let err = config_with(vec![first, second]).validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate contract_id"), "got: {}", msg);
+        assert!(msg.contains("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "got: {}", msg);
+        assert!(msg.contains("testnet"), "got: {}", msg);
     }
 
     #[test]
