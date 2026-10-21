@@ -125,6 +125,18 @@ cargo test -p txwatch-poller   # includes integration tests
 
 Add `-- --nocapture` to see log output while tests run.
 
+## Dependency checks
+
+CI runs [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) on every pull
+request. It checks advisories (RustSec), licenses, banned crates, and crate
+sources against [`deny.toml`](deny.toml). Run it locally before submitting a PR
+when you add or update dependencies:
+
+```bash
+cargo install cargo-deny --locked   # once
+cargo deny check
+```
+
 ## Adding Tests
 
 ### Where to put tests
@@ -192,15 +204,19 @@ AlertRule::MyNewRule { my_field } => {
 ```
 
 > Note: Adding a new `AlertRule` variant requires updating both `eval_rule()` and
-> `rule_label()` in `crates/rules/src/lib.rs`. Rust's exhaustive matching helps
+> `AlertRule::label()` in `crates/config/src/lib.rs`. Rust's exhaustive matching helps
 > catch missing arms, but both functions must remain in sync for new variants.
 
-### Step 4 — Label the rule (`crates/rules/src/lib.rs`)
+### Step 4 — Label the rule (`crates/config/src/lib.rs`)
 
-Add a match arm in `rule_label()`:
+Add a match arm in `AlertRule::label()` and `AlertRule::rule_type()`:
 
 ```rust
+// In label():
 AlertRule::MyNewRule { my_field } => format!("MyNewRule({})", my_field),
+
+// In rule_type():
+AlertRule::MyNewRule { .. } => "MyNewRule".into(),
 ```
 
 ### Step 5 — Add to the TOML config format
@@ -249,4 +265,25 @@ docs: document MyNewRule in alert-rules.md
 - [ ] `cargo fmt` applied
 - [ ] New rule documented in `docs/alert-rules.md`
 - [ ] CONTRIBUTING.md updated if the contribution process changed
-- [ ] CHANGELOG.md entry added under [Unreleased] describing what changed
+- [ ] CHANGELOG.md entry added under `## [Unreleased]` in the matching section: `### Added`, `### Changed`, `### Fixed` or `### Removed` (see [Keep a Changelog](https://keepachangelog.com/en/1.0.0/))
+
+---
+
+## Releasing
+
+Releases are cut by pushing a version tag. The `Release` workflow
+(`.github/workflows/release.yml`) then runs the test suite, builds the Linux
+x86_64 `txwatch` binary, and creates a GitHub Release.
+
+1. Move the entries under `## [Unreleased]` in `CHANGELOG.md` into a new
+   `## [X.Y.Z] - YYYY-MM-DD` section, and leave `## [Unreleased]` empty.
+2. Merge that change to `main`.
+3. Tag the commit and push the tag:
+
+   ```bash
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
+   ```
+
+The release notes are the body of the `## [X.Y.Z]` section. The workflow fails
+if that section is missing or empty, so fill it in before tagging.
