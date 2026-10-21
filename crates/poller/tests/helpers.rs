@@ -1,6 +1,14 @@
 #![allow(dead_code)]
 use txwatch_config::{AlertRule, Network, WatchedContract};
 
+/// A shutdown receiver that never fires. The sender is leaked on purpose so the
+/// channel stays open for the lifetime of the test process.
+pub fn shutdown_rx() -> tokio::sync::oneshot::Receiver<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::mem::forget(tx);
+    rx
+}
+
 pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
     WatchedContract {
         label: "Integration Test Contract".into(),
@@ -9,7 +17,7 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         rules,
         webhook_url: webhook_url.to_string(),
         webhook_secret: None,
-        horizon_base_url_override: None,
+        test_horizon_base_url: None,
     }
 }
 
