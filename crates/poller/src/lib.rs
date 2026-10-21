@@ -13,6 +13,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json;
 use std::fs;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::send_webhook;
@@ -93,6 +94,40 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
 /// alerts fired.
 pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
+    run_with_shutdown(cfg, dry_run, watch::channel(false).1).await
+}
+
+/// Run the polling loop with graceful shutdown support.
+///
+/// The `from_beginning` flag is controlled via the `dry_run` parameter and the
+/// `shutdown_rx` channel. When `from_beginning` is `true`, all contracts start
+/// with cursor `"0"` (the Horizon keyword for the earliest available transaction)
+/// instead of `"now"`. Any persisted cursor_file values are ignored for this run
+/// (the file is not modified either).
+pub async fn run_with_shutdown(
+    cfg: AppConfig,
+    dry_run: bool,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    run_internal(cfg, dry_run, false, shutdown_rx).await
+}
+
+/// Full internal entry point with all options.
+pub async fn run_with_options(
+    cfg: AppConfig,
+    dry_run: bool,
+    from_beginning: bool,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    run_internal(cfg, dry_run, from_beginning, shutdown_rx).await
+}
+
+async fn run_internal(
+    cfg: AppConfig,
+    dry_run: bool,
+    from_beginning: bool,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
 
@@ -103,7 +138,15 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
-    let mut cursors: HashMap<String, String> = if let Some(path) = &cfg.cursor_file {
+    let mut cursors: HashMap<String, String> = if from_beginning {
+        // Issue #262: --from-beginning overrides any persisted cursor values.
+        // All contracts start from cursor "0" (earliest available transaction).
+        warn!("--from-beginning: replaying all historical transactions — this may generate many alerts");
+        cfg.contracts
+            .iter()
+            .map(|c| (c.contract_id.clone(), "0".to_string()))
+            .collect()
+    } else if let Some(path) = &cfg.cursor_file {
         match fs::read_to_string(path) {
             Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
                 Ok(mut map) => {
@@ -215,11 +258,35 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
                 Err(e) => error!(error = %e, "contract polling task failed"),
             }
         }
-        tokio::time::sleep(interval).await;
-    }
 
-    info!("TxWatch polling engine stopped cleanly");
-    Ok(())
+        // Issue #261: persist cursor map atomically after each poll cycle.
+        // Only when not in from_beginning mode (cursor_file still applies on restart).
+        if !from_beginning {
+            if let Some(path) = &cfg.cursor_file {
+                match serde_json::to_string(&cursors) {
+                    Ok(json) => {
+                        let tmp = format!("{}.tmp", path);
+                        if let Err(e) = fs::write(&tmp, &json)
+                            .and_then(|_| fs::rename(&tmp, path))
+                        {
+                            warn!(error = %e, path = %path, "failed to persist cursor_file — will retry next cycle");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "failed to serialize cursors for cursor_file"),
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("TxWatch polling engine stopped cleanly");
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
@@ -292,7 +359,6 @@ async fn poll_contract(
 
         let records = page._embedded.records;
 
-        let records = page._embedded.records;
         if records.is_empty() {
             break;
         }
@@ -654,13 +720,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
-        let result = poll_contract(&client, &contract, &mut cursors).await;
+        let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0));
     }
@@ -683,12 +750,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+        let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
+        assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
         );
@@ -734,6 +803,7 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            cursor_file: None,
             contracts: vec![
                 WatchedContract {
                     label:       "Contract A".into(),

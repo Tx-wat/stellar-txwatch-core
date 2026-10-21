@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_path_to_error::Deserializer as PathDeserializer;
-use std::{fmt, fs, path::Path};
+use std::{env, fmt, fs, path::Path};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -627,8 +627,11 @@ mod tests {
                 http_pool_max_idle_per_host: None,
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
+                cursor_file: None,
+                contracts: vec![],
             };
             let err = cfg.validate().unwrap_err();
+            assert!(
                 err.to_string().contains("poll_interval_seconds must be >= 5"),
                 "val={} should be rejected: {}", val, err
             );

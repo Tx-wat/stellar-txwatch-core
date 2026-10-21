@@ -1,3 +1,39 @@
 /target
 Cargo.lock
 vrickish.md
+
+# Test snapshots and fixtures
+*.snap
+*.snap.new
+snapshots/
+insta.yaml
+
+# Cursor persistence files (runtime artifacts)
+cursor.json
+cursor.json.tmp
+*.cursor.json
+*.cursor.json.tmp
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Build artifacts
+*.rlib
+*.d
+
+# Coverage and profiling
+lcov.info
+*.profraw
+*.profdata
+tarpaulin-report.html
+cobertura.xml
