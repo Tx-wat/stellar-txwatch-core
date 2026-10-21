@@ -1,0 +1,21 @@
+[package]
+name    = "txwatch-rules-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+txwatch-rules = { path = ".." }
+
+# Keep the fuzz crate out of the main workspace.
+[workspace]
+
+[[bin]]
+name = "from_horizon"
+path = "fuzz_targets/from_horizon.rs"
+test = false
+doc  = false

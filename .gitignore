@@ -1,39 +1,48 @@
+# Cargo build output
 /target
-Cargo.lock
-vrickish.md
+debug/
+*.pdb
 
-# Test snapshots and fixtures
+# Cargo.lock is checked in for binaries; keep it tracked
+# Cargo.lock
+
+# Test snapshots (insta, assert_snapshot, etc.)
 *.snap
 *.snap.new
+**/__snapshots__/
 snapshots/
-insta.yaml
 
-# Cursor persistence files (runtime artifacts)
-cursor.json
-cursor.json.tmp
-*.cursor.json
-*.cursor.json.tmp
-
-# Editor and IDE
-.vscode/
+# IDE and editor files
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
+
+# OS-specific
 .DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
 
-# Environment and secrets
-.env
-.env.*
-!.env.example
-
-# Build artifacts
-*.rlib
-*.d
-
-# Coverage and profiling
+# Coverage reports
 lcov.info
+cov/
+tarpaulin-report.html
 *.profraw
 *.profdata
-tarpaulin-report.html
-cobertura.xml
+
+# Benchmark artifacts
+criterion/
+
+# Local environment / config overrides
+.env
+.env.local
+*.local.toml
+
+# Misc scratch files
+vrickish.md
+
+# Cursor persistence files generated during testing
+txwatch_*.json
