@@ -13,6 +13,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json;
 use std::fs;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::send_webhook;
@@ -93,6 +94,15 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
 /// alerts fired.
 pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
+    run_with_shutdown(cfg, dry_run, watch::channel(false).1).await
+}
+
+/// Like `run_with`, but stops after the current poll cycle once `shutdown` is set to `true`.
+pub async fn run_with_shutdown(
+    cfg: AppConfig,
+    dry_run: bool,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
 
@@ -215,7 +225,16 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
                 Err(e) => error!(error = %e, "contract polling task failed"),
             }
         }
-        tokio::time::sleep(interval).await;
+        if *shutdown.borrow() {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => {}
+        }
+        if *shutdown.borrow() {
+            break;
+        }
     }
 
     info!("TxWatch polling engine stopped cleanly");
@@ -289,8 +308,6 @@ async fn poll_contract(
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
 
         let records = page._embedded.records;
         if records.is_empty() {
@@ -654,13 +671,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
-        let result = poll_contract(&client, &contract, &mut cursors).await;
+        let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0));
     }
@@ -683,12 +701,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+        let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
+        assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
         );
@@ -734,6 +754,7 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            cursor_file: None,
             contracts: vec![
                 WatchedContract {
                     label:       "Contract A".into(),
