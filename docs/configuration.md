@@ -39,6 +39,8 @@ Valid `network` values and their corresponding Horizon endpoints:
 | `testnet` | https://horizon-testnet.stellar.org |
 | `futurenet` | https://horizon-futurenet.stellar.org |
 
+> **Futurenet explorer limitation:** explorer links for `futurenet` point to Stellar Expert (`https://stellar.expert/explorer/futurenet`). Futurenet is a development network that can be reset at any time, and Stellar Expert's coverage of it is not guaranteed. If that link does not show your transaction, use the [Stellar Laboratory](https://laboratory.stellar.org/) instead.
+
 Any value outside this list will cause a TOML parse error. For example:
 
 ```

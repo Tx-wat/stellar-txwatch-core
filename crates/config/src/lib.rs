@@ -551,6 +551,14 @@ mod tests {
     }
 
     #[test]
+    fn futurenet_explorer_url_points_to_futurenet_path() {
+        assert_eq!(
+            Network::Futurenet.explorer_base_url(),
+            "https://stellar.expert/explorer/futurenet"
+        );
+    }
+
+    #[test]
     fn rejects_duplicate_labels() {
         let c = valid_contract();
         let mut cfg = AppConfig {
