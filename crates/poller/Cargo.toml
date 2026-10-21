@@ -25,4 +25,4 @@ http-body-util   = { version = "0.1", optional = true }
 
 [dev-dependencies]
 wiremock         = "0.6"
-tokio            = { workspace = true }
+tokio            = { workspace = true, features = ["test-util"] }
