@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json;
 use std::fs;
 use tracing::{debug, error, info, warn};
@@ -51,14 +52,15 @@ struct HorizonTransactionWithOps {
     operations: Vec<HorizonOperation>,
 }
 
+/// Generic Horizon page wrapper used by `paginate()`.
 #[derive(Deserialize)]
-struct HorizonPage {
-    _embedded: Embedded,
+struct HorizonPage<T> {
+    _embedded: Embedded<T>,
 }
 
 #[derive(Deserialize)]
-struct Embedded {
-    records: Vec<HorizonTransactionWithOps>,
+struct Embedded<T> {
+    records: Vec<T>,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +77,89 @@ struct OpsEmbedded {
 
 mod counters;
 pub(crate) use counters::Counters;
+
+// ── Pagination helper ─────────────────────────────────────────────────────────
+
+/// Fetches all pages from a paginated Horizon endpoint and collects every record.
+///
+/// - `first_url`: the initial URL (already includes cursor, order, limit, etc.)
+/// - `paging_token`: closure that extracts the paging token from a single record;
+///   used to build the cursor for the next page request.
+///
+/// Stops when a page returns fewer than `page_limit` records (last page), or when
+/// the page is empty. The caller is responsible for rate-limit handling before
+/// invoking this function.
+async fn paginate<T>(
+    client: &Client,
+    first_url: &str,
+    page_limit: usize,
+    paging_token: impl Fn(&T) -> &str,
+) -> Result<Vec<T>>
+where
+    T: DeserializeOwned,
+{
+    let mut all_records: Vec<T> = Vec::new();
+    let mut url = first_url.to_string();
+
+    loop {
+        let page: HorizonPage<T> = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {} failed", url))?
+            .json()
+            .await
+            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+
+        let records = page._embedded.records;
+        if records.is_empty() {
+            break;
+        }
+
+        let last_token = records.last().map(|r| paging_token(r).to_string());
+        let count = records.len();
+        all_records.extend(records);
+
+        if count < page_limit {
+            break;
+        }
+
+        match last_token {
+            Some(token) => {
+                // Replace the cursor value in the URL for the next page.
+                // The URL contains `cursor=<value>` — update it to the new token.
+                url = replace_cursor_param(&url, &token);
+            }
+            None => break,
+        }
+    }
+
+    Ok(all_records)
+}
+
+/// Replace the `cursor=<old>` query parameter in a URL with a new cursor value.
+fn replace_cursor_param(url: &str, new_cursor: &str) -> String {
+    // Split on `cursor=` and replace through to the next `&` or end-of-string.
+    if let Some(start) = url.find("cursor=") {
+        let before = &url[..start];
+        let after_cursor = &url[start + "cursor=".len()..];
+        let end = after_cursor.find('&').map(|i| i + 1).unwrap_or(after_cursor.len());
+        let rest = &after_cursor[end..];
+        // Preserve the trailing portion (parameters after cursor).
+        if rest.is_empty() {
+            format!("{}cursor={}", before, new_cursor)
+        } else {
+            format!("{}cursor={}&{}", before, new_cursor, rest)
+        }
+    } else {
+        // No cursor param found — append it.
+        if url.contains('?') {
+            format!("{}&cursor={}", url, new_cursor)
+        } else {
+            format!("{}?cursor={}", url, new_cursor)
+        }
+    }
+}
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
@@ -390,19 +475,39 @@ async fn poll_contract(
             break;
         }
 
-        let last_token = records.last().map(|r| r.tx.paging_token.clone());
-        let count = records.len();
-        for r in records {
-            all_records.push(r);
-        }
+    if !first_response.status().is_success() {
+        let status = first_response.status();
+        return Err(anyhow::anyhow!(
+            "Horizon returned {} for {}",
+            status,
+            first_url
+        ));
+    }
 
-        if count < 200 {
-            break;
-        }
-        if let Some(token) = last_token {
-            page_cursor = token;
-        } else {
-            break;
+    let first_page: HorizonPage<HorizonTransactionWithOps> = first_response
+        .json()
+        .await
+        .with_context(|| format!("failed to parse Horizon response from {}", first_url))?;
+
+    let first_records = first_page._embedded.records;
+    let first_count = first_records.len();
+    let first_last_token = first_records.last().map(|r| r.tx.paging_token.clone());
+
+    // Collect all pages: start with the first page already fetched, then use
+    // paginate() to fetch any additional pages beyond the first.
+    let mut all_records: Vec<HorizonTransactionWithOps> = first_records;
+
+    if first_count >= 200 {
+        if let Some(next_cursor) = first_last_token {
+            let next_url = replace_cursor_param(&first_url, &next_cursor);
+            let more = paginate::<HorizonTransactionWithOps>(
+                client,
+                &next_url,
+                200,
+                |r| r.tx.paging_token.as_str(),
+            )
+            .await?;
+            all_records.extend(more);
         }
     }
 
@@ -682,7 +787,7 @@ mod tests {
             server.uri(),
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         );
-        let page: HorizonPage = client.get(&url).send().await.unwrap().json().await.unwrap();
+        let page: HorizonPage<serde_json::Value> = client.get(&url).send().await.unwrap().json().await.unwrap();
         assert!(page._embedded.records.is_empty());
     }
 
@@ -759,13 +864,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             test_horizon_base_url: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
-        let result = poll_contract(&client, &contract, &mut cursors).await;
+        let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0));
     }
@@ -788,6 +894,7 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             test_horizon_base_url: Some(server.uri()),
@@ -963,6 +1070,7 @@ mod tests {
                     test_horizon_base_url: None,
                 },
             ],
+            cursor_file: None,
         };
 
         let (version, contracts_list, networks, horizon_urls) = startup_log_fields(&cfg);
@@ -1026,5 +1134,22 @@ mod tests {
         let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
         assert_eq!(txs, 201);
         assert_eq!(alerts, 201);
+    }
+
+    #[test]
+    fn replace_cursor_param_replaces_correctly() {
+        let url = "https://horizon.stellar.org/accounts/C123/transactions?cursor=now&order=asc&limit=200";
+        let updated = replace_cursor_param(url, "12345678");
+        assert!(updated.contains("cursor=12345678"), "got: {}", updated);
+        assert!(updated.contains("order=asc"), "should preserve other params, got: {}", updated);
+        assert!(updated.contains("limit=200"), "should preserve other params, got: {}", updated);
+    }
+
+    #[test]
+    fn replace_cursor_param_works_when_cursor_is_last() {
+        let url = "https://horizon.stellar.org/accounts/C123/transactions?order=asc&cursor=now";
+        let updated = replace_cursor_param(url, "99");
+        assert!(updated.contains("cursor=99"), "got: {}", updated);
+        assert!(updated.contains("order=asc"), "got: {}", updated);
     }
 }

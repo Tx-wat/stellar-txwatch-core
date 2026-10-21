@@ -164,8 +164,8 @@ pub fn evaluate(
                 label: label.to_string(),
                 contract_id: contract_id.to_string(),
                 network: network.to_string(),
-                rule_type: rule_type(rule),
-                rule_triggered: rule_label(rule),
+                rule_type: rule.rule_type(),
+                rule_triggered: rule.label(),
                 transaction_hash: tx.hash.clone(),
                 function_name: tx.function_names.first().cloned(),
                 function_names: tx.function_names.clone(),
@@ -182,7 +182,7 @@ pub fn evaluate(
             Err(e) => {
                 tracing::warn!(
                     tx = %tx.hash,
-                    rule = %rule_label(rule),
+                    rule = %rule.label(),
                     error = %e,
                     "rule evaluation error — skipping"
                 );
@@ -193,7 +193,7 @@ pub fn evaluate(
 }
 
 // NOTE: When adding a new AlertRule variant, update both `eval_rule()` and
-// `rule_label()` together. Rust's exhaustive matching catches missing arms,
+// `AlertRule::label()` together. Rust's exhaustive matching catches missing arms,
 // but this convention should be preserved for new rule variants.
 fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
     Ok(match rule {
@@ -231,41 +231,6 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .map(|f| f >= *threshold_stroops)
             .unwrap_or(false),
     })
-}
-
-// NOTE: When adding a new AlertRule variant, update both `eval_rule()` and
-// `rule_label()` together. Rust's exhaustive matching catches missing arms,
-// but this convention should be preserved for new rule variants.
-fn rule_label(rule: &AlertRule) -> String {
-    match rule {
-        AlertRule::AnyTransaction => "AnyTransaction".into(),
-        AlertRule::TransactionFailed => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { threshold_xlm } => {
-            format!("LargeTransfer(>={}XLM)", threshold_xlm)
-        }
-        AlertRule::FunctionCalled { function_name } => format!("FunctionCalled({})", function_name),
-        AlertRule::AdminFunctionCalled { function_names } => {
-            format!("AdminFunctionCalled([{}])", function_names.join(", "))
-        }
-        AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
-            if let Some(xlm) = threshold_xlm {
-                format!("HighFee(>={} XLM)", xlm)
-            } else {
-                format!("HighFee(>={} stroops)", threshold_stroops)
-            }
-        }
-    }
-}
-
-fn rule_type(rule: &AlertRule) -> String {
-    match rule {
-        AlertRule::AnyTransaction => "AnyTransaction".into(),
-        AlertRule::TransactionFailed => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { .. } => "LargeTransfer".into(),
-        AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
-        AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
-        AlertRule::HighFee { .. } => "HighFee".into(),
-    }
 }
 
 impl AlertPayload {
@@ -335,12 +300,12 @@ mod tests {
 
     #[test]
     fn rule_label_formats_are_stable() {
-        assert_eq!(rule_label(&AlertRule::AnyTransaction), "AnyTransaction");
-        assert_eq!(rule_label(&AlertRule::TransactionFailed), "TransactionFailed");
-        assert_eq!(rule_label(&AlertRule::LargeTransfer { threshold_xlm: 10_000 }), "LargeTransfer(>=10000XLM)");
-        assert_eq!(rule_label(&AlertRule::FunctionCalled { function_name: "withdraw".into() }), "FunctionCalled(withdraw)");
-        assert_eq!(rule_label(&AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] }), "AdminFunctionCalled([set_admin, upgrade])");
-        assert_eq!(rule_label(&AlertRule::HighFee { threshold_stroops: 10_000 }), "HighFee(>=10000 stroops)");
+        assert_eq!(AlertRule::AnyTransaction.label(), "AnyTransaction");
+        assert_eq!(AlertRule::TransactionFailed.label(), "TransactionFailed");
+        assert_eq!(AlertRule::LargeTransfer { threshold_xlm: 10_000 }.label(), "LargeTransfer(>=10000XLM)");
+        assert_eq!(AlertRule::FunctionCalled { function_name: "withdraw".into() }.label(), "FunctionCalled(withdraw)");
+        assert_eq!(AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] }.label(), "AdminFunctionCalled([set_admin, upgrade])");
+        assert_eq!(AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }.label(), "HighFee(>=10000 stroops)");
     }
 
     #[test]

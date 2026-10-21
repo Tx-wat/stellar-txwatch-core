@@ -156,6 +156,8 @@ impl AlertRule {
         }
         Ok(())
     }
+    /// Human-readable rule description with parameters.
+    /// Used as `rule_triggered` in alert payloads (e.g. `"LargeTransfer(>=10000XLM)"`).
     pub fn label(&self) -> String {
         match self {
             AlertRule::AnyTransaction => "AnyTransaction".into(),
@@ -177,7 +179,22 @@ impl AlertRule {
                 }
             }
         }
-    }}
+    }
+
+    /// Stable machine-readable rule variant name.
+    /// Used as `rule_type` in alert payloads (e.g. `"LargeTransfer"`, `"HighFee"`).
+    /// Use this for programmatic routing — it never includes parameters.
+    pub fn rule_type(&self) -> String {
+        match self {
+            AlertRule::AnyTransaction => "AnyTransaction".into(),
+            AlertRule::TransactionFailed => "TransactionFailed".into(),
+            AlertRule::LargeTransfer { .. } => "LargeTransfer".into(),
+            AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
+            AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
+            AlertRule::HighFee { .. } => "HighFee".into(),
+        }
+    }
+}
 
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
