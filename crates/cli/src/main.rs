@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
@@ -140,7 +140,9 @@ async fn main() -> Result<()> {
             let client  = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");
-            send_webhook(&client, &url, &payload, None)
+            // Keep the sender alive so the receiver never resolves early.
+            let (_abort_tx, abort_rx) = tokio::sync::oneshot::channel();
+            send_webhook(&client, &url, &payload, None, abort_rx)
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
             println!("Test webhook delivered successfully to {}", url);

@@ -222,6 +222,21 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// Like [`run_with`], but returns `Ok(())` once `shutdown` is set to `true`.
+pub async fn run_with_shutdown(
+    cfg: AppConfig,
+    dry_run: bool,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    tokio::select! {
+        result = run_with(cfg, dry_run) => result,
+        _ = shutdown.wait_for(|stop| *stop) => {
+            info!("shutdown requested; stopping polling engine");
+            Ok(())
+        }
+    }
+}
+
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Returns `(transactions_processed, alerts_fired)`.
@@ -289,8 +304,6 @@ async fn poll_contract(
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
 
         let records = page._embedded.records;
         if records.is_empty() {
@@ -385,8 +398,11 @@ async fn poll_contract(
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
+                // The sender is held for the whole call so the receiver never fires early.
+                let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                 if let Err(e) = send_webhook(
                     client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
+                    shutdown_rx,
                 ).await {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,
                         tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
@@ -654,13 +670,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
-        let result = poll_contract(&client, &contract, &mut cursors).await;
+        let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0));
     }
@@ -683,12 +700,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+        let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
+        assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
         );
@@ -731,6 +750,7 @@ mod tests {
     fn startup_log_includes_version_contracts_list_and_networks() {
         let cfg = AppConfig {
             poll_interval_seconds: 10,
+            cursor_file: None,
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,

@@ -4,8 +4,12 @@
 //! exposing `send_webhook` and `test_payload` helpers for webhook delivery.
 
 use anyhow::{anyhow, Result};
+use chrono::Utc;
+use hmac::{Hmac, Mac};
 use reqwest::Client;
+use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
 use txwatch_rules::AlertPayload;
 
@@ -200,7 +204,10 @@ mod tests {
     }
 
     fn dummy_shutdown() -> oneshot::Receiver<()> {
-        oneshot::channel().1
+        // Keep the sender alive for the whole test so the receiver never resolves.
+        let (tx, rx) = oneshot::channel();
+        std::mem::forget(tx);
+        rx
     }
 
     #[tokio::test]
@@ -215,7 +222,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
         let delivery = result.unwrap();
         assert_eq!(delivery.attempts, 1);
@@ -239,7 +246,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
 
@@ -260,7 +267,7 @@ mod tests {
 
         let client   = Client::new();
         let url      = format!("{}/hook", server.uri());
-        let delivery = send_webhook(&client, &url, &sample_payload(), None)
+        let delivery = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown())
             .await
             .expect("should succeed on second attempt");
         assert_eq!(delivery.attempts, 2);
@@ -284,7 +291,7 @@ mod tests {
 
         let client   = build_client().unwrap();
         let url      = format!("{}/hook", server.uri());
-        let delivery = send_webhook(&client, &url, &sample_payload(), None)
+        let delivery = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown())
             .await
             .expect("200 with error body should be treated as success");
         assert_eq!(delivery.final_status, 200);
@@ -302,7 +309,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &sample_payload(), Some("mysecret")).await.unwrap();
+        send_webhook(&client, &url, &sample_payload(), Some("mysecret"), dummy_shutdown()).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
@@ -321,7 +328,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &sample_payload(), None).await.unwrap();
+        send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
@@ -347,7 +354,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &payload, Some(secret)).await.unwrap();
+        send_webhook(&client, &url, &payload, Some(secret), dummy_shutdown()).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         let sig = requests[0].headers.get("x-txwatch-signature").unwrap();
@@ -365,7 +372,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("shutdown"), "error should mention shutdown, got: {}", msg);
@@ -409,7 +416,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
 
@@ -428,7 +435,7 @@ mod tests {
 
         let client = Client::new();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
 }

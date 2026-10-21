@@ -4,8 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_path_to_error::Deserializer as PathDeserializer;
-use std::{fmt, fs, path::Path};
+use std::{env, fmt, fs, path::Path};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -292,13 +291,12 @@ fn default_http_tcp_keepalive_secs() -> Option<u64> {
     None
 }
 
-fn deserialize_toml_with_field_context<'de, T>(raw: &'de str, path: &Path) -> Result<T>
+fn deserialize_toml_with_field_context<'de, T>(raw: &'de str) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    let mut deserializer = toml::Deserializer::new(raw);
-    let mut path_deserializer = PathDeserializer::new(&mut deserializer);
-    T::deserialize(&mut path_deserializer).map_err(|error| {
+    let deserializer = toml::Deserializer::new(raw);
+    serde_path_to_error::deserialize(deserializer).map_err(|error| {
         let path = error.path().to_string();
         let inner = error.into_inner();
         let message = if path.is_empty() {
@@ -335,7 +333,7 @@ impl AppConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("cannot read config file '{}'", path.display()))?;
-        let mut cfg: AppConfig = deserialize_toml_with_field_context(&raw, path)
+        let mut cfg: AppConfig = deserialize_toml_with_field_context(&raw)
             .with_context(|| format!("failed to parse config file '{}'", path.display()))?;
         cfg.resolve_env_vars()?;
         cfg.validate()?;
@@ -624,11 +622,14 @@ mod tests {
         for val in 0u64..5 {
             let mut cfg = AppConfig {
                 poll_interval_seconds: val,
+                contracts: vec![],
+                cursor_file: None,
                 http_pool_max_idle_per_host: None,
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
             };
             let err = cfg.validate().unwrap_err();
+            assert!(
                 err.to_string().contains("poll_interval_seconds must be >= 5"),
                 "val={} should be rejected: {}", val, err
             );
