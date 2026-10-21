@@ -354,8 +354,14 @@ async fn poll_contract(
         let enriched = match EnrichedTransaction::from_horizon(record.tx, function_names, amount_stroops, None) {
             Ok(t) => t,
             Err(e) => {
+                // Skip-and-advance (#305): the cursor was already moved past this
+                // transaction above. Retrying would pin the cursor on a record that
+                // can never be parsed and stall every transaction after it, so the
+                // skip is counted instead and operators can alert on the metric.
                 warn!(contract = %contract.label, tx = %tx_hash, error = %e,
                     "skipping transaction due to enrichment error");
+                #[cfg(feature = "metrics")]
+                metrics::inc_enrichment_errors();
                 continue;
             }
         };
@@ -483,7 +489,7 @@ fn startup_log_fields(cfg: &AppConfig) -> (String, String, String, String) {
 mod tests {
     use super::*;
     use txwatch_config::{AlertRule, Network};
-    use wiremock::matchers::{method, path_regex};
+    use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn ops_page(function_name: &str) -> serde_json::Value {
@@ -781,6 +787,95 @@ mod tests {
         assert_eq!(networks, "mainnet, testnet");
         assert!(horizon_urls.contains("mainnet=https://horizon.stellar.org"));
         assert!(horizon_urls.contains("testnet=https://horizon-testnet.stellar.org"));
+    }
+
+    /// Reads a counter's current value from the default Prometheus registry.
+    #[cfg(feature = "metrics")]
+    fn counter_value(name: &str) -> f64 {
+        prometheus::gather()
+            .iter()
+            .find(|family| family.get_name() == name)
+            .and_then(|family| family.get_metric().first().map(|m| m.get_counter().get_value()))
+            .unwrap_or(0.0)
+    }
+
+    /// #305: a transaction whose enrichment fails is skipped and counted, the cursor
+    /// still moves past it, and the next transaction in the page is processed.
+    #[tokio::test]
+    async fn enrichment_failure_skips_tx_and_advances_cursor() {
+        let server   = MockServer::start().await;
+        let receiver = MockServer::start().await;
+
+        // The first record has an unparseable created_at, so from_horizon fails.
+        let page = serde_json::json!({
+            "_embedded": {
+                "records": [
+                    {
+                        "hash": "bad_ts_tx", "created_at": "not-a-timestamp",
+                        "successful": true, "paging_token": "1",
+                        "fee_charged": "100", "envelope_xdr": null, "result_xdr": null
+                    },
+                    {
+                        "hash": "good_tx", "created_at": "2024-06-01T10:00:00Z",
+                        "successful": true, "paging_token": "2",
+                        "fee_charged": "100", "envelope_xdr": null, "result_xdr": null
+                    }
+                ]
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .mount(&server)
+            .await;
+
+        // Only the parseable transaction matches AnyTransaction and fires a webhook.
+        Mock::given(method("POST"))
+            .and(path("/hooks"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&receiver)
+            .await;
+
+        let client   = Client::new();
+        let contract = WatchedContract {
+            label:       "Contract".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network:     Network::Testnet,
+            rules:       vec![AlertRule::AnyTransaction],
+            webhook_url: format!("{}/hooks", receiver.uri()),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract.contract_id.clone(), "now".to_string());
+
+        #[cfg(feature = "metrics")]
+        let errors_before = counter_value("txwatch_enrichment_errors_total");
+
+        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+
+        assert_eq!(txs, 1, "only the parseable transaction is counted as processed");
+        assert_eq!(alerts, 1);
+        assert_eq!(
+            cursors.get(&contract.contract_id).map(String::as_str),
+            Some("2"),
+            "cursor must advance past the skipped transaction so it is not retried"
+        );
+
+        #[cfg(feature = "metrics")]
+        assert_eq!(
+            counter_value("txwatch_enrichment_errors_total") - errors_before,
+            1.0,
+            "the skipped transaction must increment txwatch_enrichment_errors_total"
+        );
     }
 
     // ── extract_soroban_details (#304) ───────────────────────────────────────

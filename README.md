@@ -257,13 +257,14 @@ Build with the `metrics` feature to expose Prometheus counters and an HTTP `/met
 cargo build -p txwatch-poller --features metrics
 ```
 
-Three counters are registered:
+Four counters are registered:
 
 | Counter | Description |
 |---|---|
 | `txwatch_transactions_total` | Total Stellar transactions processed across all watched contracts |
 | `txwatch_alerts_total` | Total alert payloads sent (rules matched) |
 | `txwatch_webhook_failures_total` | Total permanent webhook delivery failures (after all retries) |
+| `txwatch_enrichment_errors_total` | Transactions skipped because enrichment failed (e.g. an unparseable `created_at`). The cursor still advances past them, so they are not retried. |
 
 To start the `/metrics` endpoint, call `txwatch_poller::serve_metrics(addr)` before `run_with`.
 The endpoint serves the standard Prometheus text exposition format and can be scraped by any

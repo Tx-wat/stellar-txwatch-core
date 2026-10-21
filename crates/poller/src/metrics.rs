@@ -1,9 +1,10 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes three counters:
+//! Exposes four counters:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
+//! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
 //!
 //! An optional HTTP `/metrics` endpoint can be started by calling [`serve_metrics`].
 //! It serves the Prometheus text exposition format on the configured bind address.
@@ -41,6 +42,17 @@ fn alerts_total() -> &'static IntCounter {
     })
 }
 
+fn enrichment_errors_total() -> &'static IntCounter {
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter!(
+            "txwatch_enrichment_errors_total",
+            "Transactions skipped because enrichment failed (the cursor still advances past them)"
+        )
+        .expect("register txwatch_enrichment_errors_total")
+    })
+}
+
 fn webhook_failures_total() -> &'static IntCounter {
     static C: OnceLock<IntCounter> = OnceLock::new();
     C.get_or_init(|| {
@@ -65,6 +77,11 @@ pub fn inc_alerts(n: u64) {
 /// Increment the `txwatch_webhook_failures_total` counter by 1.
 pub fn inc_webhook_failures() {
     webhook_failures_total().inc();
+}
+
+/// Increment the `txwatch_enrichment_errors_total` counter by 1.
+pub fn inc_enrichment_errors() {
+    enrichment_errors_total().inc();
 }
 
 // ── /metrics HTTP endpoint ────────────────────────────────────────────────────
