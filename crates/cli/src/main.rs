@@ -2,8 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use reqwest::Client;
-use tokio::sync::watch;
+use reqwest::{Client, StatusCode};
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
 use txwatch_notifier::{build_client, send_webhook, test_payload_with_network};
@@ -149,16 +148,6 @@ async fn main() -> Result<()> {
         Command::Watch { dry_run } => {
             let cfg = AppConfig::from_file(&cli.config)?;
 
-            // Graceful shutdown: allow the current poll cycle to finish before exiting.
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            tokio::spawn(async move {
-                if let Err(e) = tokio::signal::ctrl_c().await {
-                    warn!(error = ?e, "failed to install Ctrl+C handler");
-                    return;
-                }
-                let _ = shutdown_tx.send(true);
-            });
-
             info!(
                 version        = VERSION,
                 contracts      = cfg.contracts.len(),
@@ -166,12 +155,13 @@ async fn main() -> Result<()> {
                 dry_run        = dry_run,
                 "starting TxWatch"
             );
-            txwatch_poller::run_with_shutdown(cfg, dry_run, shutdown_rx).await?;
+            txwatch_poller::run_with(cfg, dry_run).await?;
         }
     }
 
     Ok(())
 }
+
 async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
     let response = client.head(url).send().await;
     match response {
