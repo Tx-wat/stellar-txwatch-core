@@ -137,30 +137,18 @@ pub fn evaluate(
     rules: &[AlertRule],
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
-    let horizon_link  = format!("{}/transactions/{}", horizon_base, tx.hash);
-    let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
-    let timestamp = tx.timestamp.timestamp();
-    let timestamp_iso = tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let ctx = PayloadContext {
+        label,
+        contract_id,
+        network,
+        horizon_base,
+        explorer_base,
+    };
 
     rules
         .iter()
         .filter_map(|rule| match eval_rule(rule, tx) {
-            Ok(true) => Some(AlertPayload {
-                label: label.to_string(),
-                contract_id: contract_id.to_string(),
-                network: network.to_string(),
-                rule_type: rule_type(rule),
-                rule_triggered: rule_label(rule),
-                transaction_hash: tx.hash.clone(),
-                function_name: tx.function_names.first().cloned(),
-                function_names: tx.function_names.clone(),
-                amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
-                fee_charged_stroops: tx.fee_charged_stroops,
-                timestamp,
-                timestamp_iso: timestamp_iso.clone(),
-                horizon_link: horizon_link.clone(),
-                explorer_link: explorer_link.clone(),
-            }),
+            Ok(true) => Some(AlertPayload::new(&ctx, tx, rule)),
             Ok(false) => None,
             Err(e) => {
                 tracing::warn!(
@@ -256,7 +244,36 @@ fn rule_type(rule: &AlertRule) -> String {
     }
 }
 
+/// Per-contract values shared by every payload built during one evaluation.
+pub struct PayloadContext<'a> {
+    pub label: &'a str,
+    pub contract_id: &'a str,
+    pub network: &'a str,
+    pub horizon_base: &'a str,
+    pub explorer_base: &'a str,
+}
+
 impl AlertPayload {
+    /// Build the webhook payload for `rule` matching `tx` on the contract described by `ctx`.
+    pub fn new(ctx: &PayloadContext<'_>, tx: &EnrichedTransaction, rule: &AlertRule) -> Self {
+        Self {
+            label: ctx.label.to_string(),
+            contract_id: ctx.contract_id.to_string(),
+            network: ctx.network.to_string(),
+            rule_type: rule_type(rule),
+            rule_triggered: rule_label(rule),
+            transaction_hash: tx.hash.clone(),
+            function_name: tx.function_names.first().cloned(),
+            function_names: tx.function_names.clone(),
+            amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+            fee_charged_stroops: tx.fee_charged_stroops,
+            timestamp: tx.timestamp.timestamp(),
+            timestamp_iso: tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            horizon_link: format!("{}/transactions/{}", ctx.horizon_base, tx.hash),
+            explorer_link: format!("{}/tx/{}", ctx.explorer_base, tx.hash),
+        }
+    }
+
     /// Builder helper to override the label (used by test-webhook).
     pub fn with_label(mut self, label: String) -> Self {
         self.label = label;
@@ -318,6 +335,40 @@ mod tests {
         let payloads = run(&[AlertRule::AnyTransaction], &tx);
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].rule_triggered, "AnyTransaction");
+    }
+
+    #[test]
+    fn alert_payload_new_populates_fields_from_context_and_transaction() {
+        let ctx = PayloadContext {
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: "https://stellar.expert/explorer/testnet",
+        };
+        let mut tx = make_tx(true, &["transfer", "withdraw"], Some(15_000 * 10_000_000));
+        tx.fee_charged_stroops = Some(500);
+
+        let payload = AlertPayload::new(&ctx, &tx, &AlertRule::AnyTransaction);
+
+        assert_eq!(payload.label, "Label");
+        assert_eq!(payload.network, "testnet");
+        assert_eq!(payload.rule_type, "AnyTransaction");
+        assert_eq!(payload.rule_triggered, "AnyTransaction");
+        assert_eq!(payload.transaction_hash, "abc123");
+        assert_eq!(payload.function_name.as_deref(), Some("transfer"));
+        assert_eq!(payload.function_names, vec!["transfer", "withdraw"]);
+        assert_eq!(payload.amount_xlm, Some(15_000));
+        assert_eq!(payload.fee_charged_stroops, Some(500));
+        assert_eq!(payload.timestamp_iso, "2024-01-15T12:00:00Z");
+        assert_eq!(
+            payload.horizon_link,
+            "https://horizon-testnet.stellar.org/transactions/abc123"
+        );
+        assert_eq!(
+            payload.explorer_link,
+            "https://stellar.expert/explorer/testnet/tx/abc123"
+        );
     }
 
     #[test]
