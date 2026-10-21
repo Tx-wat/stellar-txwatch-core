@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run all tests
+        run: cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release -p txwatch
+
+      # Release notes come from the CHANGELOG.md section whose heading matches the
+      # tag (e.g. tag v0.2.0 -> "## [0.2.0] - ..."). The release is refused if the
+      # section is missing or empty, so every release has a changelog entry.
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+          awk -v prefix="## [${VERSION}]" '
+            substr($0, 1, length(prefix)) == prefix { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No non-empty CHANGELOG.md section found for ${VERSION}" >&2
+            exit 1
+          fi
+
+      - name: Create GitHub Release with the txwatch binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cp target/release/txwatch "txwatch-linux-x86_64"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            "txwatch-linux-x86_64"

@@ -249,4 +249,25 @@ docs: document MyNewRule in alert-rules.md
 - [ ] `cargo fmt` applied
 - [ ] New rule documented in `docs/alert-rules.md`
 - [ ] CONTRIBUTING.md updated if the contribution process changed
-- [ ] CHANGELOG.md entry added under [Unreleased] describing what changed
+- [ ] CHANGELOG.md entry added under `## [Unreleased]` in the matching section: `### Added`, `### Changed`, `### Fixed` or `### Removed` (see [Keep a Changelog](https://keepachangelog.com/en/1.0.0/))
+
+---
+
+## Releasing
+
+Releases are cut by pushing a version tag. The `Release` workflow
+(`.github/workflows/release.yml`) then runs the test suite, builds the Linux
+x86_64 `txwatch` binary, and creates a GitHub Release.
+
+1. Move the entries under `## [Unreleased]` in `CHANGELOG.md` into a new
+   `## [X.Y.Z] - YYYY-MM-DD` section, and leave `## [Unreleased]` empty.
+2. Merge that change to `main`.
+3. Tag the commit and push the tag:
+
+   ```bash
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
+   ```
+
+The release notes are the body of the `## [X.Y.Z]` section. The workflow fails
+if that section is missing or empty, so fill it in before tagging.
