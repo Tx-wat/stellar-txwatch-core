@@ -290,6 +290,39 @@ mod tests {
         )
     }
 
+    /// Issue #272: a payload built by `evaluate` serializes to exactly the
+    /// fields documented in the README webhook payload section.
+    #[test]
+    fn alert_payload_json_includes_all_documented_fields() {
+        let tx = make_tx(true, &["transfer"], Some(150_000_000_000));
+        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        assert_eq!(payloads.len(), 1);
+
+        let json = serde_json::to_value(&payloads[0]).unwrap();
+        let object = json.as_object().unwrap();
+
+        let documented = [
+            "label",
+            "contract_id",
+            "network",
+            "rule_type",
+            "rule_triggered",
+            "transaction_hash",
+            "function_name",
+            "function_names",
+            "amount_xlm",
+            "fee_charged_stroops",
+            "timestamp",
+            "timestamp_iso",
+            "horizon_link",
+            "explorer_link",
+        ];
+        for field in documented {
+            assert!(object.contains_key(field), "missing documented field: {}", field);
+        }
+        assert_eq!(object.len(), documented.len(), "undocumented fields present: {:?}", object.keys());
+    }
+
     #[test]
     fn any_transaction_always_fires() {
         let tx = make_tx(true, &[], None);
