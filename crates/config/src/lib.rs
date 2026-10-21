@@ -202,11 +202,17 @@ impl WatchedContract {
             bail!("a contract has an empty label");
         }
 
-        // Stellar contract addresses start with 'C' and are 56 chars (base32)
-        if self.contract_id.len() != 56 || !self.contract_id.starts_with('C') {
+        // Stellar contract addresses start with 'C', are 56 chars, and use the
+        // RFC 4648 base32 alphabet in uppercase (A-Z and 2-7 only).
+        let valid_charset = self
+            .contract_id
+            .bytes()
+            .all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'));
+        if self.contract_id.len() != 56 || !self.contract_id.starts_with('C') || !valid_charset {
             bail!(
                 "contract '{}': contract_id '{}' is not a valid Stellar contract address \
-                 (must start with 'C' and be 56 characters)",
+                 (must start with 'C', be 56 characters, and use only uppercase base32 \
+                 characters A-Z and 2-7)",
                 self.label,
                 self.contract_id
             );
@@ -392,6 +398,22 @@ mod tests {
     fn rejects_short_contract_id() {
         let mut c = valid_contract();
         c.contract_id = "CSHORT".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_contract_id_with_lowercase_letters() {
+        let mut c = valid_contract();
+        c.contract_id = format!("Ca{}", "A".repeat(54));
+        assert_eq!(c.contract_id.len(), 56);
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("A-Z and 2-7"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn rejects_contract_id_with_digits_outside_base32() {
+        let mut c = valid_contract();
+        c.contract_id = format!("C1{}", "A".repeat(54));
         assert!(c.validate().is_err());
     }
 
