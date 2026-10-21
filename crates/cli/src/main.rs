@@ -148,9 +148,8 @@ async fn main() -> Result<()> {
                 ));
             }
             let first_contract = &cfg.contracts[0];
-            let network_name = first_contract.network.as_str();
             let horizon_base_url = first_contract.network.horizon_base_url();
-            let payload = test_payload_with_network(&label, &url, network_name, horizon_base_url);
+            let payload = test_payload_with_network(&label, &url, &first_contract.network, horizon_base_url);
             let client  = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");
@@ -163,6 +162,15 @@ async fn main() -> Result<()> {
 
         Command::Watch { dry_run, from_beginning } => {
             let cfg = AppConfig::from_file(&cli.config)?;
+
+            if poll_once {
+                let failed = txwatch_poller::run_once(cfg, dry_run).await?;
+                if failed > 0 {
+                    return Err(anyhow::anyhow!("{} contract poll(s) failed", failed));
+                }
+                info!("poll-once cycle completed for all contracts");
+                return Ok(());
+            }
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             // Handles both Ctrl+C (SIGINT) and SIGTERM (e.g. from Docker/systemd).

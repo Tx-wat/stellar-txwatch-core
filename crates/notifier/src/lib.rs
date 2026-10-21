@@ -184,7 +184,7 @@ pub async fn send_webhook(
 
 /// Build a synthetic `AlertPayload` suitable for `test-webhook`.
 pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
-    test_payload_with_network(label, webhook_url, "testnet", "https://horizon-testnet.stellar.org")
+    test_payload_with_network(label, webhook_url, &Network::Testnet, "https://horizon-testnet.stellar.org")
 }
 
 /// Build a synthetic `AlertPayload` with an explicit network name and Horizon base URL.
@@ -201,7 +201,7 @@ pub fn test_payload_with_network(
     AlertPayload {
         label:               label.to_string(),
         contract_id:         "CTEST000000000000000000000000000000000000000000000000000".into(),
-        network:             network.to_string(),
+        network:             network.clone(),
         rule_type:           "TestWebhook".into(),
         rule_triggered:      "TestWebhook".into(),
         transaction_hash:    tx_hash.into(),
@@ -233,7 +233,7 @@ mod tests {
         AlertPayload {
             label:               "Test Contract".into(),
             contract_id:         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network:             "testnet".into(),
+            network:             Network::Testnet,
             rule_type:           "AnyTransaction".into(),
             rule_triggered:      "AnyTransaction".into(),
             transaction_hash:    "abc123".into(),

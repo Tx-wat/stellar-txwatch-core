@@ -210,12 +210,14 @@ async fn run_internal(
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .pool_max_idle_per_host(max_idle)
-        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
-        .build()
-        .context("failed to build HTTP client")?;
+/// Run the polling loop until `shutdown` is set to `true`. A shutdown request
+/// is observed between poll cycles, so the in-flight cycle always completes.
+pub async fn run_with_shutdown(
+    cfg:        AppConfig,
+    dry_run:    bool,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let client = build_http_client(&cfg)?;
 
     let mut cursors: HashMap<String, String> = if from_beginning {
         // Issue #262: --from-beginning overrides any persisted cursor values.
@@ -549,6 +551,74 @@ impl HorizonClient for Client {
     }
 }
 
+/// Run exactly one poll cycle over every contract, then return. Uses the same
+/// starting cursors as `run_with_shutdown`. Returns the number of contracts whose
+/// poll failed; a contract that fails is logged and does not stop the others.
+pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<usize> {
+    let client = build_http_client(&cfg)?;
+    let mut cursors = initial_cursors(&cfg);
+    let mut failed = 0;
+
+    for contract in &cfg.contracts {
+        if let Err(e) = poll_contract(&client, contract, &mut cursors, dry_run).await {
+            error!(contract = %contract.label, error = %e, "contract polling task failed");
+            failed += 1;
+        }
+    }
+
+    Ok(failed)
+}
+
+fn build_http_client(cfg: &AppConfig) -> Result<Client> {
+    let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
+    let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+
+    Client::builder()
+        .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(max_idle)
+        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
+        .build()
+        .context("failed to build HTTP client")
+}
+
+/// Starting cursor for each contract: the value from `cursor_file` when present,
+/// otherwise `"now"`.
+fn initial_cursors(cfg: &AppConfig) -> HashMap<String, String> {
+    if let Some(path) = &cfg.cursor_file {
+        match fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
+                Ok(mut map) => {
+                    // Ensure every configured contract has a cursor entry.
+                    for c in &cfg.contracts {
+                        map.entry(c.contract_id.clone())
+                            .or_insert_with(|| "now".to_string());
+                    }
+                    map
+                }
+                Err(e) => {
+                    warn!(error = ?e, "failed to parse cursor_file; starting from 'now' for all contracts");
+                    cfg.contracts
+                        .iter()
+                        .map(|c| (c.contract_id.clone(), "now".to_string()))
+                        .collect()
+                }
+            },
+            Err(e) => {
+                debug!(error = ?e, "could not read cursor_file; starting from 'now'");
+                cfg.contracts
+                    .iter()
+                    .map(|c| (c.contract_id.clone(), "now".to_string()))
+                    .collect()
+            }
+        }
+    } else {
+        cfg.contracts
+            .iter()
+            .map(|c| (c.contract_id.clone(), "now".to_string()))
+            .collect()
+    }
+}
+
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Returns `(transactions_processed, alerts_fired, alerts_suppressed_by_cap)`.
@@ -618,6 +688,10 @@ async fn poll_contract(
 
         if !response.status().is_success() {
             anyhow::bail!("Horizon returned HTTP {} from {}", response.status(), url);
+        }
+
+        if !response.status().is_success() {
+            anyhow::bail!("Horizon returned HTTP {} for {}", response.status(), url);
         }
 
         let page: HorizonPage = response
@@ -722,7 +796,7 @@ async fn poll_contract(
         let payloads = evaluate(
             &contract.label,
             &contract.contract_id,
-            contract.network.as_str(),
+            &contract.network,
             canonical_base,
             contract.network.explorer_base_url(),
             &contract.rules,
@@ -780,6 +854,29 @@ async fn poll_contract(
 
 // ── Soroban operation enrichment ──────────────────────────────────────────────
 
+/// Parse a Horizon amount string (e.g. `"1000.1234567"`) into stroops using integer
+/// arithmetic only. Returns `None` for anything other than a plain decimal with at
+/// most 7 fractional digits, rather than silently rounding.
+fn parse_xlm_to_stroops(amount: &str) -> Option<u64> {
+    const STROOPS_PER_XLM: u64 = 10_000_000;
+    const FRACTION_DIGITS: usize = 7;
+
+    let (whole, fraction) = amount.split_once('.').unwrap_or((amount, ""));
+    if fraction.len() > FRACTION_DIGITS || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    let whole_stroops = whole.parse::<u64>().ok()?.checked_mul(STROOPS_PER_XLM)?;
+    // Right-pad the fraction to 7 digits: ".12" -> 1_200_000 stroops.
+    let fraction_stroops = if fraction.is_empty() {
+        0
+    } else {
+        format!("{:0<width$}", fraction, width = FRACTION_DIGITS).parse::<u64>().ok()?
+    };
+
+    whole_stroops.checked_add(fraction_stroops)
+}
+
 /// Extract Soroban details from a slice of already-fetched operations.
 /// Used for both inline (join=operations) and separately-fetched operations.
 fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u64>) {
@@ -795,8 +892,8 @@ fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u
         }
         if op.op_type == "payment" {
             if let Some(amt_str) = op.amount {
-                if let Ok(xlm) = amt_str.parse::<f64>() {
-                    total_stroops = total_stroops.saturating_add((xlm * 10_000_000.0) as u64);
+                if let Some(stroops) = parse_xlm_to_stroops(&amt_str) {
+                    total_stroops = total_stroops.saturating_add(stroops);
                     has_payment = true;
                 }
             }
@@ -1053,6 +1150,40 @@ mod tests {
         assert!(amount.is_none());
     }
 
+    #[test]
+    fn parse_xlm_to_stroops_is_exact_where_f64_is_not() {
+        // 1000000000.1234567 XLM is ~1e16 stroops, beyond f64's 2^53 exact range.
+        assert_eq!(parse_xlm_to_stroops("1000000000.1234567"), Some(10_000_000_001_234_567));
+    }
+
+    #[test]
+    fn parse_xlm_to_stroops_pads_short_fractions() {
+        assert_eq!(parse_xlm_to_stroops("10"), Some(100_000_000));
+        assert_eq!(parse_xlm_to_stroops("1.5"), Some(15_000_000));
+        assert_eq!(parse_xlm_to_stroops("0.0000001"), Some(1));
+    }
+
+    #[test]
+    fn parse_xlm_to_stroops_rejects_malformed_amounts() {
+        assert_eq!(parse_xlm_to_stroops(""), None);
+        assert_eq!(parse_xlm_to_stroops("abc"), None);
+        assert_eq!(parse_xlm_to_stroops("-1"), None);
+        assert_eq!(parse_xlm_to_stroops(".5"), None);
+        assert_eq!(parse_xlm_to_stroops("1.12345678"), None);
+    }
+
+    #[test]
+    fn extract_soroban_details_sums_payments_without_float_drift() {
+        let ops = vec![HorizonOperation {
+            op_type: "payment".into(),
+            function: None,
+            amount: Some("1000000000.1234567".into()),
+        }];
+        let (fn_names, amount) = extract_soroban_details(ops);
+        assert!(fn_names.is_empty());
+        assert_eq!(amount, Some(10_000_000_001_234_567));
+    }
+
     #[tokio::test]
     async fn fetch_soroban_details_extracts_payment_amount() {
         let server = MockServer::start().await;
@@ -1108,6 +1239,7 @@ mod tests {
         let contract = WatchedContract {
             rules: vec![],
             label: "test".into(),
+            rules: vec![txwatch_config::AlertRule::AnyTransaction],
             contract_id: contract_id.into(),
             network: Network::Testnet,
             rules: vec![AlertRule::AnyTransaction],
@@ -1191,6 +1323,7 @@ mod tests {
         let contract = WatchedContract {
             rules: vec![],
             label: "test".into(),
+            rules: vec![txwatch_config::AlertRule::AnyTransaction],
             contract_id: contract_id.into(),
             network: Network::Testnet,
             rules: vec![AlertRule::AnyTransaction],

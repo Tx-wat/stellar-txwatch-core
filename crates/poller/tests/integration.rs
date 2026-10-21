@@ -232,7 +232,7 @@ async fn any_transaction_fires_webhook() {
         let payloads = evaluate(
             &contract.label,
             &contract.contract_id,
-            contract.network.as_str(),
+            &contract.network,
             &horizon.uri(),
             "https://stellar.expert/explorer/testnet",
             &contract.rules,
