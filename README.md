@@ -124,9 +124,9 @@ For local development with webhook testing, see [Local Development with Docker C
 txwatch [--config <path>] <command>
 
 Commands:
-  watch                        Start the polling engine
-  validate                     Validate the config file and print a summary
-  test-webhook --url <URL>     Send a test payload to a webhook URL and exit
+  watch [--dry-run] [--from-beginning]  Start the polling engine
+  validate [--check-webhooks]           Validate the config file and print a summary
+  test-webhook --url <URL>              Send a test payload to a webhook URL and exit
 ```
 
 `--config` defaults to `config/example.toml`. It can also be set with the
@@ -134,6 +134,10 @@ Commands:
 
 Optional OpenTelemetry trace export: build with `--features opentelemetry` and set
 `OTEL_EXPORTER_OTLP_ENDPOINT`. See [docs/configuration.md](docs/configuration.md#opentelemetry-trace-export-optional).
+
+**watch flags:**
+- `--dry-run` — evaluate rules and log matches, but do not send any webhooks
+- `--from-beginning` — start polling from the earliest available transaction (cursor `0`) instead of `now`. Overrides any persisted `cursor_file` values for this run (does not modify the file). Warning: may generate many alerts for historical transactions.
 
 ---
 
@@ -170,7 +174,7 @@ webhook_url = "https://hooks.example.com/my-webhook"
 |---|---|
 | `AnyTransaction` | Any transaction touches the contract |
 | `TransactionFailed` | A transaction fails (`successful = false`) |
-| `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM |
+| `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM, or ≥ `threshold_stroops` stroops (exactly one) |
 | `FunctionCalled` | A specific Soroban function is invoked |
 | `AdminFunctionCalled` | Any function in a named list is invoked |
 | `HighFee` | Transaction fee exceeds configured threshold |
@@ -192,11 +196,16 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "function_name":    "transfer",
   "function_names":   ["transfer"],
   "amount_xlm":       15000,
+  "amount_stroops":   150000000000,
   "fee_charged_stroops": 50000,
+  "memo_type":        "text",
+  "memo":             "order-1234",
   "timestamp":        1705316096,
   "timestamp_iso":    "2024-01-15T12:00:00Z",
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
-  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123..."
+  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123...",
+  "ledger_sequence":  12345678,
+  "source_account":   "GABC..."
 }
 ```
 
@@ -211,8 +220,12 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
 - `function_names` — all invoked Soroban function names in the transaction (may contain multiple entries for multi-op transactions).
+- `memo_type` — the transaction memo type from Horizon (`"text"`, `"hash"`, `"id"`, `"return"` or `"none"`), or `null` if Horizon did not return one.
+- `memo` — the transaction memo value (e.g. an order ID or payment reference), or `null` when the transaction has no memo.
 - `horizon_link` — direct Horizon REST API URL for the transaction (e.g. `https://horizon-testnet.stellar.org/transactions/<hash>`); useful for fetching raw XDR or operation details programmatically.
 - `explorer_link` — Stellar Expert web explorer URL for the transaction (e.g. `https://stellar.expert/explorer/testnet/tx/<hash>`); useful for human-readable inspection in a browser.
+- `ledger_sequence` — the Stellar ledger (block) sequence number this transaction was included in; always present when Horizon returns it, otherwise `null`. Use this to cross-reference with Stellar ledger data or detect gaps in monitored activity.
+- `source_account` — the Stellar account that signed and submitted the transaction (e.g. `"GABC..."`); always present when Horizon returns it, otherwise `null`. Useful for knowing which user or bot triggered the alert and for filtering alerts by caller in downstream systems.
 
 > **`horizon_link` vs `explorer_link`**: `horizon_link` points to the Horizon REST API endpoint and returns raw JSON — useful for programmatic access. `explorer_link` points to the [Stellar Expert](https://stellar.expert) web UI — useful for human inspection. Both are always present for every alert regardless of rule type.
 
@@ -261,13 +274,14 @@ Build with the `metrics` feature to expose Prometheus counters and an HTTP `/met
 cargo build -p txwatch-poller --features metrics
 ```
 
-Three counters are registered:
+Four counters are registered:
 
 | Counter | Description |
 |---|---|
 | `txwatch_transactions_total` | Total Stellar transactions processed across all watched contracts |
 | `txwatch_alerts_total` | Total alert payloads sent (rules matched) |
 | `txwatch_webhook_failures_total` | Total permanent webhook delivery failures (after all retries) |
+| `txwatch_enrichment_errors_total` | Transactions skipped because enrichment failed (e.g. an unparseable `created_at`). The cursor still advances past them, so they are not retried. |
 
 To start the `/metrics` endpoint, call `txwatch_poller::serve_metrics(addr)` before `run_with`.
 The endpoint serves the standard Prometheus text exposition format and can be scraped by any

@@ -41,6 +41,12 @@ enum Command {
         /// Do not actually send webhooks; only log matched rules
         #[arg(long)]
         dry_run: bool,
+
+        /// Start polling from the earliest available transaction (cursor = 0).
+        /// Overrides any persisted cursor_file values for this run (does not modify the file).
+        /// Warning: this may generate many alerts for historical transactions.
+        #[arg(long)]
+        from_beginning: bool,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -63,6 +69,10 @@ enum Command {
         /// Label to include in the test payload
         #[arg(long, default_value = "TxWatch Test")]
         label: String,
+
+        /// Sign the payload with HMAC-SHA256 using this secret (sent as X-TxWatch-Signature)
+        #[arg(long)]
+        secret: Option<String>,
     },
 }
 
@@ -130,7 +140,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::TestWebhook { url, label } => {
+        Command::TestWebhook { url, label, secret } => {
             let cfg = AppConfig::from_file(&cli.config)?;
             if cfg.contracts.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -144,22 +154,43 @@ async fn main() -> Result<()> {
             let client  = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");
-            send_webhook(&client, &url, &payload, None)
+            send_webhook(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
-            println!("Test webhook delivered successfully to {}", url);
+            let signing = if secret.is_some() { "signed with HMAC-SHA256" } else { "unsigned" };
+            println!("Test webhook delivered successfully to {} ({})", url, signing);
         }
 
-        Command::Watch { dry_run } => {
+        Command::Watch { dry_run, from_beginning } => {
             let cfg = AppConfig::from_file(&cli.config)?;
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
+            // Handles both Ctrl+C (SIGINT) and SIGTERM (e.g. from Docker/systemd).
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             tokio::spawn(async move {
-                if let Err(e) = tokio::signal::ctrl_c().await {
-                    warn!(error = ?e, "failed to install Ctrl+C handler");
-                    return;
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = signal(SignalKind::terminate())
+                        .expect("failed to install SIGTERM handler");
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => {
+                            if let Err(e) = result {
+                                warn!(error = ?e, "failed to install Ctrl+C handler");
+                            }
+                        }
+                        _ = sigterm.recv() => {
+                            info!("received SIGTERM");
+                        }
+                    }
                 }
+                #[cfg(not(unix))]
+                {
+                    if let Err(e) = tokio::signal::ctrl_c().await {
+                        warn!(error = ?e, "failed to install Ctrl+C handler");
+                    }
+                }
+                info!("shutdown signal received — finishing current poll cycle");
                 let _ = shutdown_tx.send(true);
             });
 
@@ -168,14 +199,16 @@ async fn main() -> Result<()> {
                 contracts      = cfg.contracts.len(),
                 interval_secs  = cfg.poll_interval_seconds,
                 dry_run        = dry_run,
+                from_beginning = from_beginning,
                 "starting TxWatch"
             );
-            txwatch_poller::run_with_shutdown(cfg, dry_run, shutdown_rx).await?;
+            txwatch_poller::run_with_options(cfg, dry_run, from_beginning, shutdown_rx).await?;
         }
     }
 
     Ok(())
 }
+
 async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
     let response = client.head(url).send().await;
     match response {

@@ -1,6 +1,7 @@
 [package]
 name    = "txwatch"
 version = "0.1.0"
+license = "Apache-2.0"
 edition = "2021"
 license   = "Apache-2.0"
 publish   = false
@@ -19,16 +20,8 @@ anyhow           = { workspace = true }
 reqwest          = { workspace = true }
 tracing          = { workspace = true }
 tracing-subscriber = { workspace = true }
-opentelemetry        = { version = "0.33", optional = true }
-opentelemetry_sdk    = { version = "0.33", optional = true }
-opentelemetry-otlp   = { version = "0.33", default-features = false, features = ["trace", "grpc-tonic"], optional = true }
-tracing-opentelemetry = { version = "0.34", optional = true }
 
-[features]
-# Opt-in OTLP trace export. Off by default so the default build has no extra dependencies.
-opentelemetry = [
-    "dep:opentelemetry",
-    "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
-    "dep:tracing-opentelemetry",
-]
+[dev-dependencies]
+hmac               = { workspace = true }
+sha2               = { workspace = true }
+hex                = { workspace = true }

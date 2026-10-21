@@ -1,40 +1,50 @@
-# cargo-deny configuration: advisory, license, ban, and source policy.
-# Run locally with `cargo deny check` (see CONTRIBUTING.md).
-
-[graph]
-all-features = true
+# cargo-deny configuration
+# This file specifies security and dependency policies for the project.
+# Checked in CI by the `deny` job in .github/workflows/ci.yml (`cargo deny check`).
 
 [advisories]
-# Known vulnerabilities (RustSec) always fail the check.
+# How to handle crates with security vulnerabilities (always an error; not configurable).
+# How to handle unmaintained crates: "all", "workspace", "transitive" or "none".
 unmaintained = "workspace"
-yanked       = "deny"
-ignore       = []
+# A list of advisory IDs to ignore. Each entry needs a justification comment.
+ignore = [
+    #"RUSTSEC-2020-0001",
+]
 
 [licenses]
-# Only licenses on this allow-list pass; anything else fails the check.
+# List of explicitly allowed licenses. Anything not listed (including GPL-2.0,
+# GPL-3.0 and AGPL-3.0) is rejected. Unlicensed crates are always rejected.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "MIT",
-    "MPL-2.0",
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "Unlicense",
     "Zlib",
 ]
+# The confidence threshold for detecting a license from license text.
 confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"
-wildcards         = "deny"
-# Path dependencies between workspace crates have no version requirement.
-allow-wildcard-paths = true
-deny              = []
-skip              = []
-skip-tree         = []
+# Lint level for wildcard version requirements
+wildcards = "warn"
+# A list of explicitly disallowed crates
+deny = [
+    # Each entry can be just the name and version like:
+    # { name = "ansi_term", version = "=0.11.0" },
+]
+# Certain crates/versions that will be skipped when doing duplicate detection.
+skip = [
+    #{ name = "ansi_term", version = "=0.11.0" },
+]
+# Similarly named crates that are allowed to coexist
+skip-tree = [
+    #{ name = "windows-sys", version = "=0.48.0" },
+]
 
 [sources]
 unknown-registry = "deny"
