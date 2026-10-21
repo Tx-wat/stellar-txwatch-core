@@ -3,6 +3,7 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::{Client, StatusCode};
+use tokio::sync::watch;
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
 use txwatch_notifier::{build_client, send_webhook, test_payload_with_network};
@@ -40,6 +41,12 @@ enum Command {
         /// Do not actually send webhooks; only log matched rules
         #[arg(long)]
         dry_run: bool,
+
+        /// Start polling from the earliest available transaction (cursor = 0).
+        /// Overrides any persisted cursor_file values for this run (does not modify the file).
+        /// Warning: this may generate many alerts for historical transactions.
+        #[arg(long)]
+        from_beginning: bool,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -150,17 +157,48 @@ async fn main() -> Result<()> {
             println!("Test webhook delivered successfully to {} ({})", url, signing);
         }
 
-        Command::Watch { dry_run } => {
+        Command::Watch { dry_run, from_beginning } => {
             let cfg = AppConfig::from_file(&cli.config)?;
+
+            // Graceful shutdown: allow the current poll cycle to finish before exiting.
+            // Handles both Ctrl+C (SIGINT) and SIGTERM (e.g. from Docker/systemd).
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            tokio::spawn(async move {
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = signal(SignalKind::terminate())
+                        .expect("failed to install SIGTERM handler");
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => {
+                            if let Err(e) = result {
+                                warn!(error = ?e, "failed to install Ctrl+C handler");
+                            }
+                        }
+                        _ = sigterm.recv() => {
+                            info!("received SIGTERM");
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    if let Err(e) = tokio::signal::ctrl_c().await {
+                        warn!(error = ?e, "failed to install Ctrl+C handler");
+                    }
+                }
+                info!("shutdown signal received — finishing current poll cycle");
+                let _ = shutdown_tx.send(true);
+            });
 
             info!(
                 version        = VERSION,
                 contracts      = cfg.contracts.len(),
                 interval_secs  = cfg.poll_interval_seconds,
                 dry_run        = dry_run,
+                from_beginning = from_beginning,
                 "starting TxWatch"
             );
-            txwatch_poller::run_with(cfg, dry_run).await?;
+            txwatch_poller::run_with_options(cfg, dry_run, from_beginning, shutdown_rx).await?;
         }
     }
 

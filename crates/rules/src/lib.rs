@@ -3,11 +3,16 @@
 
 //! txwatch-rules evaluates `AlertRule` conditions against enriched Stellar transactions
 //! and constructs structured `AlertPayload` webhook bodies.
+//!
+//! Also exposes `HorizonOperation` and `extract_soroban_details` so that the pure
+//! data-extraction logic lives in this crate (no I/O, fully unit-testable) and the
+//! poller only handles HTTP concerns.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use txwatch_config::{large_transfer_label, AlertRule, STROOPS_PER_XLM};
+use std::collections::HashMap;
+use txwatch_config::AlertRule;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -16,6 +21,59 @@ use txwatch_config::{large_transfer_label, AlertRule, STROOPS_PER_XLM};
 /// as a reference for validating that u64 is sufficient for any realistic transaction
 /// amount, since 500 trillion is well below u64::MAX (18.4 quintillion).
 pub const MAX_XLM_SUPPLY_STROOPS: u64 = 500_000_000_000_000_000;
+
+// ── Horizon operation shape ───────────────────────────────────────────────────
+
+/// A single Horizon operation record.
+///
+/// Only the fields relevant to Soroban enrichment are captured; unknown fields
+/// are ignored by serde so this struct stays forward-compatible with Horizon API changes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HorizonOperation {
+    /// The operation type string as returned by Horizon (e.g. `"invoke_host_function"`,
+    /// `"payment"`).
+    #[serde(rename = "type")]
+    pub op_type: String,
+    /// Present on `invoke_host_function` operations — the Soroban function name.
+    pub function: Option<String>,
+    /// Present on `payment` operations — amount as a decimal string (e.g. `"1000.0000000"`).
+    pub amount: Option<String>,
+}
+
+/// Extract Soroban function names and total payment amount from a list of operations.
+///
+/// This is a pure data transformation with no I/O — it lives in `txwatch-rules` so it
+/// can be unit-tested without spinning up mock HTTP servers.
+///
+/// # Returns
+/// `(function_names, amount_stroops)` where:
+/// - `function_names` contains one entry per `invoke_host_function` op that has a
+///   `function` field.
+/// - `amount_stroops` is `Some(total)` when at least one `payment` op is present,
+///   otherwise `None`. Amounts are summed using saturating arithmetic.
+pub fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u64>) {
+    let mut function_names: Vec<String> = Vec::new();
+    let mut total_stroops: u64 = 0;
+    let mut has_payment = false;
+
+    for op in ops {
+        if op.op_type == "invoke_host_function" {
+            if let Some(f) = op.function {
+                function_names.push(f);
+            }
+        }
+        if op.op_type == "payment" {
+            if let Some(amt_str) = op.amount {
+                if let Ok(xlm) = amt_str.parse::<f64>() {
+                    total_stroops = total_stroops.saturating_add((xlm * 10_000_000.0) as u64);
+                    has_payment = true;
+                }
+            }
+        }
+    }
+
+    (function_names, if has_payment { Some(total_stroops) } else { None })
+}
 
 // ── Horizon transaction shape ─────────────────────────────────────────────────
 
@@ -32,6 +90,10 @@ pub struct HorizonTransaction {
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
     pub result_xdr: Option<String>,
+    /// Memo type: `"text"`, `"hash"`, `"id"`, `"return"` or `"none"`.
+    pub memo_type: Option<String>,
+    /// Memo value; absent when `memo_type` is `"none"`.
+    pub memo: Option<String>,
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -55,10 +117,20 @@ pub struct EnrichedTransaction {
     pub amount_stroops: Option<u64>,
     /// Fee charged for this transaction in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// Memo type from Horizon (`"text"`, `"hash"`, `"id"`, `"return"`, `"none"`).
+    pub memo_type: Option<String>,
+    /// Memo value from Horizon, if the transaction carries one.
+    pub memo: Option<String>,
 }
 
 impl EnrichedTransaction {
     /// Build from a raw Horizon record plus optional Soroban operation details.
+    ///
+    /// # Fee precedence
+    /// An explicitly passed `fee_charged_stroops` always takes precedence over
+    /// the record's own `fee_charged`. `tx.fee_charged` is parsed only as a
+    /// fallback when `fee_charged_stroops` is `None`. The poller passes `None`
+    /// (the only call site outside tests), so the Horizon record's value is used.
     pub fn from_horizon(
         tx: HorizonTransaction,
         function_names: Vec<String>,
@@ -72,6 +144,8 @@ impl EnrichedTransaction {
             )
         })?;
 
+        let result_code = tx.result_xdr.as_deref().and_then(transaction_result_code);
+
         Ok(Self {
             hash:          tx.hash,
             timestamp,
@@ -84,8 +158,27 @@ impl EnrichedTransaction {
                     .as_deref()
                     .and_then(|s| s.parse::<u64>().ok())
             }),
+            memo_type:     tx.memo_type,
+            memo:          tx.memo,
         })
     }
+}
+
+/// `TransactionResultCode::txINSUFFICIENT_BALANCE` from Stellar-transaction.x.
+pub const TX_INSUFFICIENT_BALANCE: i32 = -7;
+
+/// Extracts the transaction result code from a base64-encoded `TransactionResult`.
+///
+/// XDR layout: `int64 feeCharged` (8 bytes, big-endian), then the union discriminant
+/// `TransactionResultCode` as a big-endian `int32` (bytes 8..12). Returns `None` for
+/// invalid base64 or input shorter than 12 bytes.
+pub fn transaction_result_code(result_xdr: &str) -> Option<i32> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(result_xdr.trim())
+        .ok()?;
+    let code: [u8; 4] = bytes.get(8..12)?.try_into().ok()?;
+    Some(i32::from_be_bytes(code))
 }
 
 // ── AlertPayload ──────────────────────────────────────────────────────────────
@@ -112,6 +205,10 @@ pub struct AlertPayload {
     pub amount_stroops: Option<u64>,
     /// Fee charged in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// Memo type of the transaction (`"text"`, `"hash"`, `"id"`, `"return"`, `"none"`).
+    pub memo_type: Option<String>,
+    /// Memo value of the transaction, if any.
+    pub memo: Option<String>,
     /// Unix timestamp (seconds).
     pub timestamp: i64,
     /// ISO 8601 timestamp string.
@@ -119,6 +216,10 @@ pub struct AlertPayload {
     pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
     pub explorer_link: String,
+    /// Ledger sequence number this transaction was included in.
+    pub ledger_sequence: Option<u32>,
+    /// Stellar account that signed and submitted this transaction.
+    pub source_account: Option<String>,
 }
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
@@ -133,8 +234,11 @@ pub fn evaluate(
     horizon_base: &str,
     explorer_base: &str,
     rules: &[AlertRule],
+    tags: Option<&HashMap<String, String>>,
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
+    let horizon_base  = horizon_base.trim_end_matches('/');
+    let explorer_base = explorer_base.trim_end_matches('/');
     let horizon_link  = format!("{}/transactions/{}", horizon_base, tx.hash);
     let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
     let timestamp = tx.timestamp.timestamp();
@@ -147,24 +251,28 @@ pub fn evaluate(
                 label: label.to_string(),
                 contract_id: contract_id.to_string(),
                 network: network.to_string(),
-                rule_type: rule_type(rule),
-                rule_triggered: rule_label(rule),
+                rule_type: rule.rule_type(),
+                rule_triggered: rule.label(),
                 transaction_hash: tx.hash.clone(),
                 function_name: tx.function_names.first().cloned(),
                 function_names: tx.function_names.clone(),
                 amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
                 amount_stroops: tx.amount_stroops,
                 fee_charged_stroops: tx.fee_charged_stroops,
+                memo_type: tx.memo_type.clone(),
+                memo: tx.memo.clone(),
                 timestamp,
                 timestamp_iso: timestamp_iso.clone(),
                 horizon_link: horizon_link.clone(),
                 explorer_link: explorer_link.clone(),
+                ledger_sequence: tx.ledger_sequence,
+                source_account: tx.source_account.clone(),
             }),
             Ok(false) => None,
             Err(e) => {
                 tracing::warn!(
                     tx = %tx.hash,
-                    rule = %rule_label(rule),
+                    rule = %rule.label(),
                     error = %e,
                     "rule evaluation error — skipping"
                 );
@@ -175,7 +283,7 @@ pub fn evaluate(
 }
 
 // NOTE: When adding a new AlertRule variant, update both `eval_rule()` and
-// `rule_label()` together. Rust's exhaustive matching catches missing arms,
+// `AlertRule::label()` together. Rust's exhaustive matching catches missing arms,
 // but this convention should be preserved for new rule variants.
 fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
     Ok(match rule {
@@ -183,19 +291,24 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
 
         AlertRule::TransactionFailed => !tx.successful,
 
-        AlertRule::LargeTransfer { threshold_xlm, threshold_stroops } => {
-            let threshold = match (threshold_stroops, threshold_xlm) {
-                (Some(stroops), _) => *stroops,
-                (None, Some(xlm)) => xlm
-                    .checked_mul(STROOPS_PER_XLM)
-                    .context("threshold_xlm overflow when converting to stroops")?,
-                (None, None) => anyhow::bail!("LargeTransfer has no threshold"),
-            };
+        AlertRule::InsufficientFunds => {
+            !tx.successful && tx.result_code == Some(TX_INSUFFICIENT_BALANCE)
+        }
+
+        AlertRule::SorobanInvocation => !tx.function_names.is_empty(),
+
+        AlertRule::LargeTransfer { threshold_xlm } => {
+            let threshold_stroops = threshold_xlm
+                .checked_mul(10_000_000)
+                .context("threshold_xlm overflow when converting to stroops")?;
             tx.amount_stroops
                 .map(|s| s >= threshold)
                 .unwrap_or(false)
         }
 
+        // Exact, case-sensitive match: Soroban function names are case-sensitive
+        // symbols, so `Withdraw` and `withdraw` are different functions.
+        // (`AdminFunctionCalled` below is deliberately case-insensitive.)
         AlertRule::FunctionCalled { function_name } => tx
             .function_names
             .iter()
@@ -213,45 +326,35 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .fee_charged_stroops
             .map(|f| f >= *threshold_stroops)
             .unwrap_or(false),
+
+        AlertRule::SourceAccountMatch { source_account } => {
+            tx.source_account.as_deref() == Some(source_account.as_str())
+        }
     })
 }
 
-// NOTE: When adding a new AlertRule variant, update both `eval_rule()` and
-// `rule_label()` together. Rust's exhaustive matching catches missing arms,
-// but this convention should be preserved for new rule variants.
-fn rule_label(rule: &AlertRule) -> String {
-    match rule {
-        AlertRule::AnyTransaction => "AnyTransaction".into(),
-        AlertRule::TransactionFailed => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { threshold_xlm, threshold_stroops } => {
-            large_transfer_label(*threshold_xlm, *threshold_stroops)
-        }
-        AlertRule::FunctionCalled { function_name } => format!("FunctionCalled({})", function_name),
-        AlertRule::AdminFunctionCalled { function_names } => {
-            format!("AdminFunctionCalled([{}])", function_names.join(", "))
-        }
-        AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
-            if let Some(xlm) = threshold_xlm {
-                format!("HighFee(>={} XLM)", xlm)
-            } else {
-                format!("HighFee(>={} stroops)", threshold_stroops)
-            }
-        }
-    }
-}
-
-fn rule_type(rule: &AlertRule) -> String {
-    match rule {
-        AlertRule::AnyTransaction => "AnyTransaction".into(),
-        AlertRule::TransactionFailed => "TransactionFailed".into(),
-        AlertRule::LargeTransfer { .. } => "LargeTransfer".into(),
-        AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
-        AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
-        AlertRule::HighFee { .. } => "HighFee".into(),
-    }
-}
-
 impl AlertPayload {
+    /// Build the webhook payload for `rule` matching `tx` on the contract described by `ctx`.
+    pub fn new(ctx: &PayloadContext<'_>, tx: &EnrichedTransaction, rule: &AlertRule) -> Self {
+        Self {
+            label: ctx.label.to_string(),
+            contract_id: ctx.contract_id.to_string(),
+            network: ctx.network.to_string(),
+            rule_type: rule_type(rule),
+            rule_triggered: rule_label(rule),
+            transaction_hash: tx.hash.clone(),
+            function_name: tx.function_names.first().cloned(),
+            function_names: tx.function_names.clone(),
+            amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+            fee_charged_stroops: tx.fee_charged_stroops,
+            timestamp: tx.timestamp.timestamp(),
+            timestamp_iso: tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            horizon_link: format!("{}/transactions/{}", ctx.horizon_base, tx.hash),
+            explorer_link: format!("{}/tx/{}", ctx.explorer_base, tx.hash),
+            tags: ctx.tags.cloned(),
+        }
+    }
+
     /// Builder helper to override the label (used by test-webhook).
     pub fn with_label(mut self, label: String) -> Self {
         self.label = label;
@@ -283,6 +386,8 @@ mod tests {
             function_names: function_names.iter().map(|s| s.to_string()).collect(),
             amount_stroops,
             fee_charged_stroops: None,
+            memo_type: None,
+            memo: None,
         }
     }
 
@@ -294,6 +399,7 @@ mod tests {
             "https://horizon-testnet.stellar.org",
             "https://stellar.expert/explorer/testnet",
             rules,
+            None,
             tx,
         )
     }
@@ -315,13 +421,78 @@ mod tests {
     }
 
     #[test]
+    fn alert_payload_new_populates_fields_from_context_and_transaction() {
+        let ctx = PayloadContext {
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: "https://stellar.expert/explorer/testnet",
+            tags: None,
+        };
+        let mut tx = make_tx(true, &["transfer", "withdraw"], Some(15_000 * 10_000_000));
+        tx.fee_charged_stroops = Some(500);
+
+        let payload = AlertPayload::new(&ctx, &tx, &AlertRule::AnyTransaction);
+
+        assert_eq!(payload.label, "Label");
+        assert_eq!(payload.network, "testnet");
+        assert_eq!(payload.rule_type, "AnyTransaction");
+        assert_eq!(payload.rule_triggered, "AnyTransaction");
+        assert_eq!(payload.transaction_hash, "abc123");
+        assert_eq!(payload.function_name.as_deref(), Some("transfer"));
+        assert_eq!(payload.function_names, vec!["transfer", "withdraw"]);
+        assert_eq!(payload.amount_xlm, Some(15_000));
+        assert_eq!(payload.fee_charged_stroops, Some(500));
+        assert_eq!(payload.timestamp_iso, "2024-01-15T12:00:00Z");
+        assert_eq!(
+            payload.horizon_link,
+            "https://horizon-testnet.stellar.org/transactions/abc123"
+        );
+        assert_eq!(
+            payload.explorer_link,
+            "https://stellar.expert/explorer/testnet/tx/abc123"
+        );
+    }
+
+    #[test]
+    fn evaluate_forwards_contract_tags_to_every_payload() {
+        let tags = HashMap::from([
+            ("team".to_string(), "defi".to_string()),
+            ("severity".to_string(), "high".to_string()),
+        ]);
+        let tx = make_tx(false, &[], None);
+        let payloads = evaluate(
+            "Label",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "testnet",
+            "https://horizon-testnet.stellar.org",
+            "https://stellar.expert/explorer/testnet",
+            &[AlertRule::AnyTransaction, AlertRule::TransactionFailed],
+            Some(&tags),
+            &tx,
+        );
+        assert_eq!(payloads.len(), 2);
+        for payload in &payloads {
+            assert_eq!(payload.tags.as_ref(), Some(&tags));
+        }
+    }
+
+    #[test]
+    fn evaluate_without_tags_yields_none() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert_eq!(payloads[0].tags, None);
+    }
+
+    #[test]
     fn rule_label_formats_are_stable() {
-        assert_eq!(rule_label(&AlertRule::AnyTransaction), "AnyTransaction");
-        assert_eq!(rule_label(&AlertRule::TransactionFailed), "TransactionFailed");
-        assert_eq!(rule_label(&AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }), "LargeTransfer(>=10000XLM)");
-        assert_eq!(rule_label(&AlertRule::FunctionCalled { function_name: "withdraw".into() }), "FunctionCalled(withdraw)");
-        assert_eq!(rule_label(&AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] }), "AdminFunctionCalled([set_admin, upgrade])");
-        assert_eq!(rule_label(&AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }), "HighFee(>=10000 stroops)");
+        assert_eq!(AlertRule::AnyTransaction.label(), "AnyTransaction");
+        assert_eq!(AlertRule::TransactionFailed.label(), "TransactionFailed");
+        assert_eq!(AlertRule::LargeTransfer { threshold_xlm: 10_000 }.label(), "LargeTransfer(>=10000XLM)");
+        assert_eq!(AlertRule::FunctionCalled { function_name: "withdraw".into() }.label(), "FunctionCalled(withdraw)");
+        assert_eq!(AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] }.label(), "AdminFunctionCalled([set_admin, upgrade])");
+        assert_eq!(AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }.label(), "HighFee(>=10000 stroops)");
     }
 
     #[test]
@@ -329,6 +500,105 @@ mod tests {
         let tx = make_tx(false, &[], None);
         let payloads = run(&[AlertRule::TransactionFailed], &tx);
         assert_eq!(payloads.len(), 1);
+    }
+
+    // ── Issue #280: InsufficientFunds ────────────────────────────────────────
+
+    /// Base64 `TransactionResult` for txINSUFFICIENT_BALANCE: fee 100 stroops,
+    /// result code -7, ext 0. Hand-encoded from the XDR spec, not captured from testnet.
+    const INSUFFICIENT_BALANCE_XDR: &str = "AAAAAAAAAGT////5AAAAAA==";
+    /// txFAILED (-1) with an empty operation-result array.
+    const TX_FAILED_XDR: &str = "AAAAAAAAAGT/////AAAAAAAAAAA=";
+    /// txBAD_SEQ (-5).
+    const BAD_SEQ_XDR: &str = "AAAAAAAAAGT////7AAAAAA==";
+
+    fn make_tx_with_result(successful: bool, result_xdr: &str) -> EnrichedTransaction {
+        let raw = horizon_tx_with_result(successful, result_xdr);
+        EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap()
+    }
+
+    fn horizon_tx_with_result(successful: bool, result_xdr: &str) -> HorizonTransaction {
+        HorizonTransaction {
+            hash: "insufficient".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful,
+            paging_token: "1".into(),
+            fee_charged: Some("100".into()),
+            envelope_xdr: None,
+            result_xdr: Some(result_xdr.into()),
+        }
+    }
+
+    #[test]
+    fn insufficient_funds_fires_on_insufficient_balance_result() {
+        let tx = make_tx_with_result(false, INSUFFICIENT_BALANCE_XDR);
+        assert_eq!(tx.result_code, Some(TX_INSUFFICIENT_BALANCE));
+        let payloads = run(&[AlertRule::InsufficientFunds], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_triggered, "InsufficientFunds");
+        assert_eq!(payloads[0].rule_type, "InsufficientFunds");
+    }
+
+    #[test]
+    fn insufficient_funds_does_not_fire_on_other_failure_codes() {
+        for xdr in [TX_FAILED_XDR, BAD_SEQ_XDR] {
+            let tx = make_tx_with_result(false, xdr);
+            let payloads = run(&[AlertRule::InsufficientFunds], &tx);
+            assert!(payloads.is_empty(), "should not fire for {}", xdr);
+        }
+    }
+
+    #[test]
+    fn insufficient_funds_does_not_fire_on_success() {
+        let tx = make_tx_with_result(true, INSUFFICIENT_BALANCE_XDR);
+        let payloads = run(&[AlertRule::InsufficientFunds], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn insufficient_funds_does_not_fire_without_result_xdr() {
+        let tx = make_tx(false, &[], None);
+        let payloads = run(&[AlertRule::InsufficientFunds], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn transaction_result_code_decodes_known_samples() {
+        assert_eq!(transaction_result_code(INSUFFICIENT_BALANCE_XDR), Some(-7));
+        assert_eq!(transaction_result_code(TX_FAILED_XDR), Some(-1));
+        assert_eq!(transaction_result_code(BAD_SEQ_XDR), Some(-5));
+    }
+
+    #[test]
+    fn transaction_result_code_returns_none_for_bad_input() {
+        assert_eq!(transaction_result_code("%%% not base64 %%%"), None);
+        assert_eq!(transaction_result_code("AAAAAAAAAGQ="), None); // 8 bytes only
+        assert_eq!(transaction_result_code(""), None);
+    }
+
+    // ── Issue #281: SorobanInvocation ────────────────────────────────────────
+
+    #[test]
+    fn soroban_invocation_fires_with_one_function_name() {
+        let tx = make_tx(true, &["deposit"], None);
+        let payloads = run(&[AlertRule::SorobanInvocation], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_triggered, "SorobanInvocation");
+        assert_eq!(payloads[0].rule_type, "SorobanInvocation");
+    }
+
+    #[test]
+    fn soroban_invocation_fires_with_multiple_function_names() {
+        let tx = make_tx(true, &["deposit", "withdraw"], None);
+        let payloads = run(&[AlertRule::SorobanInvocation], &tx);
+        assert_eq!(payloads.len(), 1);
+    }
+
+    #[test]
+    fn soroban_invocation_does_not_fire_for_native_only_transaction() {
+        let tx = make_tx(true, &[], Some(100_000_000));
+        let payloads = run(&[AlertRule::SorobanInvocation], &tx);
+        assert!(payloads.is_empty());
     }
 
     #[test]
@@ -424,6 +694,40 @@ mod tests {
     }
 
     #[test]
+    fn function_called_is_case_sensitive() {
+        let tx = make_tx(true, &["withdraw"], None);
+        let payloads = run(
+            &[AlertRule::FunctionCalled {
+                function_name: "Withdraw".into(),
+            }],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "FunctionCalled must not match a different casing"
+        );
+    }
+
+    #[test]
+    fn explicit_fee_takes_precedence_over_record_fee() {
+        let raw = |fee: Option<&str>| HorizonTransaction {
+            hash: "h".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: fee.map(Into::into),
+            envelope_xdr: None,
+            result_xdr: None,
+        };
+
+        let explicit = EnrichedTransaction::from_horizon(raw(Some("100")), vec![], None, Some(999)).unwrap();
+        assert_eq!(explicit.fee_charged_stroops, Some(999));
+
+        let fallback = EnrichedTransaction::from_horizon(raw(Some("100")), vec![], None, None).unwrap();
+        assert_eq!(fallback.fee_charged_stroops, Some(100));
+    }
+
+    #[test]
     fn admin_function_called_fires_on_any_match() {
         let tx = make_tx(true, &["upgrade"], None);
         let payloads = run(
@@ -497,11 +801,13 @@ mod tests {
                 function_names: vec![],
                 amount_stroops: None,
                 fee_charged_stroops: None,
+                memo_type: None,
+                memo: None,
             };
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 "testnet", horizon_base, explorer_base,
-                &[AlertRule::AnyTransaction], &tx,
+                &[AlertRule::AnyTransaction], None, &tx,
             );
             payloads.remove(0)
         }
@@ -586,6 +892,61 @@ mod tests {
         assert!(payloads.is_empty());
     }
 
+    // ── SourceAccountMatch (issue #303) ───────────────────────────────────────
+
+    const SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const OTHER: &str = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    fn source_rule(source_account: &str) -> AlertRule {
+        AlertRule::SourceAccountMatch {
+            source_account: source_account.into(),
+        }
+    }
+
+    #[test]
+    fn source_account_match_fires_on_exact_match() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some(SOURCE.into());
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_type, "SourceAccountMatch");
+        assert_eq!(
+            payloads[0].rule_triggered,
+            format!("SourceAccountMatch({})", SOURCE)
+        );
+    }
+
+    #[test]
+    fn source_account_match_does_not_fire_on_different_account() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some(OTHER.into());
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn source_account_match_does_not_fire_when_source_account_is_missing() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn from_horizon_carries_source_account() {
+        let raw = HorizonTransaction {
+            hash: "h2".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            source_account: Some(SOURCE.into()),
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.source_account.as_deref(), Some(SOURCE));
+    }
+
     #[test]
     fn enriched_transaction_parses_timestamp() {
         let raw = HorizonTransaction {
@@ -596,9 +957,46 @@ mod tests {
             fee_charged: Some("100".into()),
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
+    }
+
+    #[test]
+    fn from_horizon_maps_memo_fields() {
+        let raw = HorizonTransaction {
+            hash: "h2".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "2".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            memo_type: Some("text".into()),
+            memo: Some("order-1234".into()),
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.memo_type.as_deref(), Some("text"));
+        assert_eq!(enriched.memo.as_deref(), Some("order-1234"));
+
+        let payloads = evaluate(
+            "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "testnet", "https://horizon-testnet.stellar.org",
+            "https://stellar.expert/explorer/testnet",
+            &[AlertRule::AnyTransaction], &enriched,
+        );
+        assert_eq!(payloads[0].memo_type.as_deref(), Some("text"));
+        assert_eq!(payloads[0].memo.as_deref(), Some("order-1234"));
+    }
+
+    #[test]
+    fn horizon_transaction_memo_fields_default_to_none_when_absent() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1"}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert!(tx.memo_type.is_none());
+        assert!(tx.memo.is_none());
     }
 
     /// Issue #65: from_horizon must return Err when created_at is not a valid RFC 3339 timestamp.
@@ -612,6 +1010,8 @@ mod tests {
             fee_charged:  None,
             envelope_xdr: None,
             result_xdr:   None,
+            ledger: None,
+            source_account: None,
         };
         let result = EnrichedTransaction::from_horizon(raw, vec![], None, None);
         assert!(result.is_err(), "expected Err for invalid timestamp");
@@ -687,10 +1087,14 @@ mod tests {
             amount_xlm: Some(15000),
             amount_stroops: Some(150_000_000_000),
             fee_charged_stroops: Some(50000),
+            memo_type: Some("text".into()),
+            memo: Some("order-1234".into()),
             timestamp: 1705316096,
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            ledger_sequence: Some(12345678),
+            source_account: Some("GABC123".into()),
         };
 
         let json = serde_json::to_value(payload).expect("serialize AlertPayload to JSON");
@@ -711,5 +1115,160 @@ mod tests {
         assert_eq!(obj["timestamp_iso"].as_str(), Some("2024-01-15T12:00:00Z"));
         assert_eq!(obj["horizon_link"].as_str(), Some("https://horizon-testnet.stellar.org/transactions/abc123"));
         assert_eq!(obj["explorer_link"].as_str(), Some("https://stellar.expert/explorer/testnet/tx/abc123"));
+        assert_eq!(obj["ledger_sequence"].as_u64(), Some(12345678));
+        assert_eq!(obj["source_account"].as_str(), Some("GABC123"));
+    }
+
+    // ── Issue #263: source_account propagation ────────────────────────────────
+
+    #[test]
+    fn source_account_is_propagated_to_alert_payload() {
+        let raw = HorizonTransaction {
+            hash: "src_test".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            ledger: None,
+            source_account: Some("GABC1234567890".into()),
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.source_account.as_deref(), Some("GABC1234567890"));
+
+        let payloads = run(&[AlertRule::AnyTransaction], &EnrichedTransaction {
+            source_account: Some("GABC1234567890".into()),
+            ..make_tx(true, &[], None)
+        });
+        assert_eq!(payloads[0].source_account.as_deref(), Some("GABC1234567890"));
+    }
+
+    #[test]
+    fn source_account_is_null_when_not_provided() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert!(payloads[0].source_account.is_none());
+    }
+
+    // ── Issue #264: ledger_sequence propagation ───────────────────────────────
+
+    #[test]
+    fn ledger_sequence_is_propagated_to_alert_payload() {
+        let raw = HorizonTransaction {
+            hash: "ledger_test".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            ledger: Some(99887766),
+            source_account: None,
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.ledger_sequence, Some(99887766));
+
+        let payloads = run(&[AlertRule::AnyTransaction], &EnrichedTransaction {
+            ledger_sequence: Some(99887766),
+            ..make_tx(true, &[], None)
+        });
+        assert_eq!(payloads[0].ledger_sequence, Some(99887766));
+    }
+
+    #[test]
+    fn ledger_sequence_is_null_when_not_provided() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert!(payloads[0].ledger_sequence.is_none());
+    }
+
+    // ── #253: extract_soroban_details unit tests ─────────────────────────────
+
+    fn make_op(op_type: &str, function: Option<&str>, amount: Option<&str>) -> HorizonOperation {
+        HorizonOperation {
+            op_type: op_type.to_string(),
+            function: function.map(|s| s.to_string()),
+            amount: amount.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn extract_returns_function_name_from_invoke_host_function_op() {
+        let ops = vec![make_op("invoke_host_function", Some("withdraw"), None)];
+        let (names, amount) = extract_soroban_details(ops);
+        assert_eq!(names, vec!["withdraw"]);
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_returns_multiple_function_names_from_multiple_ops() {
+        let ops = vec![
+            make_op("invoke_host_function", Some("deposit"), None),
+            make_op("invoke_host_function", Some("withdraw"), None),
+        ];
+        let (names, amount) = extract_soroban_details(ops);
+        assert_eq!(names, vec!["deposit", "withdraw"]);
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_ignores_invoke_host_function_op_with_no_function_field() {
+        let ops = vec![make_op("invoke_host_function", None, None)];
+        let (names, amount) = extract_soroban_details(ops);
+        assert!(names.is_empty());
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_returns_payment_amount_in_stroops() {
+        // 1000.0000000 XLM = 10_000_000_000 stroops
+        let ops = vec![make_op("payment", None, Some("1000.0000000"))];
+        let (names, amount) = extract_soroban_details(ops);
+        assert!(names.is_empty());
+        assert_eq!(amount, Some(10_000_000_000));
+    }
+
+    #[test]
+    fn extract_sums_multiple_payment_ops() {
+        let ops = vec![
+            make_op("payment", None, Some("500.0000000")),
+            make_op("payment", None, Some("500.0000000")),
+        ];
+        let (_, amount) = extract_soroban_details(ops);
+        assert_eq!(amount, Some(10_000_000_000));
+    }
+
+    #[test]
+    fn extract_returns_none_amount_when_no_payment_ops() {
+        let ops = vec![make_op("invoke_host_function", Some("transfer"), None)];
+        let (_, amount) = extract_soroban_details(ops);
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_handles_empty_ops_list() {
+        let (names, amount) = extract_soroban_details(vec![]);
+        assert!(names.is_empty());
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_ignores_unknown_op_types() {
+        let ops = vec![make_op("create_account", None, None)];
+        let (names, amount) = extract_soroban_details(ops);
+        assert!(names.is_empty());
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_combines_function_names_and_payment_in_same_tx() {
+        let ops = vec![
+            make_op("invoke_host_function", Some("transfer"), None),
+            make_op("payment", None, Some("200.0000000")),
+        ];
+        let (names, amount) = extract_soroban_details(ops);
+        assert_eq!(names, vec!["transfer"]);
+        assert_eq!(amount, Some(2_000_000_000));
     }
 }
