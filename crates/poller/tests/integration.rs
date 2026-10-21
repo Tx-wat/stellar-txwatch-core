@@ -9,6 +9,7 @@
 /// real Stellar network.
 mod helpers;
 
+use reqwest::Client;
 use std::time::Duration;
 
 use reqwest::Client;
@@ -94,6 +95,14 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
                 }]
             }
         })))
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+
+    // Later poll cycles see no new transactions, so the single webhook is the only delivery.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
         .mount(&horizon)
         .await;
 

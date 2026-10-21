@@ -11,6 +11,7 @@ use reqwest::Client;
 use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, span, warn, Level};
+use txwatch_config::TlsConfig;
 use txwatch_rules::AlertPayload;
 
 const MAX_RETRIES: u32 = 3;
@@ -30,6 +31,39 @@ pub fn build_client() -> Result<Client> {
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| anyhow!("failed to build HTTP client: {}", e))
+}
+
+/// Build a client for a contract with `[contracts.tls]` set. The client presents
+/// the configured mTLS identity and, when `ca_cert` is set, trusts that CA bundle
+/// in addition to the system roots. Files are read once, here, at startup.
+/// Error messages name the file path but never include file contents.
+pub fn build_tls_client(tls: &TlsConfig) -> Result<Client> {
+    let cert = fs::read(&tls.client_cert)
+        .map_err(|e| anyhow!("cannot read tls.client_cert '{}': {}", tls.client_cert, e))?;
+    let key = fs::read(&tls.client_key)
+        .map_err(|e| anyhow!("cannot read tls.client_key '{}': {}", tls.client_key, e))?;
+    let identity = Identity::from_pkcs8_pem(&cert, &key).map_err(|e| {
+        anyhow!(
+            "invalid mTLS identity (client_cert '{}', client_key '{}'): {}",
+            tls.client_cert,
+            tls.client_key,
+            e
+        )
+    })?;
+
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .identity(identity);
+    if let Some(ca_path) = &tls.ca_cert {
+        let ca_pem = fs::read(ca_path)
+            .map_err(|e| anyhow!("cannot read tls.ca_cert '{}': {}", ca_path, e))?;
+        let ca = Certificate::from_pem(&ca_pem)
+            .map_err(|e| anyhow!("invalid tls.ca_cert '{}': {}", ca_path, e))?;
+        builder = builder.add_root_certificate(ca);
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow!("failed to build mTLS HTTP client: {}", e))
 }
 
 /// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
@@ -321,6 +355,7 @@ mod tests {
         let url    = format!("{}/hook", server.uri());
         send_webhook(&client, &url, &payload, Some(secret)).await.unwrap();
 
+        // The raw secret is never sent; only the HMAC signature header is.
         let requests = server.received_requests().await.unwrap();
         let sig = requests[0].headers.get("x-txwatch-signature").unwrap();
         assert_eq!(sig, &expected);

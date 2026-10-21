@@ -69,6 +69,11 @@ impl fmt::Display for Network {
 pub enum AlertRule {
     AnyTransaction,
     TransactionFailed,
+    /// Fires when a transaction fails because the source account cannot cover the fee
+    /// (Horizon result code `txINSUFFICIENT_BALANCE`). Other failures do not match.
+    InsufficientFunds,
+    /// Fires when the transaction invokes any Soroban host function, regardless of name.
+    SorobanInvocation,
     LargeTransfer       { threshold_xlm: u64 },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
@@ -126,7 +131,10 @@ impl AlertRule {
                     *name = name.to_lowercase();
                 }
             }
-            AlertRule::AnyTransaction | AlertRule::TransactionFailed => {}
+            AlertRule::AnyTransaction
+            | AlertRule::TransactionFailed
+            | AlertRule::InsufficientFunds
+            | AlertRule::SorobanInvocation => {}
             AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
                 match (*threshold_xlm, *threshold_stroops) {
                     (Some(_), s) if s > 0 => bail!(
@@ -162,6 +170,8 @@ impl AlertRule {
         match self {
             AlertRule::AnyTransaction => "AnyTransaction".into(),
             AlertRule::TransactionFailed => "TransactionFailed".into(),
+            AlertRule::InsufficientFunds => "InsufficientFunds".into(),
+            AlertRule::SorobanInvocation => "SorobanInvocation".into(),
             AlertRule::LargeTransfer { threshold_xlm } => {
                 format!("LargeTransfer(>={}XLM)", threshold_xlm)
             }
@@ -193,6 +203,46 @@ impl AlertRule {
             AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
             AlertRule::HighFee { .. } => "HighFee".into(),
         }
+    }
+}
+
+// ── TlsConfig ─────────────────────────────────────────────────────────────────
+
+/// Optional mutual-TLS settings for webhook delivery to one contract.
+/// All paths point to PEM files and are checked for existence at validation time.
+/// The private key contents are never logged.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM client certificate presented to the webhook receiver.
+    pub client_cert: String,
+    /// PEM private key (PKCS#8) matching `client_cert`.
+    pub client_key: String,
+    /// Optional PEM CA bundle used to validate the webhook server's certificate.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+}
+
+impl TlsConfig {
+    pub fn validate(&self, contract_label: &str) -> Result<()> {
+        let mut paths = vec![("client_cert", &self.client_cert), ("client_key", &self.client_key)];
+        if let Some(ca) = &self.ca_cert {
+            paths.push(("ca_cert", ca));
+        }
+        for (field, path) in paths {
+            if path.trim().is_empty() {
+                bail!("contract '{}': tls.{} must not be empty", contract_label, field);
+            }
+            if !Path::new(path).is_file() {
+                bail!(
+                    "contract '{}': tls.{} file '{}' does not exist or is not a file",
+                    contract_label,
+                    field,
+                    path
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -263,6 +313,10 @@ impl WatchedContract {
             rule.validate(&label)?;
         }
 
+        if let Some(tls) = &self.tls {
+            tls.validate(&self.label)?;
+        }
+
         Ok(())
     }
 }
@@ -314,9 +368,8 @@ fn deserialize_toml_with_field_context<'de, T>(raw: &'de str, path: &Path) -> Re
 where
     T: DeserializeOwned,
 {
-    let mut deserializer = toml::Deserializer::new(raw);
-    let mut path_deserializer = PathDeserializer::new(&mut deserializer);
-    T::deserialize(&mut path_deserializer).map_err(|error| {
+    let deserializer = toml::Deserializer::new(raw);
+    serde_path_to_error::deserialize(deserializer).map_err(|error| {
         let path = error.path().to_string();
         let inner = error.into_inner();
         let message = if path.is_empty() {
@@ -326,6 +379,47 @@ where
         };
         anyhow!(message)
     })
+}
+
+/// Checks `cursor_file` before polling starts (#279).
+///
+/// - Existing file: must be readable and contain valid JSON.
+/// - Missing file: its parent directory must exist and be writable.
+fn validate_cursor_file(path: &str) -> Result<()> {
+    let cursor_path = Path::new(path);
+
+    if cursor_path.is_file() {
+        let raw = fs::read_to_string(cursor_path)
+            .with_context(|| format!("cursor_file '{}' cannot be read", path))?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .with_context(|| format!("cursor_file '{}' is not valid JSON", path))?;
+        return Ok(());
+    }
+
+    if cursor_path.exists() {
+        bail!("cursor_file '{}' exists but is not a regular file", path);
+    }
+
+    let dir = match cursor_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if !dir.is_dir() {
+        bail!("cursor_file directory '{}' does not exist", dir.display());
+    }
+    check_dir_writable(dir)
+}
+
+/// Probes writability by creating and removing a uniquely named file.
+fn check_dir_writable(dir: &Path) -> Result<()> {
+    let probe = dir.join(format!(".txwatch-write-probe-{}", std::process::id()));
+    match fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(_) => bail!("cursor_file directory '{}' is not writable", dir.display()),
+    }
 }
 
 // ── Env-var interpolation ─────────────────────────────────────────────────────
@@ -408,6 +502,9 @@ impl AppConfig {
         for contract in &mut self.contracts {
             contract.validate()?;
         }
+        if let Some(path) = &self.cursor_file {
+            validate_cursor_file(path)?;
+        }
         let mut seen = std::collections::HashSet::new();
         for contract in &self.contracts {
             if !seen.insert(&contract.label) {
@@ -424,6 +521,7 @@ impl AppConfig {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn env_interpolation_passes_plain_values_through() {
@@ -527,6 +625,170 @@ mod tests {
         let mut c = valid_contract();
         c.webhook_url = "https://hooks.example.com/alerts?token=abc123".into();
         assert!(c.validate().is_ok());
+    }
+
+    // ── Issue #278: mTLS config ──────────────────────────────────────────────
+
+    fn fixture_path(name: &str) -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../notifier/tests/fixtures")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn tls_section_parses_from_toml_with_optional_ca() {
+        let raw = format!(
+            r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[rules]]
+            type = "AnyTransaction"
+            [tls]
+            client_cert = "{}"
+            client_key = "{}"
+            "#,
+            fixture_path("client-cert.pem"),
+            fixture_path("client-key.pem"),
+        );
+        let mut c: WatchedContract = toml::from_str(&raw).unwrap();
+        assert!(c.tls.as_ref().unwrap().ca_cert.is_none());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_rejects_missing_client_cert_file() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: "/nonexistent/client.pem".into(),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_cert"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_rejects_missing_ca_cert_file() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some("/nonexistent/ca.pem".into()),
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.ca_cert"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_rejects_empty_key_path() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: "  ".into(),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_key must not be empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_accepts_existing_files() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some(fixture_path("client-cert.pem")),
+        });
+        assert!(c.validate().is_ok());
+    }
+
+    // ── Issue #279: cursor_file validation ───────────────────────────────────
+
+    fn cursor_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "txwatch-cursor-{}-{}",
+            name,
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn app_config_with_cursor(cursor_file: String) -> AppConfig {
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![valid_contract()],
+            cursor_file: Some(cursor_file),
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+        }
+    }
+
+    #[test]
+    fn cursor_file_existing_valid_json_is_accepted() {
+        let dir = cursor_test_dir("valid-json");
+        let file = dir.join("cursors.json");
+        fs::write(&file, r#"{"CABC": "123-1"}"#).unwrap();
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        assert!(cfg.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_existing_invalid_json_is_rejected() {
+        let dir = cursor_test_dir("invalid-json");
+        let file = dir.join("cursors.json");
+        fs::write(&file, "{ not json").unwrap();
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("is not valid JSON"), "got: {}", err);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_missing_file_in_existing_dir_is_accepted() {
+        let dir = cursor_test_dir("missing-file");
+        let file = dir.join("not-yet-created.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        assert!(cfg.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_missing_directory_is_rejected() {
+        let dir = cursor_test_dir("missing-dir").join("no-such-subdir");
+        let file = dir.join("cursors.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "got: {}", err);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_file_unwritable_directory_fails_with_clear_message() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = cursor_test_dir("readonly-dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let file = dir.join("cursors.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        // Restore permissions so cleanup succeeds.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(err.contains("is not writable"), "got: {}", err);
+    }
+
+    #[test]
+    fn insufficient_funds_rule_parses_from_toml() {
+        let rule: AlertRule = toml::from_str("type = \"InsufficientFunds\"").unwrap();
+        assert!(matches!(rule, AlertRule::InsufficientFunds));
+        assert_eq!(rule.label(), "InsufficientFunds");
     }
 
     #[test]
@@ -760,7 +1022,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
+        // `{:#}` renders the full context chain, including the field path.
+        let error_msg = format!("{:#}", result.unwrap_err());
         assert!(error_msg.contains("failed to parse config file"));
         assert!(error_msg.contains("field: poll_interval_seconds"));
     }

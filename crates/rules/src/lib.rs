@@ -143,6 +143,8 @@ impl EnrichedTransaction {
             )
         })?;
 
+        let result_code = tx.result_xdr.as_deref().and_then(transaction_result_code);
+
         Ok(Self {
             hash:          tx.hash,
             timestamp,
@@ -159,6 +161,23 @@ impl EnrichedTransaction {
             memo:          tx.memo,
         })
     }
+}
+
+/// `TransactionResultCode::txINSUFFICIENT_BALANCE` from Stellar-transaction.x.
+pub const TX_INSUFFICIENT_BALANCE: i32 = -7;
+
+/// Extracts the transaction result code from a base64-encoded `TransactionResult`.
+///
+/// XDR layout: `int64 feeCharged` (8 bytes, big-endian), then the union discriminant
+/// `TransactionResultCode` as a big-endian `int32` (bytes 8..12). Returns `None` for
+/// invalid base64 or input shorter than 12 bytes.
+pub fn transaction_result_code(result_xdr: &str) -> Option<i32> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(result_xdr.trim())
+        .ok()?;
+    let code: [u8; 4] = bytes.get(8..12)?.try_into().ok()?;
+    Some(i32::from_be_bytes(code))
 }
 
 // ── AlertPayload ──────────────────────────────────────────────────────────────
@@ -213,6 +232,8 @@ pub fn evaluate(
     rules: &[AlertRule],
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
+    let horizon_base  = horizon_base.trim_end_matches('/');
+    let explorer_base = explorer_base.trim_end_matches('/');
     let horizon_link  = format!("{}/transactions/{}", horizon_base, tx.hash);
     let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
     let timestamp = tx.timestamp.timestamp();
@@ -263,6 +284,12 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
         AlertRule::AnyTransaction => true,
 
         AlertRule::TransactionFailed => !tx.successful,
+
+        AlertRule::InsufficientFunds => {
+            !tx.successful && tx.result_code == Some(TX_INSUFFICIENT_BALANCE)
+        }
+
+        AlertRule::SorobanInvocation => !tx.function_names.is_empty(),
 
         AlertRule::LargeTransfer { threshold_xlm } => {
             let threshold_stroops = threshold_xlm
@@ -376,6 +403,105 @@ mod tests {
         let tx = make_tx(false, &[], None);
         let payloads = run(&[AlertRule::TransactionFailed], &tx);
         assert_eq!(payloads.len(), 1);
+    }
+
+    // ── Issue #280: InsufficientFunds ────────────────────────────────────────
+
+    /// Base64 `TransactionResult` for txINSUFFICIENT_BALANCE: fee 100 stroops,
+    /// result code -7, ext 0. Hand-encoded from the XDR spec, not captured from testnet.
+    const INSUFFICIENT_BALANCE_XDR: &str = "AAAAAAAAAGT////5AAAAAA==";
+    /// txFAILED (-1) with an empty operation-result array.
+    const TX_FAILED_XDR: &str = "AAAAAAAAAGT/////AAAAAAAAAAA=";
+    /// txBAD_SEQ (-5).
+    const BAD_SEQ_XDR: &str = "AAAAAAAAAGT////7AAAAAA==";
+
+    fn make_tx_with_result(successful: bool, result_xdr: &str) -> EnrichedTransaction {
+        let raw = horizon_tx_with_result(successful, result_xdr);
+        EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap()
+    }
+
+    fn horizon_tx_with_result(successful: bool, result_xdr: &str) -> HorizonTransaction {
+        HorizonTransaction {
+            hash: "insufficient".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful,
+            paging_token: "1".into(),
+            fee_charged: Some("100".into()),
+            envelope_xdr: None,
+            result_xdr: Some(result_xdr.into()),
+        }
+    }
+
+    #[test]
+    fn insufficient_funds_fires_on_insufficient_balance_result() {
+        let tx = make_tx_with_result(false, INSUFFICIENT_BALANCE_XDR);
+        assert_eq!(tx.result_code, Some(TX_INSUFFICIENT_BALANCE));
+        let payloads = run(&[AlertRule::InsufficientFunds], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_triggered, "InsufficientFunds");
+        assert_eq!(payloads[0].rule_type, "InsufficientFunds");
+    }
+
+    #[test]
+    fn insufficient_funds_does_not_fire_on_other_failure_codes() {
+        for xdr in [TX_FAILED_XDR, BAD_SEQ_XDR] {
+            let tx = make_tx_with_result(false, xdr);
+            let payloads = run(&[AlertRule::InsufficientFunds], &tx);
+            assert!(payloads.is_empty(), "should not fire for {}", xdr);
+        }
+    }
+
+    #[test]
+    fn insufficient_funds_does_not_fire_on_success() {
+        let tx = make_tx_with_result(true, INSUFFICIENT_BALANCE_XDR);
+        let payloads = run(&[AlertRule::InsufficientFunds], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn insufficient_funds_does_not_fire_without_result_xdr() {
+        let tx = make_tx(false, &[], None);
+        let payloads = run(&[AlertRule::InsufficientFunds], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn transaction_result_code_decodes_known_samples() {
+        assert_eq!(transaction_result_code(INSUFFICIENT_BALANCE_XDR), Some(-7));
+        assert_eq!(transaction_result_code(TX_FAILED_XDR), Some(-1));
+        assert_eq!(transaction_result_code(BAD_SEQ_XDR), Some(-5));
+    }
+
+    #[test]
+    fn transaction_result_code_returns_none_for_bad_input() {
+        assert_eq!(transaction_result_code("%%% not base64 %%%"), None);
+        assert_eq!(transaction_result_code("AAAAAAAAAGQ="), None); // 8 bytes only
+        assert_eq!(transaction_result_code(""), None);
+    }
+
+    // ── Issue #281: SorobanInvocation ────────────────────────────────────────
+
+    #[test]
+    fn soroban_invocation_fires_with_one_function_name() {
+        let tx = make_tx(true, &["deposit"], None);
+        let payloads = run(&[AlertRule::SorobanInvocation], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_triggered, "SorobanInvocation");
+        assert_eq!(payloads[0].rule_type, "SorobanInvocation");
+    }
+
+    #[test]
+    fn soroban_invocation_fires_with_multiple_function_names() {
+        let tx = make_tx(true, &["deposit", "withdraw"], None);
+        let payloads = run(&[AlertRule::SorobanInvocation], &tx);
+        assert_eq!(payloads.len(), 1);
+    }
+
+    #[test]
+    fn soroban_invocation_does_not_fire_for_native_only_transaction() {
+        let tx = make_tx(true, &[], Some(100_000_000));
+        let payloads = run(&[AlertRule::SorobanInvocation], &tx);
+        assert!(payloads.is_empty());
     }
 
     #[test]

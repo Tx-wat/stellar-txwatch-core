@@ -17,7 +17,7 @@ use std::fs;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
-use txwatch_notifier::send_webhook;
+use txwatch_notifier::{build_tls_client, send_webhook};
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
 // ── Optional Prometheus metrics ───────────────────────────────────────────────
@@ -338,6 +338,15 @@ async fn run_internal(
         }
     });
 
+    // Contracts with `[contracts.tls]` deliver webhooks through a dedicated client,
+    // so their client certificate is never presented to Horizon.
+    let mut webhook_clients: HashMap<String, Client> = HashMap::new();
+    for contract in &cfg.contracts {
+        if let Some(tls) = &contract.tls {
+            webhook_clients.insert(contract.label.clone(), build_tls_client(tls)?);
+        }
+    }
+
     loop {
         poll_cycle(&client, &cfg.contracts, &mut cursors, dry_run, &counters, MAX_CONCURRENT_POLLS).await;
         tokio::time::sleep(interval).await;
@@ -443,6 +452,19 @@ fn spawn_summary_logger(
     })
 }
 
+/// Resolves once the shutdown flag is `true`. If the sender is dropped without
+/// signalling, this never resolves so the poll loop keeps running.
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Returns `(transactions_processed, alerts_fired)`.
@@ -457,10 +479,11 @@ fn spawn_summary_logger(
     network     = %contract.network.as_str()
 ))]
 async fn poll_contract(
-    client:   &Client,
-    contract: &WatchedContract,
-    cursors:  &mut HashMap<String, String>,
-    dry_run:  bool,
+    client:         &Client,
+    webhook_client: &Client,
+    contract:       &WatchedContract,
+    cursors:        &mut HashMap<String, String>,
+    dry_run:        bool,
 ) -> Result<(u64, u64)> {
     let cursor = cursors
         .get(&contract.contract_id)
@@ -504,6 +527,10 @@ async fn poll_contract(
             warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
             tokio::time::sleep(Duration::from_secs(retry_after)).await;
             return Ok((0, 0));
+        }
+
+        if !response.status().is_success() {
+            anyhow::bail!("Horizon returned HTTP {} from {}", response.status(), url);
         }
 
         let page: HorizonPage = response
@@ -625,7 +652,7 @@ async fn poll_contract(
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
                 if let Err(e) = send_webhook(
-                    client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
+                    webhook_client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
                 ).await {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,
                         tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
@@ -825,7 +852,7 @@ mod tests {
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+        let (txs, alerts) = poll_contract(&client, &client, &contract, &mut cursors, false).await.unwrap();
         assert_eq!(txs, 1);
         assert_eq!(alerts, 1, "FunctionCalled(withdraw) should fire from inline operations");
 
@@ -994,7 +1021,7 @@ mod tests {
             test_horizon_base_url: Some(server.uri()),
         };
 
-        let result = poll_contract(&client, &contract, &mut cursors, false).await;
+        let result = poll_contract(&client, &client, &contract, &mut cursors, false).await;
         assert!(result.is_err(), "expected Err when Horizon returns 500");
         assert_eq!(
             cursors.get(CONTRACT_ID),
@@ -1101,6 +1128,7 @@ mod tests {
     fn startup_log_includes_version_contracts_list_and_networks() {
         let cfg = AppConfig {
             poll_interval_seconds: 10,
+            cursor_file: None,
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
@@ -1182,6 +1210,14 @@ mod tests {
             .mount(&server)
             .await;
 
+        // One webhook POST per transaction (AnyTransaction). Unmocked receivers return 404
+        // and trigger retry backoff, which would stall this test for minutes.
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/hooks"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
         let client = Client::new();
         let contract = WatchedContract {
             label:       "Contract".into(),
@@ -1195,7 +1231,7 @@ mod tests {
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+        let (txs, alerts) = poll_contract(&client, &client, &contract, &mut cursors, false).await.unwrap();
         assert_eq!(txs, 201);
         assert_eq!(alerts, 201);
     }
