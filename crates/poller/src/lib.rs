@@ -465,6 +465,88 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
     }
 }
 
+// ── Horizon access ───────────────────────────────────────────────────────────
+
+/// One response from the Horizon transactions endpoint.
+enum TransactionsPage {
+    Records(Vec<HorizonTransactionWithOps>),
+    /// Horizon answered 429. The caller backs off for `retry_after` seconds.
+    RateLimited { retry_after: u64 },
+}
+
+/// The Horizon calls the poller makes. `reqwest::Client` implements this for
+/// production; tests can implement it with canned responses and no HTTP server.
+trait HorizonClient {
+    /// Fetch one page of transactions for `contract_id` after `cursor`.
+    async fn fetch_transactions(
+        &self,
+        base:        &str,
+        contract_id: &str,
+        cursor:      &str,
+    ) -> Result<TransactionsPage>;
+
+    /// Fetch the operations for a single transaction.
+    async fn fetch_operations(&self, base: &str, tx_hash: &str) -> Result<Vec<HorizonOperation>>;
+}
+
+impl HorizonClient for Client {
+    async fn fetch_transactions(
+        &self,
+        base:        &str,
+        contract_id: &str,
+        cursor:      &str,
+    ) -> Result<TransactionsPage> {
+        // Issue #23: use join=operations to fetch operations inline, eliminating
+        // one HTTP request per transaction.
+        let url = format!(
+            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations",
+            base, contract_id, cursor
+        );
+
+        let response = self
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {} failed", url))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5);
+            return Ok(TransactionsPage::RateLimited { retry_after });
+        }
+
+        if !response.status().is_success() {
+            anyhow::bail!("Horizon returned HTTP {} for {}", response.status(), url);
+        }
+
+        let page: HorizonPage = response
+            .json()
+            .await
+            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+
+        Ok(TransactionsPage::Records(page._embedded.records))
+    }
+
+    async fn fetch_operations(&self, base: &str, tx_hash: &str) -> Result<Vec<HorizonOperation>> {
+        let url = format!("{}/transactions/{}/operations", base, tx_hash);
+
+        let page: OperationsPage = self
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {} failed", url))?
+            .json()
+            .await
+            .with_context(|| format!("failed to parse operations from {}", url))?;
+
+        Ok(page._embedded.records)
+    }
+}
+
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Returns `(transactions_processed, alerts_fired)`.
@@ -473,7 +555,10 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 /// operations inline, eliminating one HTTP request per transaction (#23).
 /// Falls back to a separate `/transactions/{hash}/operations` fetch only when
 /// the inline `operations` array is absent (older Horizon versions).
-#[tracing::instrument(skip(client, contract, cursors), fields(
+///
+/// `horizon` serves the Horizon reads and `client` sends webhooks. They are
+/// separate so the Horizon side can be replaced in tests (#302).
+#[tracing::instrument(skip(horizon, client, contract, cursors), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
     network     = %contract.network.as_str()
@@ -602,7 +687,7 @@ async fn poll_contract(
             debug!(contract = %contract.label, tx = %tx_hash, "using inline operations (join=operations)");
             extract_soroban_details(record.operations)
         } else {
-            match fetch_soroban_details(client, poll_base, &tx_hash).await {
+            match fetch_soroban_details(horizon, poll_base, &tx_hash).await {
                 Ok(details) => details,
                 Err(e) => {
                     warn!(
@@ -617,8 +702,14 @@ async fn poll_contract(
         let enriched = match EnrichedTransaction::from_horizon(record.tx, function_names, amount_stroops, None) {
             Ok(t) => t,
             Err(e) => {
+                // Skip-and-advance (#305): the cursor was already moved past this
+                // transaction above. Retrying would pin the cursor on a record that
+                // can never be parsed and stall every transaction after it, so the
+                // skip is counted instead and operators can alert on the metric.
                 warn!(contract = %contract.label, tx = %tx_hash, error = %e,
                     "skipping transaction due to enrichment error");
+                #[cfg(feature = "metrics")]
+                metrics::inc_enrichment_errors();
                 continue;
             }
         };
@@ -652,6 +743,9 @@ async fn poll_contract(
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
+                // The sender is kept alive for the duration of the call so the
+                // retry backoff is never interrupted by a dropped channel.
+                let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
                 if let Err(e) = send_webhook(
                     webhook_client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
                 ).await {
@@ -702,24 +796,14 @@ fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u
 
 /// Fetch operations for a single transaction from Horizon.
 /// Used as a fallback when `join=operations` is not supported or returned no ops.
-#[tracing::instrument(skip(client), fields(tx = %tx_hash))]
-async fn fetch_soroban_details(
-    client:  &Client,
+#[tracing::instrument(skip(horizon), fields(tx = %tx_hash))]
+async fn fetch_soroban_details<H: HorizonClient>(
+    horizon: &H,
     base:    &str,
     tx_hash: &str,
 ) -> Result<(Vec<String>, Option<u64>)> {
-    let url = format!("{}/transactions/{}/operations", base, tx_hash);
-
-    let page: OperationsPage = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {} failed", url))?
-        .json()
-        .await
-        .with_context(|| format!("failed to parse operations from {}", url))?;
-
-    Ok(extract_soroban_details(page._embedded.records))
+    let ops = horizon.fetch_operations(base, tx_hash).await?;
+    Ok(extract_soroban_details(ops))
 }
 
 /// Polling intervals below this many seconds trigger a startup rate-limit warning.
@@ -1000,21 +1084,55 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn poll_contract_does_not_advance_cursor_on_fetch_failure() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path_regex("/accounts/.*/transactions"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
+    // ── Trait-based Horizon doubles (#302) ──────────────────────────────────
 
-        let client      = Client::new();
-        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let mut cursors: HashMap<String, String> = HashMap::new();
-        cursors.insert(contract_id.to_string(), "now".to_string());
+    /// Horizon double whose transaction fetch always fails.
+    struct FailingHorizon;
 
-        let contract = WatchedContract {
+    impl HorizonClient for FailingHorizon {
+        async fn fetch_transactions(
+            &self, _base: &str, _contract_id: &str, _cursor: &str,
+        ) -> Result<TransactionsPage> {
+            anyhow::bail!("simulated Horizon outage")
+        }
+
+        async fn fetch_operations(&self, _base: &str, _tx_hash: &str) -> Result<Vec<HorizonOperation>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Horizon double that serves `pages` in order, then empty pages.
+    /// Transactions carry no inline operations, so enrichment makes a
+    /// `fetch_operations` call for each one and gets an empty list back.
+    struct ScriptedHorizon {
+        pages: std::sync::Mutex<std::collections::VecDeque<Vec<HorizonTransactionWithOps>>>,
+    }
+
+    impl HorizonClient for ScriptedHorizon {
+        async fn fetch_transactions(
+            &self, _base: &str, _contract_id: &str, _cursor: &str,
+        ) -> Result<TransactionsPage> {
+            let next = self.pages.lock().unwrap().pop_front().unwrap_or_default();
+            Ok(TransactionsPage::Records(next))
+        }
+
+        async fn fetch_operations(&self, _base: &str, _tx_hash: &str) -> Result<Vec<HorizonOperation>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn scripted_tx(hash: &str, paging_token: &str) -> HorizonTransactionWithOps {
+        serde_json::from_value(serde_json::json!({
+            "hash":         hash,
+            "created_at":   "2024-06-01T10:00:00Z",
+            "successful":   true,
+            "paging_token": paging_token,
+        }))
+        .expect("valid transaction record")
+    }
+
+    fn test_contract(contract_id: &str) -> WatchedContract {
+        WatchedContract {
             label:       "test".into(),
             contract_id: contract_id.into(),
             network:     Network::Testnet,
@@ -1176,6 +1294,148 @@ mod tests {
         assert!(horizon_urls.contains("testnet=https://horizon-testnet.stellar.org"));
     }
 
+    /// Reads a counter's current value from the default Prometheus registry.
+    #[cfg(feature = "metrics")]
+    fn counter_value(name: &str) -> f64 {
+        prometheus::gather()
+            .iter()
+            .find(|family| family.get_name() == name)
+            .and_then(|family| family.get_metric().first().map(|m| m.get_counter().get_value()))
+            .unwrap_or(0.0)
+    }
+
+    /// #305: a transaction whose enrichment fails is skipped and counted, the cursor
+    /// still moves past it, and the next transaction in the page is processed.
+    #[tokio::test]
+    async fn enrichment_failure_skips_tx_and_advances_cursor() {
+        let server   = MockServer::start().await;
+        let receiver = MockServer::start().await;
+
+        // The first record has an unparseable created_at, so from_horizon fails.
+        let page = serde_json::json!({
+            "_embedded": {
+                "records": [
+                    {
+                        "hash": "bad_ts_tx", "created_at": "not-a-timestamp",
+                        "successful": true, "paging_token": "1",
+                        "fee_charged": "100", "envelope_xdr": null, "result_xdr": null
+                    },
+                    {
+                        "hash": "good_tx", "created_at": "2024-06-01T10:00:00Z",
+                        "successful": true, "paging_token": "2",
+                        "fee_charged": "100", "envelope_xdr": null, "result_xdr": null
+                    }
+                ]
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex("/transactions/.*/operations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .mount(&server)
+            .await;
+
+        // Only the parseable transaction matches AnyTransaction and fires a webhook.
+        Mock::given(method("POST"))
+            .and(path("/hooks"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&receiver)
+            .await;
+
+        let client   = Client::new();
+        let contract = WatchedContract {
+            label:       "Contract".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network:     Network::Testnet,
+            rules:       vec![AlertRule::AnyTransaction],
+            webhook_url: format!("{}/hooks", receiver.uri()),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract.contract_id.clone(), "now".to_string());
+
+        #[cfg(feature = "metrics")]
+        let errors_before = counter_value("txwatch_enrichment_errors_total");
+
+        let (txs, alerts) = poll_contract(&client, &client, &contract, &mut cursors, false).await.unwrap();
+
+        assert_eq!(txs, 1, "only the parseable transaction is counted as processed");
+        assert_eq!(alerts, 1);
+        assert_eq!(
+            cursors.get(&contract.contract_id).map(String::as_str),
+            Some("2"),
+            "cursor must advance past the skipped transaction so it is not retried"
+        );
+
+        #[cfg(feature = "metrics")]
+        assert_eq!(
+            counter_value("txwatch_enrichment_errors_total") - errors_before,
+            1.0,
+            "the skipped transaction must increment txwatch_enrichment_errors_total"
+        );
+    }
+
+    // ── extract_soroban_details (#304) ───────────────────────────────────────
+
+    fn payment_op(amount: &str) -> HorizonOperation {
+        HorizonOperation {
+            op_type:  "payment".into(),
+            function: None,
+            amount:   Some(amount.into()),
+        }
+    }
+
+    fn invoke_op(function: &str) -> HorizonOperation {
+        HorizonOperation {
+            op_type:  "invoke_host_function".into(),
+            function: Some(function.into()),
+            amount:   None,
+        }
+    }
+
+    #[test]
+    fn extract_sums_two_payment_ops() {
+        let ops = vec![payment_op("1.0000000"), payment_op("2.5000000")];
+        let (function_names, total) = extract_soroban_details(ops);
+
+        assert!(function_names.is_empty());
+        assert_eq!(total, Some(35_000_000), "1.0 + 2.5 XLM is 35_000_000 stroops");
+    }
+
+    #[test]
+    fn extract_saturates_when_payment_sum_overflows_u64() {
+        // Each op is 1.2e19 stroops, which fits in u64 on its own (max ≈ 1.8e19),
+        // but the sum does not. saturating_add must clamp it to u64::MAX.
+        let ops = vec![
+            payment_op("1200000000000.0000000"),
+            payment_op("1200000000000.0000000"),
+        ];
+        let (_, total) = extract_soroban_details(ops);
+
+        assert_eq!(total, Some(u64::MAX));
+    }
+
+    #[test]
+    fn extract_populates_function_names_and_total_for_mixed_ops() {
+        let ops = vec![
+            invoke_op("withdraw"),
+            payment_op("10.0000000"),
+            payment_op("0.5000000"),
+        ];
+        let (function_names, total) = extract_soroban_details(ops);
+
+        assert_eq!(function_names, vec!["withdraw"]);
+        assert_eq!(total, Some(105_000_000), "10.5 XLM is 105_000_000 stroops");
+    }
+
     #[tokio::test]
     async fn poll_handles_pagination_two_pages() {
         let server = MockServer::start().await;
@@ -1227,7 +1487,7 @@ mod tests {
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network:     Network::Testnet,
             rules:       vec![AlertRule::AnyTransaction],
-            webhook_url: format!("{}/hooks", server.uri()),
+            webhook_url: format!("{}/hooks", receiver.uri()),
             webhook_secret: None,
             test_horizon_base_url: Some(server.uri()),
         };
