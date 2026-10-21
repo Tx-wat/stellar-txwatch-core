@@ -78,6 +78,9 @@ pub fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Opti
 // ── Horizon transaction shape ─────────────────────────────────────────────────
 
 /// Raw Horizon transaction record as returned by the REST API.
+///
+/// This is the single definition of the Horizon transaction shape. The poller
+/// reuses it (via `#[serde(flatten)]`) rather than redeclaring its fields.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HorizonTransaction {
     pub hash: String,

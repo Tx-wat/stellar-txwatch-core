@@ -42,6 +42,7 @@ struct HorizonOperation {
 }
 
 /// A Horizon transaction record that may include inline operations via `join=operations`.
+/// The transaction fields come from `txwatch_rules::HorizonTransaction`; only `operations` is added here.
 #[derive(Deserialize)]
 struct HorizonTransactionWithOps {
     #[serde(flatten)]

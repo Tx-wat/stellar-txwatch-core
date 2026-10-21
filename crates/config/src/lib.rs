@@ -1449,6 +1449,30 @@ mod tests {
     }
 
     #[test]
+    fn from_file_handles_utf8_bom_prefix() {
+        let path = std::env::temp_dir().join("txwatch_utf8_bom_test_config.toml");
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(raw.as_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let result = AppConfig::from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let cfg = result.expect("config with a leading UTF-8 BOM should parse");
+        assert_eq!(cfg.poll_interval_seconds, 10);
+    }
+
+    #[test]
     fn from_file_returns_err_for_wrong_type_field() {
         let path = std::env::temp_dir().join("txwatch_wrong_type_field_test_config.toml");
         let raw = r#"

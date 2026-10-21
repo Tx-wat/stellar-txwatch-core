@@ -265,7 +265,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
         let delivery = result.unwrap();
         assert_eq!(delivery.attempts, 1);
@@ -289,7 +289,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
 
@@ -310,7 +310,7 @@ mod tests {
 
         let client   = Client::new();
         let url      = format!("{}/hook", server.uri());
-        let delivery = send_webhook(&client, &url, &sample_payload(), None)
+        let delivery = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown())
             .await
             .expect("should succeed on second attempt");
         assert_eq!(delivery.attempts, 2);
@@ -333,7 +333,7 @@ mod tests {
 
         let client   = build_client().unwrap();
         let url      = format!("{}/hook", server.uri());
-        let delivery = send_webhook(&client, &url, &sample_payload(), None)
+        let delivery = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown())
             .await
             .expect("200 with error body should be treated as success");
         assert_eq!(delivery.final_status, 200);
@@ -378,7 +378,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &sample_payload(), None).await.unwrap();
+        send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
@@ -452,7 +452,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
 
@@ -471,7 +471,7 @@ mod tests {
 
         let client = Client::new();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
 }
