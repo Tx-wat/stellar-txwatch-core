@@ -4,8 +4,12 @@
 //! exposing `send_webhook` and `test_payload` helpers for webhook delivery.
 
 use anyhow::{anyhow, Result};
+use chrono::Utc;
+use hmac::{Hmac, Mac};
 use reqwest::Client;
+use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
 use txwatch_rules::AlertPayload;
 

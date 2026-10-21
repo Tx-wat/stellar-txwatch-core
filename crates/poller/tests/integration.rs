@@ -14,6 +14,7 @@ use std::time::Duration;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use reqwest::Client;
 use txwatch_config::{AlertRule, AppConfig};
 use txwatch_rules::{evaluate, EnrichedTransaction};
 
@@ -247,7 +248,7 @@ async fn any_transaction_fires_webhook() {
         assert_eq!(payloads.len(), 1);
 
         for payload in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, payload, None)
+            txwatch_notifier::send_webhook(&client, &contract.webhook_url, payload, None, helpers::shutdown_rx())
                 .await
                 .unwrap();
         }
@@ -338,7 +339,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
             tx,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
+            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None, helpers::shutdown_rx())
                 .await
                 .unwrap();
         }
@@ -392,7 +393,7 @@ async fn large_transfer_fires_above_threshold() {
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].amount_xlm, Some(10_000));
 
-    txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None)
+    txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None, helpers::shutdown_rx())
         .await
         .unwrap();
 }
@@ -460,7 +461,7 @@ async fn function_called_rule_fires_on_exact_match() {
             tx,
         );
         for p in &payloads {
-            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None)
+            txwatch_notifier::send_webhook(&client, &contract.webhook_url, p, None, helpers::shutdown_rx())
                 .await
                 .unwrap();
         }
@@ -543,6 +544,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
         },
         vec![],
         None,
+        None,
     )
     .unwrap();
 
@@ -559,7 +561,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
     assert!(payloads[0].rule_triggered.contains("HighFee"));
     assert_eq!(payloads[0].fee_charged_stroops, Some(50_000));
 
-    txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None)
+    txwatch_notifier::send_webhook(&client, &contract.webhook_url, &payloads[0], None, helpers::shutdown_rx())
         .await
         .unwrap();
 }
@@ -619,6 +621,9 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -670,6 +675,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
     let cfg = AppConfig {
         poll_interval_seconds: 1,
         contracts: vec![contract],
+        cursor_file: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -686,7 +692,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
     assert_eq!(body["amount_xlm"].as_u64(), Some(5000));
 
     let requests = horizon.received_requests().await.unwrap();
-    assert!(requests.iter().any(|r| r.url.contains("cursor=1")),
+    assert!(requests.iter().any(|r| r.url.as_str().contains("cursor=1")),
         "expected the second Horizon transaction request to advance the cursor to '1'");
 }
 

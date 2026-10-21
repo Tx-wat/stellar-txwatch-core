@@ -13,6 +13,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json;
 use std::fs;
+use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::send_webhook;
@@ -285,12 +286,14 @@ async fn poll_contract(
             return Ok((0, 0));
         }
 
+        if !response.status().is_success() {
+            anyhow::bail!("Horizon returned HTTP {} for {}", response.status(), url);
+        }
+
         let page: HorizonPage = response
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
 
         let records = page._embedded.records;
         if records.is_empty() {
@@ -385,8 +388,11 @@ async fn poll_contract(
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
+                // The sender is kept alive for the duration of the call so the
+                // retry backoff is never interrupted by a dropped channel.
+                let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
                 if let Err(e) = send_webhook(
-                    client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
+                    client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(), shutdown_rx,
                 ).await {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,
                         tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
@@ -654,13 +660,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
-        let result = poll_contract(&client, &contract, &mut cursors).await;
+        let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0));
     }
@@ -683,12 +690,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+        let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
+        assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
         );
@@ -731,6 +740,7 @@ mod tests {
     fn startup_log_includes_version_contracts_list_and_networks() {
         let cfg = AppConfig {
             poll_interval_seconds: 10,
+            cursor_file: None,
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
@@ -810,13 +820,20 @@ mod tests {
             .mount(&server)
             .await;
 
+        // Webhook receiver: accepts every alert so retries never fire.
+        let receiver = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&receiver)
+            .await;
+
         let client = Client::new();
         let contract = WatchedContract {
             label:       "Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             network:     Network::Testnet,
             rules:       vec![AlertRule::AnyTransaction],
-            webhook_url: format!("{}/hooks", server.uri()),
+            webhook_url: format!("{}/hooks", receiver.uri()),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
