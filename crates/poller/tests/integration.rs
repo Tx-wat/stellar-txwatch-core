@@ -59,7 +59,7 @@ async fn run_polls_once_and_fires_webhook() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::AnyTransaction],
     );
-    contract.horizon_base_url_override = Some(horizon.uri());
+    contract.test_horizon_base_url = Some(horizon.uri());
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
@@ -110,11 +110,10 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         .mount(&receiver)
         .await;
 
-    let mut contract = helpers::contract(
-        &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }],
-    );
-    contract.horizon_base_url_override = Some(horizon.uri());
+    let mut contract = helpers::contract(&format!("{}/hook", receiver.uri()), vec![
+        AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None },
+    ]);
+    contract.test_horizon_base_url = Some(horizon.uri());
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
@@ -143,11 +142,8 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         .mount(&horizon)
         .await;
 
-    let mut contract = helpers::contract(
-        &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::AnyTransaction],
-    );
-    contract.horizon_base_url_override = Some(horizon.uri());
+    let mut contract = helpers::contract(&format!("{}/hook", receiver.uri()), vec![AlertRule::AnyTransaction]);
+    contract.test_horizon_base_url = Some(horizon.uri());
 
     let tmp = std::env::temp_dir().join("txwatch_test_cursor_integration.json");
     let mapping = serde_json::json!({ contract.contract_id.clone(): "100" });
@@ -260,17 +256,29 @@ async fn transaction_failed_rule_fires_only_on_failure() {
     let txs = vec![
         EnrichedTransaction::from_horizon(
             txwatch_rules::HorizonTransaction {
-                hash: "ok_tx".into(), created_at: "2024-06-01T10:00:00Z".into(),
-                successful: true, paging_token: "1".into(),
-                fee_charged: None, envelope_xdr: None, result_xdr: None,
+                hash: "ok_tx".into(),
+                created_at: "2024-06-01T10:00:00Z".into(),
+                successful: true,
+                paging_token: "1".into(),
+                fee_charged: None,
+                envelope_xdr: None,
+                result_xdr: None,
+                memo_type: None,
+                memo: None,
             },
             vec![], None, None,
         ).unwrap(),
         EnrichedTransaction::from_horizon(
             txwatch_rules::HorizonTransaction {
-                hash: "fail_tx".into(), created_at: "2024-06-01T10:01:00Z".into(),
-                successful: false, paging_token: "2".into(),
-                fee_charged: None, envelope_xdr: None, result_xdr: None,
+                hash: "fail_tx".into(),
+                created_at: "2024-06-01T10:01:00Z".into(),
+                successful: false,
+                paging_token: "2".into(),
+                fee_charged: None,
+                envelope_xdr: None,
+                result_xdr: None,
+                memo_type: None,
+                memo: None,
             },
             vec![], None, None,
         ).unwrap(),
@@ -311,9 +319,15 @@ async fn large_transfer_fires_above_threshold() {
 
     let tx = EnrichedTransaction::from_horizon(
         txwatch_rules::HorizonTransaction {
-            hash: "big_tx".into(), created_at: "2024-06-01T10:00:00Z".into(),
-            successful: true, paging_token: "1".into(),
-            fee_charged: None, envelope_xdr: None, result_xdr: None,
+            hash: "big_tx".into(),
+            created_at: "2024-06-01T10:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            memo_type: None,
+            memo: None,
         },
         vec![], Some(100_000_000_000), None,
     ).unwrap();
@@ -353,17 +367,29 @@ async fn function_called_rule_fires_on_exact_match() {
     let txs = vec![
         EnrichedTransaction::from_horizon(
             txwatch_rules::HorizonTransaction {
-                hash: "t1".into(), created_at: "2024-06-01T10:00:00Z".into(),
-                successful: true, paging_token: "1".into(),
-                fee_charged: None, envelope_xdr: None, result_xdr: None,
+                hash: "t1".into(),
+                created_at: "2024-06-01T10:00:00Z".into(),
+                successful: true,
+                paging_token: "1".into(),
+                fee_charged: None,
+                envelope_xdr: None,
+                result_xdr: None,
+                memo_type: None,
+                memo: None,
             },
             vec!["deposit".into()], None, None,
         ).unwrap(),
         EnrichedTransaction::from_horizon(
             txwatch_rules::HorizonTransaction {
-                hash: "t2".into(), created_at: "2024-06-01T10:01:00Z".into(),
-                successful: true, paging_token: "2".into(),
-                fee_charged: None, envelope_xdr: None, result_xdr: None,
+                hash: "t2".into(),
+                created_at: "2024-06-01T10:01:00Z".into(),
+                successful: true,
+                paging_token: "2".into(),
+                fee_charged: None,
+                envelope_xdr: None,
+                result_xdr: None,
+                memo_type: None,
+                memo: None,
             },
             vec!["withdraw".into()], None, None,
         ).unwrap(),
@@ -457,9 +483,15 @@ async fn high_fee_rule_fires_on_fee_charged() {
 
     let tx = EnrichedTransaction::from_horizon(
         txwatch_rules::HorizonTransaction {
-            hash: "fee_tx".into(), created_at: "2024-06-01T10:00:00Z".into(),
-            successful: true, paging_token: "1".into(),
-            fee_charged: Some("50000".into()), envelope_xdr: None, result_xdr: None,
+            hash: "fee_tx".into(),
+            created_at: "2024-06-01T10:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: Some("50000".into()),
+            envelope_xdr: None,
+            result_xdr: None,
+            memo_type: None,
+            memo: None,
         },
         vec![], None, None,
     ).unwrap();
@@ -520,7 +552,7 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::AnyTransaction],
     );
-    contract.horizon_base_url_override = Some(horizon.uri());
+    contract.test_horizon_base_url = Some(horizon.uri());
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
@@ -580,7 +612,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::LargeTransfer { threshold_xlm: 1_000 }],
     );
-    contract.horizon_base_url_override = Some(horizon.uri());
+    contract.test_horizon_base_url = Some(horizon.uri());
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
@@ -612,7 +644,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
 }
 
 /// horizon_link in webhook payloads always points to the canonical Horizon URL
-/// even when polling against a mock server. Closes #92.
+/// even when polling against a mock server (test_horizon_base_url set). Closes #92.
 #[tokio::test]
 async fn horizon_link_uses_canonical_url_not_mock_server() {
     let horizon  = MockServer::start().await;
@@ -649,7 +681,7 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::AnyTransaction],
     );
-    contract.horizon_base_url_override = Some(horizon.uri());
+    contract.test_horizon_base_url = Some(horizon.uri());
 
     let canonical_base = txwatch_config::Network::Testnet.horizon_base_url();
 
@@ -735,7 +767,7 @@ async fn contracts_polled_concurrently() {
         } else {
             "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string()
         };
-        c.horizon_base_url_override = Some(horizon_uri.to_string());
+        c.test_horizon_base_url = Some(horizon_uri.to_string());
         c
     };
 

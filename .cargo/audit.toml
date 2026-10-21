@@ -1,0 +1,12 @@
+[advisories]
+# Advisory IDs to ignore, each with a justification comment explaining why.
+#
+# Format:
+#   ignore = ["RUSTSEC-YYYY-NNNN"]  # <crate>: <reason + link to upstream fix>
+#
+# Example:
+#   ignore = ["RUSTSEC-2020-0071"]  # time: unmaintained indirect dep; no upstream fix yet
+#
+# Leave empty — every known vulnerability must be resolved or explicitly
+# acknowledged here before CI will pass.
+ignore = []
