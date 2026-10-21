@@ -324,6 +324,10 @@ async fn poll_contract(
             return Ok((0, 0));
         }
 
+        if !response.status().is_success() {
+            anyhow::bail!("Horizon returned HTTP {} from {}", response.status(), url);
+        }
+
         let page: HorizonPage = response
             .json()
             .await
@@ -855,6 +859,14 @@ mod tests {
         Mock::given(method("GET"))
             .and(path_regex("/transactions/.*/operations"))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .mount(&server)
+            .await;
+
+        // One webhook POST per transaction (AnyTransaction). Unmocked receivers return 404
+        // and trigger retry backoff, which would stall this test for minutes.
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/hooks"))
+            .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
 

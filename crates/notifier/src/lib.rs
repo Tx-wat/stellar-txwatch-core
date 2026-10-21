@@ -381,10 +381,11 @@ mod tests {
         let url    = format!("{}/hook", server.uri());
         send_webhook(&client, &url, &sample_payload(), Some("mysecret")).await.unwrap();
 
+        // The raw secret is never sent; only the HMAC signature header is.
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(requests[0].headers.contains_key("x-txwatch-secret"));
-        assert_eq!(requests[0].headers.get("x-txwatch-secret").unwrap(), "mysecret");
+        assert!(requests[0].headers.contains_key("x-txwatch-signature"));
+        assert!(!requests[0].headers.contains_key("x-txwatch-secret"));
     }
 
     #[tokio::test]

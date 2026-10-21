@@ -946,7 +946,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
+        // `{:#}` renders the full context chain, including the field path.
+        let error_msg = format!("{:#}", result.unwrap_err());
         assert!(error_msg.contains("failed to parse config file"));
         assert!(error_msg.contains("field: poll_interval_seconds"));
     }
