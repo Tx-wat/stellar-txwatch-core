@@ -304,6 +304,7 @@ scrape_configs:
 1. Poller wakes up (every poll_interval_seconds)
 2. For each contract:
    a. GET /accounts/{contract_id}/transactions?cursor={last_seen}&order=asc
+      → on 410 Gone (cursor expired): log a warning, reset cursor to "now", skip this cycle
    b. For each new transaction:
       i.  Advance cursor (even if enrichment fails)
       ii. GET /transactions/{hash}/operations
