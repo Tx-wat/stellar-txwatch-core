@@ -364,6 +364,7 @@ async fn poll_contract(
             canonical_base,
             contract.network.explorer_base_url(),
             &contract.rules,
+            contract.tags.as_ref(),
             &enriched,
         );
 
@@ -543,6 +544,7 @@ mod tests {
             rules:       vec![AlertRule::FunctionCalled { function_name: "withdraw".into() }],
             webhook_url: format!("{}/hook", receiver.uri()),
             webhook_secret: None,
+            tags: None,
             horizon_base_url_override: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
@@ -654,6 +656,7 @@ mod tests {
             network: Network::Testnet,
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            tags: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
@@ -683,6 +686,7 @@ mod tests {
             network: Network::Testnet,
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            tags: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
@@ -714,6 +718,7 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            tags: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
@@ -741,6 +746,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/a".into(),
                     webhook_secret: None,
+                    tags: None,
                     horizon_base_url_override: None,
                 },
                 WatchedContract {
@@ -750,6 +756,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/b".into(),
                     webhook_secret: None,
+                    tags: None,
                     horizon_base_url_override: None,
                 },
                 WatchedContract {
@@ -759,6 +766,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/c".into(),
                     webhook_secret: None,
+                    tags: None,
                     horizon_base_url_override: None,
                 },
             ],
@@ -817,6 +825,7 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: format!("{}/hooks", server.uri()),
             webhook_secret: None,
+            tags: None,
             horizon_base_url_override: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();

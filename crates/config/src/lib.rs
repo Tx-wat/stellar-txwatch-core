@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::{env, fmt, fs, path::Path};
+use std::{collections::HashMap, env, fmt, fs, path::Path};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -207,9 +207,33 @@ pub struct WatchedContract {
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
     pub webhook_secret: Option<String>,
+    /// Optional key-value tags forwarded in every `AlertPayload` for this contract, so
+    /// downstream receivers can route or annotate alerts without parsing the label.
+    /// Keys and values must be non-empty and at most 64 characters each.
+    #[serde(default)]
+    pub tags: Option<HashMap<String, String>>,
     /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
     #[serde(skip, default)]
     pub horizon_base_url_override: Option<String>,
+}
+
+/// Maximum length, in characters, of a tag key or value.
+const MAX_TAG_LEN: usize = 64;
+
+fn validate_tag_part(contract_label: &str, kind: &str, part: &str) -> Result<()> {
+    if part.trim().is_empty() {
+        bail!("contract '{}': tag {} must not be empty", contract_label, kind);
+    }
+    if part.chars().count() > MAX_TAG_LEN {
+        bail!(
+            "contract '{}': tag {} '{}' must be at most {} characters",
+            contract_label,
+            kind,
+            part,
+            MAX_TAG_LEN
+        );
+    }
+    Ok(())
 }
 
 impl WatchedContract {
@@ -258,6 +282,13 @@ impl WatchedContract {
         let label = self.label.clone();
         for rule in &mut self.rules {
             rule.validate(&label)?;
+        }
+
+        if let Some(tags) = &self.tags {
+            for (key, value) in tags {
+                validate_tag_part(&self.label, "key", key)?;
+                validate_tag_part(&self.label, "value", value)?;
+            }
         }
 
         Ok(())
@@ -394,6 +425,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
+            tags: None,
             horizon_base_url_override: None,
         }
     }
@@ -659,6 +691,73 @@ mod tests {
             source_account: "C".to_string() + &"A".repeat(55),
         }];
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn tags_accept_valid_key_values() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([
+            ("team".to_string(), "defi".to_string()),
+            ("severity".to_string(), "high".to_string()),
+        ]));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn tags_accept_exactly_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("k".repeat(64), "v".repeat(64))]));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn tags_reject_empty_key() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("".to_string(), "defi".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag key must not be empty"));
+    }
+
+    #[test]
+    fn tags_reject_blank_value() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("team".to_string(), "   ".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag value must not be empty"));
+    }
+
+    #[test]
+    fn tags_reject_key_over_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("k".repeat(65), "v".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag key"));
+        assert!(err.to_string().contains("at most 64 characters"));
+    }
+
+    #[test]
+    fn tags_reject_value_over_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("team".to_string(), "v".repeat(65))]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag value"));
+    }
+
+    #[test]
+    fn tags_deserialise_from_toml() {
+        let raw = r#"
+            label = "My Contract"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            tags = { team = "defi", env = "prod", severity = "high" }
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let c: WatchedContract = toml::from_str(raw).unwrap();
+        let tags = c.tags.unwrap();
+        assert_eq!(tags.get("team").map(String::as_str), Some("defi"));
+        assert_eq!(tags.len(), 3);
     }
 
     #[test]

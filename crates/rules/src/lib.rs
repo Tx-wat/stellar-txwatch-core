@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use txwatch_config::AlertRule;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -121,6 +122,8 @@ pub struct AlertPayload {
     pub horizon_link: String,
     /// Stellar Expert explorer link for the transaction.
     pub explorer_link: String,
+    /// Per-contract tags from config, forwarded so receivers can route or filter alerts.
+    pub tags: Option<HashMap<String, String>>,
 }
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
@@ -135,6 +138,7 @@ pub fn evaluate(
     horizon_base: &str,
     explorer_base: &str,
     rules: &[AlertRule],
+    tags: Option<&HashMap<String, String>>,
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
     let ctx = PayloadContext {
@@ -143,6 +147,7 @@ pub fn evaluate(
         network,
         horizon_base,
         explorer_base,
+        tags,
     };
 
     rules
@@ -251,6 +256,7 @@ pub struct PayloadContext<'a> {
     pub network: &'a str,
     pub horizon_base: &'a str,
     pub explorer_base: &'a str,
+    pub tags: Option<&'a HashMap<String, String>>,
 }
 
 impl AlertPayload {
@@ -271,6 +277,7 @@ impl AlertPayload {
             timestamp_iso: tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             horizon_link: format!("{}/transactions/{}", ctx.horizon_base, tx.hash),
             explorer_link: format!("{}/tx/{}", ctx.explorer_base, tx.hash),
+            tags: ctx.tags.cloned(),
         }
     }
 
@@ -317,6 +324,7 @@ mod tests {
             "https://horizon-testnet.stellar.org",
             "https://stellar.expert/explorer/testnet",
             rules,
+            None,
             tx,
         )
     }
@@ -345,6 +353,7 @@ mod tests {
             network: "testnet",
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: "https://stellar.expert/explorer/testnet",
+            tags: None,
         };
         let mut tx = make_tx(true, &["transfer", "withdraw"], Some(15_000 * 10_000_000));
         tx.fee_charged_stroops = Some(500);
@@ -369,6 +378,36 @@ mod tests {
             payload.explorer_link,
             "https://stellar.expert/explorer/testnet/tx/abc123"
         );
+    }
+
+    #[test]
+    fn evaluate_forwards_contract_tags_to_every_payload() {
+        let tags = HashMap::from([
+            ("team".to_string(), "defi".to_string()),
+            ("severity".to_string(), "high".to_string()),
+        ]);
+        let tx = make_tx(false, &[], None);
+        let payloads = evaluate(
+            "Label",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "testnet",
+            "https://horizon-testnet.stellar.org",
+            "https://stellar.expert/explorer/testnet",
+            &[AlertRule::AnyTransaction, AlertRule::TransactionFailed],
+            Some(&tags),
+            &tx,
+        );
+        assert_eq!(payloads.len(), 2);
+        for payload in &payloads {
+            assert_eq!(payload.tags.as_ref(), Some(&tags));
+        }
+    }
+
+    #[test]
+    fn evaluate_without_tags_yields_none() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert_eq!(payloads[0].tags, None);
     }
 
     #[test]
@@ -558,7 +597,7 @@ mod tests {
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 "testnet", horizon_base, explorer_base,
-                &[AlertRule::AnyTransaction], &tx,
+                &[AlertRule::AnyTransaction], None, &tx,
             );
             payloads.remove(0)
         }
@@ -783,6 +822,7 @@ mod tests {
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
+            tags: None,
         };
 
         let json = serde_json::to_value(payload).expect("serialize AlertPayload to JSON");

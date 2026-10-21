@@ -126,6 +126,7 @@ All matching rules fire; there is no short-circuit.
 | `timestamp`        | i64         | yes            | Unix timestamp (seconds) of transaction  |
 | `horizon_link`     | string      | yes            | Direct link to transaction on Horizon    |
 | `explorer_link`    | string      | yes            | Stellar Expert explorer link for the transaction |
+| `tags`             | object/null | no             | Per-contract tags from config; `null` when none are set |
 
 > `horizon_link` and `explorer_link` are always present in every alert payload, even when `function_name` is `null` for a non-Soroban transaction.
 

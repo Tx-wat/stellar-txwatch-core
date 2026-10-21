@@ -9,6 +9,7 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         rules,
         webhook_url: webhook_url.to_string(),
         webhook_secret: None,
+        tags: None,
         horizon_base_url_override: None,
     }
 }

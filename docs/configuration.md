@@ -28,6 +28,7 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `network`     | string | yes      | `mainnet`, `testnet`, or `futurenet`.                        |
 | `webhook_url` | string | yes      | `http://` or `https://` endpoint that receives alert JSON.   |
 | `webhook_secret` | string | no    | If set, an HMAC-SHA256 signature of the request body is sent as `X-TxWatch-Signature: sha256=<hmac>`. Never sends the raw secret over the wire. |
+| `tags`        | table  | no       | Optional key-value pairs forwarded in every alert payload under `tags`, for routing or filtering downstream. Keys and values must be non-empty and at most 64 characters. |
 
 ### Network field values
 
@@ -108,12 +109,14 @@ function_names = ["set_admin", "upgrade", "initialize"]
   "amount_xlm":       15000,
   "timestamp":        1705316096,
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
-  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123..."
+  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123...",
+  "tags":             { "team": "defi", "env": "prod" }
 }
 ```
 
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
 - `function_names` — all Soroban function names invoked in the transaction (one per `invoke_host_function` operation). Most transactions have zero or one entry.
+- `tags` — the contract's `tags` table as configured, or `null` when none are set.
 
 ## Environment variables
 
