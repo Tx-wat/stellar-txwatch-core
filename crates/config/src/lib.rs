@@ -314,13 +314,38 @@ where
 // ── Env-var interpolation ─────────────────────────────────────────────────────
 
 /// Resolves a `${VAR_NAME}` reference to the corresponding environment variable.
-/// Values that don't match the `${...}` pattern are returned unchanged.
+///
+/// Supported syntax: the whole value must be exactly `${VAR_NAME}`, where `VAR_NAME`
+/// contains only ASCII letters, digits and underscores. Values containing no `$`
+/// reference are returned unchanged. Any other `$` pattern (`$VAR` without braces,
+/// `${VAR:-default}`, or a reference embedded in a longer string) is rejected with an
+/// error rather than silently passed through as a literal.
 fn resolve_env_interpolation(value: &str) -> Result<String> {
-    match value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        Some(var_name) => env::var(var_name)
-            .with_context(|| format!("env var '{}' referenced in config is not set", var_name)),
-        None => Ok(value.to_owned()),
+    if let Some(var_name) = value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        let valid = !var_name.is_empty()
+            && var_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            bail!(
+                "unsupported env var interpolation '{}': only '${{VAR_NAME}}' is supported",
+                value
+            );
+        }
+        return std::env::var(var_name)
+            .with_context(|| format!("env var '{}' referenced in config is not set", var_name));
     }
+    let looks_like_reference = value
+        .match_indices('$')
+        .any(|(i, _)| matches!(
+            value[i + 1..].chars().next(),
+            Some(c) if c == '{' || c == '_' || c.is_ascii_alphabetic()
+        ));
+    if looks_like_reference {
+        bail!(
+            "unsupported env var interpolation '{}': only a value of exactly '${{VAR_NAME}}' is supported",
+            value
+        );
+    }
+    Ok(value.to_owned())
 }
 
 impl AppConfig {
@@ -329,6 +354,7 @@ impl AppConfig {
             if let Some(secret) = &contract.webhook_secret {
                 contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
             }
+            contract.webhook_url = resolve_env_interpolation(&contract.webhook_url)?;
         }
         Ok(())
     }
@@ -372,6 +398,29 @@ impl AppConfig {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_interpolation_passes_plain_values_through() {
+        assert_eq!(resolve_env_interpolation("plain-secret").unwrap(), "plain-secret");
+        assert_eq!(resolve_env_interpolation("price$5").unwrap(), "price$5");
+    }
+
+    #[test]
+    fn env_interpolation_resolves_braced_var() {
+        std::env::set_var("TXWATCH_TEST_INTERP_SECRET", "s3cret");
+        assert_eq!(
+            resolve_env_interpolation("${TXWATCH_TEST_INTERP_SECRET}").unwrap(),
+            "s3cret"
+        );
+    }
+
+    #[test]
+    fn env_interpolation_rejects_unsupported_patterns() {
+        for bad in ["$VAR", "${VAR:-default}", "prefix-${VAR}", "${}", "${VAR}-suffix"] {
+            let err = resolve_env_interpolation(bad).unwrap_err().to_string();
+            assert!(err.contains("unsupported env var interpolation"), "{bad}: {err}");
+        }
+    }
 
     fn valid_contract() -> WatchedContract {
         WatchedContract {
