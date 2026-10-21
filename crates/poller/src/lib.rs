@@ -218,9 +218,6 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
         }
         tokio::time::sleep(interval).await;
     }
-
-    info!("TxWatch polling engine stopped cleanly");
-    Ok(())
 }
 
 /// Like [`run_with`], but returns `Ok(())` once `shutdown` is set to `true`.
