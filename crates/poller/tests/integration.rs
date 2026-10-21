@@ -569,6 +569,9 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
         contracts: vec![contract],
         cursor_file: None,
         http_pool_max_idle_per_host: None,
@@ -629,6 +632,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
+        cursor_file: None,
         contracts: vec![contract],
         cursor_file: None,
         http_pool_max_idle_per_host: None,

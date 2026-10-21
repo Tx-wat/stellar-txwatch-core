@@ -1122,6 +1122,58 @@ mod tests {
         assert_eq!(result.unwrap(), (0, 0, 0));
     }
 
+    /// Issue #271: a 429 makes poll_contract sleep for the Retry-After duration
+    /// (default 5s when absent) and return Ok((0, 0)). Paused time keeps it fast.
+    async fn assert_429_backoff(retry_after: Option<&str>, expected_secs: u64) {
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(429);
+        if let Some(value) = retry_after {
+            response = response.insert_header("Retry-After", value);
+        }
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "now".to_string());
+
+        let contract = WatchedContract {
+            label: "test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            rules: vec![],
+            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+
+        let started = tokio::time::Instant::now();
+        let result = poll_contract(&client, &contract, &mut cursors, false).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(result.unwrap(), (0, 0));
+        assert_eq!(elapsed, Duration::from_secs(expected_secs));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn horizon_429_retry_after_zero_backs_off_zero_seconds() {
+        assert_429_backoff(Some("0"), 0).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn horizon_429_retry_after_five_backs_off_five_seconds() {
+        assert_429_backoff(Some("5"), 5).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn horizon_429_missing_retry_after_defaults_to_five_seconds() {
+        assert_429_backoff(None, 5).await;
+    }
+
     #[tokio::test]
     async fn horizon_503_error_contains_status_code() {
         let server = MockServer::start().await;

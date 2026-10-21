@@ -14,3 +14,10 @@ anyhow         = { workspace = true }
 base64         = "0.22"
 chrono         = { workspace = true }
 tracing        = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name    = "eval_benchmark"
+harness = false
