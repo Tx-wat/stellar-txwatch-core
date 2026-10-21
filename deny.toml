@@ -1,83 +1,43 @@
-# cargo-deny configuration
-# This file specifies security and dependency policies for the project.
+# cargo-deny configuration: advisory, license, ban, and source policy.
+# Run locally with `cargo deny check` (see CONTRIBUTING.md).
+
+[graph]
+all-features = true
 
 [advisories]
-# The advisory database to use. Options: "db" (default, uses advisory DB)
-db-path = "~/.cargo/advisory-db"
-# How to handle crates with security vulnerabilities
-vulnerability = "deny"
-# How to handle unmaintained/yanked crates
-unmaintained = "warn"
-# How to handle crates that have been yanked from crates.io
-yanked = "warn"
-# How to handle crates with security notices
-notice = "warn"
-# A list of advisory IDs to ignore
-ignore = [
-    #"RUSTSEC-2020-0001",
-]
+# Known vulnerabilities (RustSec) always fail the check.
+unmaintained = "workspace"
+yanked       = "deny"
+ignore       = []
 
 [licenses]
-# How to handle crates which do not have a detectable license
-unlicensed = "deny"
-# List of explicitly allowed licenses
+# Only licenses on this allow-list pass; anything else fails the check.
 allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
     "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
     "Unicode-DFS-2016",
     "Unlicense",
-    "MPL-2.0",
-    "BSD-3-Clause",
-    "BSD-2-Clause",
+    "Zlib",
 ]
-# List of explicitly disallowed licenses
-deny = [
-    "GPL-2.0",
-    "GPL-3.0",
-    "AGPL-3.0",
-]
-# Lint level for crates which do not have a detectable license
-copyleft = "warn"
-# Blanket approval or denial for OSI-approved or FSF Free/Libre licenses
-allow-osi-fsf-free = "both"
-# Lint level used when no other predicates are matched
-default = "deny"
-# The confidence threshold for detecting a license from license text.
 confidence-threshold = 0.8
 
 [bans]
-# Lint level for when multiple versions of the same crate are detected
 multiple-versions = "warn"
-# Lint level for when a crate in the graph has been yanked
-yanked = "warn"
-# Lint level for when a crate with security notices is detected
-notice = "warn"
-# A list of explicitly allowed duplicate crates
-allow = [
-    #{ name = "ansi_term", version = "=0.11.0" },
-]
-# A list of explicitly disallowed duplicate crates
-deny = [
-    # Each entry can be just the name and version like:
-    # { name = "ansi_term", version = "=0.11.0" },
-]
-# Certain crates/versions that will be skipped when doing duplicate detection.
-skip = [
-    #{ name = "ansi_term", version = "=0.11.0" },
-]
-# Similarly named crates that are allowed to coexist
-skip-tree = [
-    #{ name = "windows-sys", version = "=0.48.0" },
-]
+wildcards         = "deny"
+# Path dependencies between workspace crates have no version requirement.
+allow-wildcard-paths = true
+deny              = []
+skip              = []
+skip-tree         = []
 
 [sources]
-# Lint level for what to happen when a crate from a crate registry that is not in the allow list is detected
-unknown-registry = "warn"
-# Lint level for what to happen when a crate from a git repository that is not in the allow list is detected
-unknown-git = "warn"
-# List of allowed crate registries
-allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# List of allowed Git repositories
-allow-git = []
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
+allow-git        = []
