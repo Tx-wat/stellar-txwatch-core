@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
@@ -150,12 +150,32 @@ async fn main() -> Result<()> {
             let cfg = AppConfig::from_file(&cli.config)?;
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
+            // Handles both Ctrl+C (SIGINT) and SIGTERM (e.g. from Docker/systemd).
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             tokio::spawn(async move {
-                if let Err(e) = tokio::signal::ctrl_c().await {
-                    warn!(error = ?e, "failed to install Ctrl+C handler");
-                    return;
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = signal(SignalKind::terminate())
+                        .expect("failed to install SIGTERM handler");
+                    tokio::select! {
+                        result = tokio::signal::ctrl_c() => {
+                            if let Err(e) = result {
+                                warn!(error = ?e, "failed to install Ctrl+C handler");
+                            }
+                        }
+                        _ = sigterm.recv() => {
+                            info!("received SIGTERM");
+                        }
+                    }
                 }
+                #[cfg(not(unix))]
+                {
+                    if let Err(e) = tokio::signal::ctrl_c().await {
+                        warn!(error = ?e, "failed to install Ctrl+C handler");
+                    }
+                }
+                info!("shutdown signal received — finishing current poll cycle");
                 let _ = shutdown_tx.send(true);
             });
 

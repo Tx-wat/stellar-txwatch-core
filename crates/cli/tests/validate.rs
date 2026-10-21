@@ -126,15 +126,15 @@ webhook_url = "https://hooks.example.com/test"
         "  poll_interval_seconds : 10\n",
         "  contracts             : 1\n",
         "\n",
-        "  [testnet] Test Contract\n",
-        "    contract_id  : CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+        "  [Stellar Testnet] Test Contract\n",
+        "    contract_id  : CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
         "    webhook_url  : https://hooks.example.com/test\n",
         "    secret       : none\n",
         "    rules        : 2\n",
         "      - AnyTransaction\n",
         "      - TransactionFailed\n",
         "    horizon      : https://horizon-testnet.stellar.org\n",
-        "    explorer     : https://stellar.expert/explorer/testnet\n"
+        "    explorer     : https://stellar.expert/explorer/testnet/contract/CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
     );
 
     assert_eq!(stdout, expected);

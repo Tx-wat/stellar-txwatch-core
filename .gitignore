@@ -1,3 +1,27 @@
+# Build output
 /target
-Cargo.lock
+
+# Test snapshots (insta / cargo-insta)
+**/*.snap
+**/*.snap.new
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Editor and OS junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Scratch / dev notes
 vrickish.md
+
+# Cursor persistence files generated during testing
+txwatch_*.json

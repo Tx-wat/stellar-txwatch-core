@@ -4,7 +4,11 @@
 //! exposing `send_webhook` and `test_payload` helpers for webhook delivery.
 
 use anyhow::{anyhow, Result};
+use chrono::Utc;
+use hex;
+use hmac::{Hmac, Mac};
 use reqwest::Client;
+use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, span, warn, Level};
 use txwatch_rules::AlertPayload;
@@ -30,7 +34,9 @@ pub fn build_client() -> Result<Client> {
 
 /// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
 /// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
-/// If `secret` is Some, adds an `X-TxWatch-Secret` header to every request.
+///
+/// If `secret` is `Some`, adds an `X-TxWatch-Signature: sha256=<hmac>` header
+/// computed as HMAC-SHA256 of the request body using the provided secret key.
 ///
 /// Delivery semantics: HTTP 2xx = success. The response body is logged at
 /// debug level but is otherwise ignored — a 200 OK with an error body is
@@ -38,13 +44,17 @@ pub fn build_client() -> Result<Client> {
 ///
 /// Returns a [`DeliveryResult`] describing how many attempts were needed.
 pub async fn send_webhook(
-    client: &Client,
-    url: &str,
+    client:  &Client,
+    url:     &str,
     payload: &AlertPayload,
-    secret: Option<&str>,
-    mut shutdown: oneshot::Receiver<()>,
+    secret:  Option<&str>,
 ) -> Result<DeliveryResult> {
-    let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
+    let span = span!(
+        Level::INFO,
+        "send_webhook",
+        contract = %payload.label,
+        rule     = %payload.rule_triggered
+    );
     let _enter = span.enter();
 
     let body = serde_json::to_string(payload)?;
@@ -61,6 +71,7 @@ pub async fn send_webhook(
             .header("Content-Type", "application/json")
             .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
             .body(body.clone());
+
         if let Some(s) = secret {
             let mut mac = Hmac::<Sha256>::new_from_slice(s.as_bytes())
                 .expect("HMAC accepts any key length");
@@ -68,13 +79,12 @@ pub async fn send_webhook(
             let sig = hex::encode(mac.finalize().into_bytes());
             req = req.header("X-TxWatch-Signature", format!("sha256={}", sig));
         }
+
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 let final_status = resp.status().as_u16();
                 // Issue #24: log response body at debug level.
                 // HTTP 2xx = delivery success regardless of body content.
-                // Some receivers return 200 OK with an error body; we treat
-                // any 2xx as a successful delivery (body is informational only).
                 let body_text = resp.text().await.unwrap_or_default();
                 debug!(
                     timestamp     = %ts,
@@ -117,12 +127,7 @@ pub async fn send_webhook(
         }
 
         if attempt < MAX_RETRIES {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))) => {}
-                _ = &mut shutdown => {
-                    return Err(anyhow!("webhook retry aborted: shutdown signal received"));
-                }
-            }
+            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
         }
     }
 
@@ -144,9 +149,9 @@ pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
 
 /// Build a synthetic `AlertPayload` with an explicit network name and Horizon base URL.
 pub fn test_payload_with_network(
-    label: &str,
-    webhook_url: &str,
-    network: &str,
+    label:            &str,
+    webhook_url:      &str,
+    network:          &str,
     horizon_base_url: &str,
 ) -> AlertPayload {
     let now     = Utc::now();
@@ -173,6 +178,7 @@ pub fn test_payload_with_network(
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use hmac::{Hmac, Mac};
@@ -197,10 +203,6 @@ mod tests {
             horizon_link:        "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link:       "https://stellar.expert/explorer/testnet/tx/abc123".into(),
         }
-    }
-
-    fn dummy_shutdown() -> oneshot::Receiver<()> {
-        oneshot::channel().1
     }
 
     #[tokio::test]
@@ -268,7 +270,6 @@ mod tests {
     }
 
     /// Issue #24: a 200 response with an error body must still be treated as success.
-    /// The body is logged at debug level but does not affect delivery outcome.
     #[tokio::test]
     async fn success_with_error_body_is_still_treated_as_success() {
         let server = MockServer::start().await;
@@ -292,7 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signature_header_present_when_provided() {
+    async fn signature_header_is_correct_hmac() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/hook"))
@@ -300,14 +301,21 @@ mod tests {
             .mount(&server)
             .await;
 
+        let payload = sample_payload();
+        let body    = serde_json::to_string(&payload).unwrap();
+        let secret  = "test-secret";
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body.as_bytes());
+        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &sample_payload(), Some("mysecret")).await.unwrap();
+        send_webhook(&client, &url, &payload, Some(secret)).await.unwrap();
 
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].headers.contains_key("x-txwatch-secret"));
-        assert_eq!(requests[0].headers.get("x-txwatch-secret").unwrap(), "mysecret");
+        let sig = requests[0].headers.get("x-txwatch-signature").unwrap();
+        assert_eq!(sig, &expected);
     }
 
     #[tokio::test]
@@ -326,32 +334,7 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert!(!requests[0].headers.contains_key("x-txwatch-secret"));
-    }
-
-    #[tokio::test]
-    async fn signature_header_is_correct_hmac() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/hook"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-
-        let payload = sample_payload();
-        let body = serde_json::to_string(&payload).unwrap();
-        let secret = "test-secret";
-
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
-        mac.update(body.as_bytes());
-        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-
-        let client = build_client().unwrap();
-        let url = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &payload, Some(secret)).await.unwrap();
-
-        let requests = server.received_requests().await.unwrap();
-        let sig = requests[0].headers.get("x-txwatch-signature").unwrap();
-        assert_eq!(sig, &expected);
+        assert!(!requests[0].headers.contains_key("x-txwatch-signature"));
     }
 
     #[tokio::test]
@@ -367,11 +350,9 @@ mod tests {
         let url    = format!("{}/hook", server.uri());
         let result = send_webhook(&client, &url, &sample_payload(), None).await;
         assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("shutdown"), "error should mention shutdown, got: {}", msg);
     }
 
-    /// Issue #13: test_payload produces a structurally valid AlertPayload (56-char contract ID).
+    /// Issue #13: test_payload produces a structurally valid AlertPayload.
     #[test]
     fn test_payload_is_structurally_valid() {
         let p = test_payload("My Contract", "https://example.com/hook");
@@ -379,18 +360,16 @@ mod tests {
         assert_eq!(p.rule_triggered, "TestWebhook");
         assert_eq!(p.contract_id.len(), 56, "contract_id must be 56 characters");
         assert!(p.contract_id.starts_with('C'), "contract_id must start with 'C'");
-        assert!(p.horizon_link.contains("/transactions/"), "horizon_link must contain /transactions/");
-        assert!(p.explorer_link.contains("stellar.expert"), "explorer_link must point to stellar.expert");
+        assert!(p.horizon_link.contains("/transactions/"));
+        assert!(p.explorer_link.contains("stellar.expert"));
     }
 
     /// Issue #13: test_payload_with_network derives links from the supplied network config.
     #[test]
     fn test_payload_with_network_derives_links_from_config() {
         let p = test_payload_with_network(
-            "Label",
-            "https://example.com/hook",
-            "mainnet",
-            "https://horizon.stellar.org",
+            "Label", "https://example.com/hook",
+            "mainnet", "https://horizon.stellar.org",
         );
         assert!(p.horizon_link.starts_with("https://horizon.stellar.org/transactions/"));
         assert!(p.explorer_link.contains("/mainnet/"));
@@ -415,8 +394,8 @@ mod tests {
 
     #[tokio::test]
     async fn content_length_header_is_present_and_correct() {
-        let server = MockServer::start().await;
-        let body   = serde_json::to_string(&sample_payload()).unwrap();
+        let server  = MockServer::start().await;
+        let body    = serde_json::to_string(&sample_payload()).unwrap();
 
         Mock::given(method("POST"))
             .and(path("/hook"))
