@@ -80,6 +80,7 @@ struct Counters {
     alerts: AtomicU64,
     interval_transactions: AtomicU64,
     interval_alerts: AtomicU64,
+    interval_suppressed: AtomicU64,
 }
 
 // ── Public entry points ───────────────────────────────────────────────────────
@@ -191,12 +192,14 @@ pub async fn run_with_shutdown(
                     tokio::time::sleep(summary_every).await;
                     let interval_txs    = c.interval_transactions.swap(0, Ordering::Relaxed);
                     let interval_alerts = c.interval_alerts.swap(0, Ordering::Relaxed);
+                    let interval_suppressed = c.interval_suppressed.swap(0, Ordering::Relaxed);
                     info!(
                         contracts             = n_contracts,
                         transactions_total    = c.transactions.load(Ordering::Relaxed),
                         alerts_total          = c.alerts.load(Ordering::Relaxed),
                         transactions_interval = interval_txs,
                         alerts_interval       = interval_alerts,
+                        alerts_suppressed_interval = interval_suppressed,
                         "60-second summary"
                     );
                 }
@@ -207,14 +210,26 @@ pub async fn run_with_shutdown(
         }
     });
 
+    // A contract without its own cap inherits the global `max_alerts_per_cycle`.
+    let contracts: Vec<WatchedContract> = cfg
+        .contracts
+        .iter()
+        .cloned()
+        .map(|mut c| {
+            c.max_alerts_per_cycle = c.max_alerts_per_cycle.or(cfg.max_alerts_per_cycle);
+            c
+        })
+        .collect();
+
     loop {
-        for contract in &cfg.contracts {
+        for contract in &contracts {
             match poll_contract(&client, contract, &mut cursors, dry_run).await {
-                Ok((txs, alerts)) => {
+                Ok((txs, alerts, suppressed)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
                     counters.interval_transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
+                    counters.interval_suppressed.fetch_add(suppressed, Ordering::Relaxed);
                     // Issue #25: increment Prometheus counters when metrics feature is enabled.
                     #[cfg(feature = "metrics")]
                     {
@@ -243,7 +258,7 @@ pub async fn run_with_shutdown(
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
-/// Returns `(transactions_processed, alerts_fired)`.
+/// Returns `(transactions_processed, alerts_fired, alerts_suppressed_by_cap)`.
 ///
 /// Uses `join=operations` on the transactions endpoint so that Horizon returns
 /// operations inline, eliminating one HTTP request per transaction (#23).
@@ -259,7 +274,7 @@ async fn poll_contract(
     contract: &WatchedContract,
     cursors:  &mut HashMap<String, String>,
     dry_run:  bool,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, u64)> {
     let cursor = cursors
         .get(&contract.contract_id)
         .cloned()
@@ -301,7 +316,7 @@ async fn poll_contract(
                 .unwrap_or(5);
             warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
             tokio::time::sleep(Duration::from_secs(retry_after)).await;
-            return Ok((0, 0));
+            return Ok((0, 0, 0));
         }
 
         let page: HorizonPage = response
@@ -338,6 +353,7 @@ async fn poll_contract(
 
     let mut tx_count    = 0u64;
     let mut alert_count = 0u64;
+    let mut suppressed  = 0u64;
 
     for record in all_records {
         let paging_token = record.tx.paging_token.clone();
@@ -392,6 +408,10 @@ async fn poll_contract(
         }
 
         for payload in payloads {
+            if contract.max_alerts_per_cycle.is_some_and(|cap| alert_count >= cap) {
+                suppressed += 1;
+                continue;
+            }
             alert_count += 1;
             info!(contract = %contract.label, rule = %payload.rule_triggered,
                 tx = %payload.transaction_hash, "rule matched");
@@ -414,12 +434,17 @@ async fn poll_contract(
         }
     }
 
+    if suppressed > 0 {
+        warn!(contract = %contract.label, cap = ?contract.max_alerts_per_cycle, suppressed,
+            "alert cap reached: {} additional alerts suppressed this cycle", suppressed);
+    }
+
     if tx_count > 0 {
         info!(contract = %contract.label, transactions = tx_count, alerts = alert_count,
             "poll cycle complete");
     }
 
-    Ok((tx_count, alert_count))
+    Ok((tx_count, alert_count, suppressed))
 }
 
 // ── Soroban operation enrichment ──────────────────────────────────────────────
@@ -563,11 +588,12 @@ mod tests {
             webhook_url: format!("{}/hook", receiver.uri()),
             webhook_secret: None,
             horizon_url: Some(server.uri()),
+            max_alerts_per_cycle: None,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+        let (txs, alerts, _) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
         assert_eq!(txs, 1);
         assert_eq!(alerts, 1, "FunctionCalled(withdraw) should fire from inline operations");
 
@@ -577,6 +603,64 @@ mod tests {
             reqs.iter().all(|r| !r.url.path().contains("/operations")),
             "no separate /operations request should be made when inline ops are present"
         );
+    }
+
+    /// #269: with a per-cycle cap of 2, three matching transactions send two webhooks
+    /// and report one suppressed alert.
+    #[tokio::test]
+    async fn alert_cap_suppresses_alerts_above_limit_in_one_cycle() {
+        let server = MockServer::start().await;
+        let records: Vec<serde_json::Value> = (1..=3)
+            .map(|i| {
+                serde_json::json!({
+                    "hash":         format!("captx{}", i),
+                    "created_at":   "2024-06-01T10:00:00Z",
+                    "successful":   true,
+                    "paging_token": format!("{}", i),
+                    "operations":   [{ "type": "invoke_host_function", "function": "withdraw" }]
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "_embedded": { "records": records } }),
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .mount(&server)
+            .await;
+
+        let receiver = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&receiver)
+            .await;
+
+        let client = Client::new();
+        let contract = WatchedContract {
+            label:       "capped".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network:     Network::Testnet,
+            rules:       vec![AlertRule::AnyTransaction],
+            webhook_url: format!("{}/hook", receiver.uri()),
+            webhook_secret: None,
+            horizon_url: Some(server.uri()),
+            max_alerts_per_cycle: Some(2),
+        };
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract.contract_id.clone(), "now".to_string());
+
+        let (txs, alerts, suppressed) =
+            poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+        assert_eq!(txs, 3);
+        assert_eq!(alerts, 2, "only the first two alerts should be sent");
+        assert_eq!(suppressed, 1, "the third alert should be suppressed, not dropped silently");
     }
 
     #[tokio::test]
@@ -675,12 +759,13 @@ mod tests {
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_url: Some(server.uri()),
+            max_alerts_per_cycle: None,
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
         let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
-        assert_eq!(result.unwrap(), (0, 0));
+        assert_eq!(result.unwrap(), (0, 0, 0));
     }
 
     #[tokio::test]
@@ -705,6 +790,7 @@ mod tests {
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_url: Some(server.uri()),
+            max_alerts_per_cycle: None,
         };
 
         let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
@@ -736,6 +822,7 @@ mod tests {
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_url: Some(server.uri()),
+            max_alerts_per_cycle: None,
         };
 
         let result = poll_contract(&client, &contract, &mut cursors, false).await;
@@ -755,6 +842,7 @@ mod tests {
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
             cursor_file: None,
+            max_alerts_per_cycle: None,
             contracts: vec![
                 WatchedContract {
                     label:       "Contract A".into(),
@@ -764,6 +852,7 @@ mod tests {
                     webhook_url: "https://hooks.example.com/a".into(),
                     webhook_secret: None,
                     horizon_url: None,
+                    max_alerts_per_cycle: None,
                 },
                 WatchedContract {
                     label:       "Contract B".into(),
@@ -773,6 +862,7 @@ mod tests {
                     webhook_url: "https://hooks.example.com/b".into(),
                     webhook_secret: None,
                     horizon_url: None,
+                    max_alerts_per_cycle: None,
                 },
                 WatchedContract {
                     label:       "Contract C".into(),
@@ -782,6 +872,7 @@ mod tests {
                     webhook_url: "https://hooks.example.com/c".into(),
                     webhook_secret: None,
                     horizon_url: None,
+                    max_alerts_per_cycle: None,
                 },
             ],
         };
@@ -840,11 +931,12 @@ mod tests {
             webhook_url: format!("{}/hooks", server.uri()),
             webhook_secret: None,
             horizon_url: Some(server.uri()),
+            max_alerts_per_cycle: None,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
 
-        let (txs, alerts) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
+        let (txs, alerts, _) = poll_contract(&client, &contract, &mut cursors, false).await.unwrap();
         assert_eq!(txs, 201);
         assert_eq!(alerts, 201);
     }

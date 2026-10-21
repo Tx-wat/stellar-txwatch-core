@@ -7,6 +7,7 @@ Config is a TOML file passed via `--config` (default: `config/example.toml`).
 | Field                   | Type | Required | Description                           |
 |-------------------------|------|----------|---------------------------------------|
 | `poll_interval_seconds` | u64  | yes      | How often to poll Horizon (seconds). Must be >= 5 and ≤ 3600. |
+| `max_alerts_per_cycle` | u64 | no | Maximum webhooks sent per contract in one poll cycle. Alerts above the cap are logged (`alert cap reached: N additional alerts suppressed this cycle`) and counted in the 60-second summary, not silently dropped. Must be >= 1. Default: unlimited. A contract's own `max_alerts_per_cycle` overrides this value. |
 
 > **Horizon rate limits:** Polling too frequently across many contracts can exhaust Horizon's per-IP request quota,
 > resulting in `429 Too Many Requests` responses. Sustained polling across six or more contracts at intervals below
@@ -29,6 +30,7 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `webhook_url` | string | yes      | `http://` or `https://` endpoint that receives alert JSON.   |
 | `webhook_secret` | string | no    | If set, an HMAC-SHA256 signature of the request body is sent as `X-TxWatch-Signature: sha256=<hmac>`. Never sends the raw secret over the wire. |
 | `horizon_url` | string | no | Optional Horizon base URL override (e.g. a private Horizon or local replica). Must be `http://` or `https://`. When omitted, the network's public Horizon is used. Payload `horizon_link` fields still point at the public Horizon. |
+| `max_alerts_per_cycle` | u64 | no | Per-contract cap on webhooks sent per poll cycle. Overrides the top-level `max_alerts_per_cycle`. Must be >= 1. |
 
 ### Network field values
 

@@ -195,6 +195,10 @@ pub struct WatchedContract {
     /// Falls back to the network's public Horizon when absent.
     #[serde(default)]
     pub horizon_url: Option<String>,
+    /// Per-contract cap on webhooks sent in one poll cycle. Overrides the global
+    /// `max_alerts_per_cycle`. Unset means the global value applies.
+    #[serde(default)]
+    pub max_alerts_per_cycle: Option<u64>,
 }
 
 impl WatchedContract {
@@ -233,6 +237,13 @@ impl WatchedContract {
                 "contract '{}': webhook_url '{}' has no host",
                 self.label,
                 self.webhook_url
+            );
+        }
+
+        if self.max_alerts_per_cycle == Some(0) {
+            bail!(
+                "contract '{}': max_alerts_per_cycle must be >= 1 when set",
+                self.label
             );
         }
 
@@ -307,6 +318,11 @@ pub struct AppConfig {
     /// Default: false.
     #[serde(default)]
     pub http_connection_verbose: Option<bool>,
+    /// Maximum webhooks sent per contract in a single poll cycle. Alerts above the cap
+    /// are logged and suppressed, not silently dropped. Unset (default) means unlimited.
+    /// A contract's own `max_alerts_per_cycle` takes precedence over this value.
+    #[serde(default)]
+    pub max_alerts_per_cycle: Option<u64>,
 }
 
 fn default_http_pool_max_idle_per_host() -> Option<usize> {
@@ -376,6 +392,9 @@ impl AppConfig {
         if self.contracts.is_empty() {
             bail!("at least one [[contracts]] entry is required");
         }
+        if self.max_alerts_per_cycle == Some(0) {
+            bail!("max_alerts_per_cycle must be >= 1 when set");
+        }
         for contract in &mut self.contracts {
             contract.validate()?;
         }
@@ -405,6 +424,7 @@ mod tests {
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
             horizon_url: None,
+            max_alerts_per_cycle: None,
         }
     }
 
@@ -415,6 +435,57 @@ mod tests {
     }
 
     /// #268: horizon_url is optional and absent by default.
+    /// #269: max_alerts_per_cycle is optional and defaults to unlimited.
+    #[test]
+    fn max_alerts_per_cycle_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.max_alerts_per_cycle.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    /// #269: the global cap and per-contract override both parse from TOML.
+    #[test]
+    fn max_alerts_per_cycle_is_parsed_globally_and_per_contract() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            max_alerts_per_cycle = 50
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            max_alerts_per_cycle = 5
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.max_alerts_per_cycle, Some(50));
+        assert_eq!(cfg.contracts[0].max_alerts_per_cycle, Some(5));
+    }
+
+    #[test]
+    fn rejects_zero_max_alerts_per_cycle_on_contract() {
+        let mut c = valid_contract();
+        c.max_alerts_per_cycle = Some(0);
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_zero_global_max_alerts_per_cycle() {
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![valid_contract()],
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: Some(0),
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
+    }
+
     #[test]
     fn horizon_url_defaults_to_none() {
         let mut c = valid_contract();
@@ -653,6 +724,7 @@ mod tests {
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
             cursor_file: None,
+            max_alerts_per_cycle: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -667,6 +739,7 @@ mod tests {
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
             cursor_file: None,
+            max_alerts_per_cycle: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -720,6 +793,7 @@ mod tests {
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
                 cursor_file: None,
+                max_alerts_per_cycle: None,
             };
             let err = cfg.validate().unwrap_err();
             assert!(
