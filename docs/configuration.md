@@ -13,8 +13,9 @@ Config is a TOML file passed via `--config` (default: `config/example.toml`).
 > resulting in `429 Too Many Requests` responses. Sustained polling across six or more contracts at intervals below
 > 10 seconds is known to trigger rate limiting in production. The recommended minimum is
 > `poll_interval_seconds = 10`; for high-volume deployments with many contracts, `poll_interval_seconds = 30` or
-> higher is advised. TxWatch logs a startup warning when `poll_interval_seconds < 10` and more than 5 contracts
-> are configured.
+> higher is advised. TxWatch logs a startup warning when `poll_interval_seconds < 10`, regardless of how many
+> contracts are configured. The warning includes the estimated requests per minute
+> (`contracts × 60 / poll_interval_seconds`).
 
 > **Contract limit:** A maximum of **100** `[[contracts]]` entries are allowed per configuration file. Exceeding this limit is rejected at startup to prevent exhausting memory or file descriptors from too many concurrent Horizon polling tasks.
 
@@ -29,8 +30,9 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `network`     | string | yes      | `mainnet`, `testnet`, or `futurenet`.                        |
 | `webhook_url` | string | yes      | `http://` or `https://` endpoint that receives alert JSON.   |
 | `webhook_secret` | string | no    | If set, an HMAC-SHA256 signature of the request body is sent as `X-TxWatch-Signature: sha256=<hmac>`. Never sends the raw secret over the wire. |
-| `horizon_url` | string | no | Optional Horizon base URL override (e.g. a private Horizon or local replica). Must be `http://` or `https://`. When omitted, the network's public Horizon is used. Payload `horizon_link` fields still point at the public Horizon. |
-| `max_alerts_per_cycle` | u64 | no | Per-contract cap on webhooks sent per poll cycle. Overrides the top-level `max_alerts_per_cycle`. Must be >= 1. |
+| `tags`        | table  | no       | Optional key-value pairs forwarded in every alert payload under `tags`, for routing or filtering downstream. Keys and values must be non-empty and at most 64 characters. |
+
+> **Env var interpolation:** `webhook_secret` supports exactly one interpolation form: the whole value must be `${VAR_NAME}` (ASCII letters, digits and underscores), which is replaced by the environment variable's value at load time. Any other `$` pattern — `$VAR` without braces, `${VAR:-default}`, or a reference embedded in a longer string — is rejected at startup with an `unsupported env var interpolation` error. Values with no `$` reference are used as-is.
 
 ### Network field values
 
@@ -99,6 +101,23 @@ type           = "AdminFunctionCalled"
 function_names = ["set_admin", "upgrade", "initialize"]
 ```
 
+### `HighFee`
+Fires when the transaction's total fee exceeds the threshold. Set exactly one of
+`threshold_stroops` (raw stroops, > 0) or `threshold_xlm` (whole XLM, > 0); setting both is an error.
+`threshold_xlm` is converted to stroops during validation (1 XLM = 10,000,000 stroops).
+
+```toml
+[[contracts.rules]]
+type               = "HighFee"
+threshold_stroops  = 100000
+```
+
+```toml
+[[contracts.rules]]
+type           = "HighFee"
+threshold_xlm  = 1             # equivalent to threshold_stroops = 10000000
+```
+
 ## Webhook payload
 
 ```json
@@ -111,14 +130,17 @@ function_names = ["set_admin", "upgrade", "initialize"]
   "function_name":    "transfer",
   "function_names":   ["transfer"],
   "amount_xlm":       15000,
+  "amount_stroops":   150000000000,
   "timestamp":        1705316096,
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
-  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123..."
+  "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123...",
+  "tags":             { "team": "defi", "env": "prod" }
 }
 ```
 
 - `function_name` — the first invoked Soroban function name (present for backward compatibility).
 - `function_names` — all Soroban function names invoked in the transaction (one per `invoke_host_function` operation). Most transactions have zero or one entry.
+- `tags` — the contract's `tags` table as configured, or `null` when none are set.
 
 ## Environment variables
 

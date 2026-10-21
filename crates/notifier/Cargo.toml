@@ -1,11 +1,13 @@
 [package]
 name    = "txwatch-notifier"
 version = "0.1.0"
+license = "Apache-2.0"
 edition = "2021"
 
 [dependencies]
+txwatch-config = { path = "../config" }
 txwatch-rules = { path = "../rules" }
-reqwest       = { workspace = true }
+reqwest       = { workspace = true, features = ["native-tls"] }
 serde_json    = { workspace = true }
 anyhow        = { workspace = true }
 tokio         = { workspace = true }
