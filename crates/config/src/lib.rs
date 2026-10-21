@@ -4,8 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_path_to_error::Deserializer as PathDeserializer;
-use std::{fmt, fs, path::Path};
+use std::{env, fmt, fs, path::Path};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -296,9 +295,8 @@ fn deserialize_toml_with_field_context<'de, T>(raw: &'de str, path: &Path) -> Re
 where
     T: DeserializeOwned,
 {
-    let mut deserializer = toml::Deserializer::new(raw);
-    let mut path_deserializer = PathDeserializer::new(&mut deserializer);
-    T::deserialize(&mut path_deserializer).map_err(|error| {
+    let deserializer = toml::Deserializer::new(raw);
+    serde_path_to_error::deserialize(deserializer).map_err(|error| {
         let path = error.path().to_string();
         let inner = error.into_inner();
         let message = if path.is_empty() {
@@ -624,11 +622,14 @@ mod tests {
         for val in 0u64..5 {
             let mut cfg = AppConfig {
                 poll_interval_seconds: val,
+                contracts: vec![valid_contract()],
                 http_pool_max_idle_per_host: None,
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
+                cursor_file: None,
             };
             let err = cfg.validate().unwrap_err();
+            assert!(
                 err.to_string().contains("poll_interval_seconds must be >= 5"),
                 "val={} should be rejected: {}", val, err
             );
@@ -679,7 +680,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
+        // `{:#}` renders the full context chain, including the field-path cause.
+        let error_msg = format!("{:#}", result.unwrap_err());
         assert!(error_msg.contains("failed to parse config file"));
         assert!(error_msg.contains("field: poll_interval_seconds"));
     }

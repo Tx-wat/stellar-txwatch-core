@@ -291,8 +291,6 @@ async fn poll_contract(
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
 
         let records = page._embedded.records;
-
-        let records = page._embedded.records;
         if records.is_empty() {
             break;
         }
@@ -689,6 +687,7 @@ mod tests {
         };
 
         let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+        assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
         );

@@ -43,7 +43,7 @@ webhook_url = "https://hooks.example.com/vault-webhook"
 [[contracts]]
 label       = "Mainnet Bridge Gateway"
 # Replace with your actual Soroban contract address (56 characters, starts with 'C')
-contract_id = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+contract_id = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 # network must be one of: mainnet / testnet / futurenet
 network     = "mainnet"
 # webhook_url can differ per contract — this allows routing alerts to different endpoints
