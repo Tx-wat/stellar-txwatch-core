@@ -26,8 +26,8 @@ const VERSION: &str = concat!(
     about   = "Stellar Soroban contract monitor & webhook alert engine"
 )]
 struct Cli {
-    /// Path to the TOML config file
-    #[arg(short, long, default_value = "config/example.toml")]
+    /// Path to the TOML config file [env: TXWATCH_CONFIG]
+    #[arg(short, long, env = "TXWATCH_CONFIG", default_value = "config/example.toml")]
     config: PathBuf,
 
     #[command(subcommand)]
@@ -80,6 +80,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // With the `opentelemetry` feature, the returned provider flushes buffered spans on drop.
+    #[cfg(feature = "opentelemetry")]
+    let _telemetry = init_tracing();
+    #[cfg(not(feature = "opentelemetry"))]
     init_tracing();
 
     let cli = Cli::parse();
@@ -224,6 +228,7 @@ async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
 }
 // ── Tracing initialisation ────────────────────────────────────────────────────
 
+#[cfg(not(feature = "opentelemetry"))]
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     fmt()
@@ -232,4 +237,60 @@ fn init_tracing() {
         )
         .with_target(false)
         .init();
+}
+
+/// Installs the log subscriber, plus an OTLP span exporter when
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The returned provider must stay alive
+/// for the whole run so that buffered spans are flushed on shutdown.
+#[cfg(feature = "opentelemetry")]
+fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+    let provider = otel_provider(endpoint.as_deref());
+    let otel_layer = provider
+        .as_ref()
+        .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("txwatch")));
+
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(fmt::layer().with_target(false))
+        .with(otel_layer)
+        .init();
+    provider
+}
+
+/// Builds a batch OTLP span exporter. Export is opt-in: with no endpoint,
+/// no exporter is created and no spans leave the process.
+#[cfg(feature = "opentelemetry")]
+fn otel_provider(endpoint: Option<&str>) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+    // The exporter reads OTEL_EXPORTER_OTLP_ENDPOINT itself; `endpoint` only gates it.
+    endpoint?;
+    match opentelemetry_otlp::SpanExporter::builder().with_tonic().build() {
+        Ok(exporter) => Some(
+            opentelemetry_sdk::trace::SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .build(),
+        ),
+        Err(e) => {
+            eprintln!("failed to build OTLP span exporter, trace export disabled: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(all(test, feature = "opentelemetry"))]
+mod otel_tests {
+    use super::otel_provider;
+
+    #[test]
+    fn no_exporter_is_built_without_an_endpoint() {
+        assert!(otel_provider(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn exporter_is_built_when_an_endpoint_is_configured() {
+        assert!(otel_provider(Some("http://127.0.0.1:4317")).is_some());
+    }
 }

@@ -125,6 +125,18 @@ cargo test -p txwatch-poller   # includes integration tests
 
 Add `-- --nocapture` to see log output while tests run.
 
+## Dependency checks
+
+CI runs [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) on every pull
+request. It checks advisories (RustSec), licenses, banned crates, and crate
+sources against [`deny.toml`](deny.toml). Run it locally before submitting a PR
+when you add or update dependencies:
+
+```bash
+cargo install cargo-deny --locked   # once
+cargo deny check
+```
+
 ## Adding Tests
 
 ### Where to put tests

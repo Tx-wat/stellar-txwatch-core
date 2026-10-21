@@ -121,6 +121,7 @@ pub async fn send_webhook(
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 let final_status = resp.status().as_u16();
+                span.record("status", final_status);
                 // Issue #24: log response body at debug level.
                 // HTTP 2xx = delivery success regardless of body content.
                 let body_text = resp.text().await.unwrap_or_default();
@@ -143,6 +144,7 @@ pub async fn send_webhook(
             }
             Ok(resp) => {
                 let status = resp.status();
+                span.record("status", status.as_u16());
                 warn!(
                     timestamp = %ts,
                     attempt   = attempt,
@@ -224,8 +226,6 @@ pub fn test_payload_with_network(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

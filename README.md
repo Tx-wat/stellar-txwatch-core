@@ -129,7 +129,11 @@ Commands:
   test-webhook --url <URL>              Send a test payload to a webhook URL and exit
 ```
 
-`--config` defaults to `config/example.toml`.
+`--config` defaults to `config/example.toml`. It can also be set with the
+`TXWATCH_CONFIG` environment variable; the `--config` flag takes precedence when both are set.
+
+Optional OpenTelemetry trace export: build with `--features opentelemetry` and set
+`OTEL_EXPORTER_OTLP_ENDPOINT`. See [docs/configuration.md](docs/configuration.md#opentelemetry-trace-export-optional).
 
 **watch flags:**
 - `--dry-run` — evaluate rules and log matches, but do not send any webhooks

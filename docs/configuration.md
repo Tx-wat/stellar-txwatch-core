@@ -144,9 +144,30 @@ threshold_xlm  = 1             # equivalent to threshold_stroops = 10000000
 
 ## Environment variables
 
-| Variable   | Default | Description                                      |
-|------------|---------|--------------------------------------------------|
-| `RUST_LOG` | `info`  | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+| Variable         | Default               | Description                                                                 |
+|------------------|-----------------------|-----------------------------------------------------------------------------|
+| `RUST_LOG`       | `info`                | Log level: `error`, `warn`, `info`, `debug`, `trace`                        |
+| `TXWATCH_CONFIG` | `config/example.toml` | Path to the TOML config file. Used when `--config` is not passed; the `--config` flag takes precedence. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP collector endpoint. Only read by builds with the `opentelemetry` feature; when set, spans are exported. |
+
+## OpenTelemetry trace export (optional)
+
+TxWatch can export distributed traces over OTLP (gRPC) to tools such as Jaeger,
+Tempo, or Honeycomb. This is opt-in: it needs a build with the `opentelemetry`
+feature, and nothing is exported unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
+
+```bash
+cargo build -p txwatch --features opentelemetry
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  txwatch --config config/my-config.toml watch
+```
+
+Spans:
+
+- `poll_contract` — one per contract poll, with `contract`, `contract_id`, `network`, and `transactions` (the number of transactions processed).
+- `send_webhook` — a child of `poll_contract`, with `contract`, `rule`, `url`, and `status` (the HTTP status of the response, when one was received).
+
+Default builds do not include the OpenTelemetry dependencies.
 
 Note: setting `RUST_LOG=debug` will show per-contract idle poll cycles — the
 poller emits `"no new transactions"` debug logs with the contract `label` and
