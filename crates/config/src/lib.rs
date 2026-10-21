@@ -192,9 +192,10 @@ pub struct WatchedContract {
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
     pub webhook_secret: Option<String>,
-    /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
+    /// Test-only: override the Horizon base URL. Never read from TOML (`serde(skip)`) —
+    /// set programmatically in tests. Production code must leave this `None`.
     #[serde(skip, default)]
-    pub horizon_base_url_override: Option<String>,
+    pub test_horizon_base_url: Option<String>,
 }
 
 impl WatchedContract {
@@ -429,7 +430,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
-            horizon_base_url_override: None,
+            test_horizon_base_url: None,
         }
     }
 

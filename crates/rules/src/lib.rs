@@ -67,6 +67,12 @@ pub struct EnrichedTransaction {
 
 impl EnrichedTransaction {
     /// Build from a raw Horizon record plus optional Soroban operation details.
+    ///
+    /// # Fee precedence
+    /// An explicitly passed `fee_charged_stroops` always takes precedence over
+    /// the record's own `fee_charged`. `tx.fee_charged` is parsed only as a
+    /// fallback when `fee_charged_stroops` is `None`. The poller passes `None`
+    /// (the only call site outside tests), so the Horizon record's value is used.
     pub fn from_horizon(
         tx: HorizonTransaction,
         function_names: Vec<String>,
@@ -204,6 +210,9 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
                 .unwrap_or(false)
         }
 
+        // Exact, case-sensitive match: Soroban function names are case-sensitive
+        // symbols, so `Withdraw` and `withdraw` are different functions.
+        // (`AdminFunctionCalled` below is deliberately case-insensitive.)
         AlertRule::FunctionCalled { function_name } => tx
             .function_names
             .iter()
@@ -428,6 +437,40 @@ mod tests {
             &tx,
         );
         assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn function_called_is_case_sensitive() {
+        let tx = make_tx(true, &["withdraw"], None);
+        let payloads = run(
+            &[AlertRule::FunctionCalled {
+                function_name: "Withdraw".into(),
+            }],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "FunctionCalled must not match a different casing"
+        );
+    }
+
+    #[test]
+    fn explicit_fee_takes_precedence_over_record_fee() {
+        let raw = |fee: Option<&str>| HorizonTransaction {
+            hash: "h".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: fee.map(Into::into),
+            envelope_xdr: None,
+            result_xdr: None,
+        };
+
+        let explicit = EnrichedTransaction::from_horizon(raw(Some("100")), vec![], None, Some(999)).unwrap();
+        assert_eq!(explicit.fee_charged_stroops, Some(999));
+
+        let fallback = EnrichedTransaction::from_horizon(raw(Some("100")), vec![], None, None).unwrap();
+        assert_eq!(fallback.fee_charged_stroops, Some(100));
     }
 
     #[test]
