@@ -77,17 +77,18 @@ jobs:
         run: cargo test --all
 
   # ── Security audit ──────────────────────────────────────────────────────────
-  audit:
+  security-audit:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
 
-      - name: Run cargo-audit to check for known CVEs
-        run: cargo install cargo-audit && cargo audit
+      - name: Run cargo-audit
+        # Fails CI on any advisory not listed in .cargo/audit.toml [advisories] ignore
+        run: cargo audit
 
   # ── Dependency checks ───────────────────────────────────────────────────────
   deny:
@@ -96,14 +97,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run cargo-deny to check dependencies
-        uses: EmbarkStudios/cargo-deny-action@v1
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run cargo-deny to check licenses, bans and advisories
+        run: cargo install cargo-deny --locked && cargo deny check
 
   # ── Build (release) ─────────────────────────────────────────────────────────
   build:
     name: Build (release)
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, audit, deny]
+    needs: [fmt, clippy, test, security-audit, deny]
     steps:
       - uses: actions/checkout@v4
 

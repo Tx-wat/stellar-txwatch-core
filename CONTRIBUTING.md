@@ -192,15 +192,19 @@ AlertRule::MyNewRule { my_field } => {
 ```
 
 > Note: Adding a new `AlertRule` variant requires updating both `eval_rule()` and
-> `rule_label()` in `crates/rules/src/lib.rs`. Rust's exhaustive matching helps
+> `AlertRule::label()` in `crates/config/src/lib.rs`. Rust's exhaustive matching helps
 > catch missing arms, but both functions must remain in sync for new variants.
 
-### Step 4 — Label the rule (`crates/rules/src/lib.rs`)
+### Step 4 — Label the rule (`crates/config/src/lib.rs`)
 
-Add a match arm in `rule_label()`:
+Add a match arm in `AlertRule::label()` and `AlertRule::rule_type()`:
 
 ```rust
+// In label():
 AlertRule::MyNewRule { my_field } => format!("MyNewRule({})", my_field),
+
+// In rule_type():
+AlertRule::MyNewRule { .. } => "MyNewRule".into(),
 ```
 
 ### Step 5 — Add to the TOML config format

@@ -4,10 +4,34 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_path_to_error::Deserializer as PathDeserializer;
 use std::{env, fmt, fs, path::Path};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
+
+/// Stroops per XLM (1 XLM = 10^7 stroops).
+pub const STROOPS_PER_XLM: u64 = 10_000_000;
+
+/// Formats a stroop amount as whole or decimal XLM, e.g. `5_000_000` → `"0.5"`.
+pub fn format_xlm(stroops: u64) -> String {
+    let whole = stroops / STROOPS_PER_XLM;
+    let frac = stroops % STROOPS_PER_XLM;
+    if frac == 0 {
+        whole.to_string()
+    } else {
+        format!("{}.{}", whole, format!("{:07}", frac).trim_end_matches('0'))
+    }
+}
+
+/// Human-readable `LargeTransfer` label, e.g. `"LargeTransfer(>=10000XLM)"`.
+pub fn large_transfer_label(threshold_xlm: Option<u64>, threshold_stroops: Option<u64>) -> String {
+    match (threshold_xlm, threshold_stroops) {
+        (Some(xlm), None) => format!("LargeTransfer(>={}XLM)", xlm),
+        (None, Some(stroops)) => format!("LargeTransfer(>={}XLM)", format_xlm(stroops)),
+        _ => "LargeTransfer".into(),
+    }
+}
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
@@ -61,6 +85,22 @@ impl fmt::Display for Network {
     }
 }
 
+impl FromStr for Network {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "mainnet" => Ok(Network::Mainnet),
+            "testnet" => Ok(Network::Testnet),
+            "futurenet" => Ok(Network::Futurenet),
+            other => bail!(
+                "unknown network '{}'. Valid values: mainnet, testnet, futurenet.",
+                other
+            ),
+        }
+    }
+}
+
 // ── AlertRule ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -68,6 +108,11 @@ impl fmt::Display for Network {
 pub enum AlertRule {
     AnyTransaction,
     TransactionFailed,
+    /// Fires when a transaction fails because the source account cannot cover the fee
+    /// (Horizon result code `txINSUFFICIENT_BALANCE`). Other failures do not match.
+    InsufficientFunds,
+    /// Fires when the transaction invokes any Soroban host function, regardless of name.
+    SorobanInvocation,
     LargeTransfer       { threshold_xlm: u64 },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
@@ -80,24 +125,54 @@ pub enum AlertRule {
         #[serde(default)]
         threshold_xlm: Option<u64>,
     },
+    /// Fires when the transaction's source account equals `source_account`.
+    SourceAccountMatch { source_account: String },
 }
 
 impl AlertRule {
     pub fn validate(&mut self, contract_label: &str) -> Result<()> {
         match self {
-            AlertRule::LargeTransfer { threshold_xlm } => {
-                if *threshold_xlm == 0 {
-                    bail!(
-                        "contract '{}': LargeTransfer threshold_xlm must be > 0",
+            AlertRule::LargeTransfer { threshold_xlm, threshold_stroops } => {
+                match (*threshold_xlm, *threshold_stroops) {
+                    (Some(_), Some(_)) => bail!(
+                        "contract '{}': LargeTransfer: specify either threshold_stroops or \
+                         threshold_xlm, not both",
                         contract_label
-                    );
-                }
-                if *threshold_xlm > MAX_LARGE_TRANSFER_THRESHOLD_XLM {
-                    bail!(
-                        "contract '{}': LargeTransfer threshold_xlm must be <= {}",
-                        contract_label,
-                        MAX_LARGE_TRANSFER_THRESHOLD_XLM
-                    );
+                    ),
+                    (None, None) => bail!(
+                        "contract '{}': LargeTransfer requires threshold_xlm or threshold_stroops",
+                        contract_label
+                    ),
+                    (Some(xlm), None) => {
+                        if xlm == 0 {
+                            bail!(
+                                "contract '{}': LargeTransfer threshold_xlm must be > 0",
+                                contract_label
+                            );
+                        }
+                        if xlm > MAX_LARGE_TRANSFER_THRESHOLD_XLM {
+                            bail!(
+                                "contract '{}': LargeTransfer threshold_xlm must be <= {}",
+                                contract_label,
+                                MAX_LARGE_TRANSFER_THRESHOLD_XLM
+                            );
+                        }
+                    }
+                    (None, Some(stroops)) => {
+                        if stroops == 0 {
+                            bail!(
+                                "contract '{}': LargeTransfer threshold_stroops must be > 0",
+                                contract_label
+                            );
+                        }
+                        if stroops > MAX_LARGE_TRANSFER_THRESHOLD_XLM * STROOPS_PER_XLM {
+                            bail!(
+                                "contract '{}': LargeTransfer threshold_stroops must be <= {}",
+                                contract_label,
+                                MAX_LARGE_TRANSFER_THRESHOLD_XLM * STROOPS_PER_XLM
+                            );
+                        }
+                    }
                 }
             }
             AlertRule::FunctionCalled { function_name } => {
@@ -125,7 +200,10 @@ impl AlertRule {
                     *name = name.to_lowercase();
                 }
             }
-            AlertRule::AnyTransaction | AlertRule::TransactionFailed => {}
+            AlertRule::AnyTransaction
+            | AlertRule::TransactionFailed
+            | AlertRule::InsufficientFunds
+            | AlertRule::SorobanInvocation => {}
             AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
                 match (*threshold_xlm, *threshold_stroops) {
                     (Some(_), s) if s > 0 => bail!(
@@ -152,13 +230,28 @@ impl AlertRule {
                     _ => {}
                 }
             }
+            AlertRule::SourceAccountMatch { source_account } => {
+                // Stellar account (G-) addresses are 56 base32 characters.
+                if source_account.len() != 56 || !source_account.starts_with('G') {
+                    bail!(
+                        "contract '{}': SourceAccountMatch source_account '{}' is not a valid \
+                         Stellar account address (must start with 'G' and be 56 characters)",
+                        contract_label,
+                        source_account
+                    );
+                }
+            }
         }
         Ok(())
     }
+    /// Human-readable rule description with parameters.
+    /// Used as `rule_triggered` in alert payloads (e.g. `"LargeTransfer(>=10000XLM)"`).
     pub fn label(&self) -> String {
         match self {
             AlertRule::AnyTransaction => "AnyTransaction".into(),
             AlertRule::TransactionFailed => "TransactionFailed".into(),
+            AlertRule::InsufficientFunds => "InsufficientFunds".into(),
+            AlertRule::SorobanInvocation => "SorobanInvocation".into(),
             AlertRule::LargeTransfer { threshold_xlm } => {
                 format!("LargeTransfer(>={}XLM)", threshold_xlm)
             }
@@ -175,8 +268,66 @@ impl AlertRule {
                     format!("HighFee(>={} stroops)", threshold_stroops)
                 }
             }
+            AlertRule::SourceAccountMatch { source_account } => {
+                format!("SourceAccountMatch({})", source_account)
+            }
         }
-    }}
+    }
+
+    /// Stable machine-readable rule variant name.
+    /// Used as `rule_type` in alert payloads (e.g. `"LargeTransfer"`, `"HighFee"`).
+    /// Use this for programmatic routing — it never includes parameters.
+    pub fn rule_type(&self) -> String {
+        match self {
+            AlertRule::AnyTransaction => "AnyTransaction".into(),
+            AlertRule::TransactionFailed => "TransactionFailed".into(),
+            AlertRule::LargeTransfer { .. } => "LargeTransfer".into(),
+            AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
+            AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
+            AlertRule::HighFee { .. } => "HighFee".into(),
+        }
+    }
+}
+
+// ── TlsConfig ─────────────────────────────────────────────────────────────────
+
+/// Optional mutual-TLS settings for webhook delivery to one contract.
+/// All paths point to PEM files and are checked for existence at validation time.
+/// The private key contents are never logged.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM client certificate presented to the webhook receiver.
+    pub client_cert: String,
+    /// PEM private key (PKCS#8) matching `client_cert`.
+    pub client_key: String,
+    /// Optional PEM CA bundle used to validate the webhook server's certificate.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+}
+
+impl TlsConfig {
+    pub fn validate(&self, contract_label: &str) -> Result<()> {
+        let mut paths = vec![("client_cert", &self.client_cert), ("client_key", &self.client_key)];
+        if let Some(ca) = &self.ca_cert {
+            paths.push(("ca_cert", ca));
+        }
+        for (field, path) in paths {
+            if path.trim().is_empty() {
+                bail!("contract '{}': tls.{} must not be empty", contract_label, field);
+            }
+            if !Path::new(path).is_file() {
+                bail!(
+                    "contract '{}': tls.{} file '{}' does not exist or is not a file",
+                    contract_label,
+                    field,
+                    path
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
@@ -191,9 +342,29 @@ pub struct WatchedContract {
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
     pub webhook_secret: Option<String>,
-    /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
+    /// Test-only: override the Horizon base URL. Never read from TOML (`serde(skip)`) —
+    /// set programmatically in tests. Production code must leave this `None`.
     #[serde(skip, default)]
-    pub horizon_base_url_override: Option<String>,
+    pub test_horizon_base_url: Option<String>,
+}
+
+/// Maximum length, in characters, of a tag key or value.
+const MAX_TAG_LEN: usize = 64;
+
+fn validate_tag_part(contract_label: &str, kind: &str, part: &str) -> Result<()> {
+    if part.trim().is_empty() {
+        bail!("contract '{}': tag {} must not be empty", contract_label, kind);
+    }
+    if part.chars().count() > MAX_TAG_LEN {
+        bail!(
+            "contract '{}': tag {} '{}' must be at most {} characters",
+            contract_label,
+            kind,
+            part,
+            MAX_TAG_LEN
+        );
+    }
+    Ok(())
 }
 
 impl WatchedContract {
@@ -242,6 +413,10 @@ impl WatchedContract {
         let label = self.label.clone();
         for rule in &mut self.rules {
             rule.validate(&label)?;
+        }
+
+        if let Some(tls) = &self.tls {
+            tls.validate(&self.label)?;
         }
 
         Ok(())
@@ -296,7 +471,7 @@ where
     T: DeserializeOwned,
 {
     let deserializer = toml::Deserializer::new(raw);
-    serde_path_to_error::deserialize::<_, T>(deserializer).map_err(|error| {
+    serde_path_to_error::deserialize(deserializer).map_err(|error| {
         let path = error.path().to_string();
         let inner = error.into_inner();
         let message = if path.is_empty() {
@@ -308,16 +483,82 @@ where
     })
 }
 
+/// Checks `cursor_file` before polling starts (#279).
+///
+/// - Existing file: must be readable and contain valid JSON.
+/// - Missing file: its parent directory must exist and be writable.
+fn validate_cursor_file(path: &str) -> Result<()> {
+    let cursor_path = Path::new(path);
+
+    if cursor_path.is_file() {
+        let raw = fs::read_to_string(cursor_path)
+            .with_context(|| format!("cursor_file '{}' cannot be read", path))?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .with_context(|| format!("cursor_file '{}' is not valid JSON", path))?;
+        return Ok(());
+    }
+
+    if cursor_path.exists() {
+        bail!("cursor_file '{}' exists but is not a regular file", path);
+    }
+
+    let dir = match cursor_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    if !dir.is_dir() {
+        bail!("cursor_file directory '{}' does not exist", dir.display());
+    }
+    check_dir_writable(dir)
+}
+
+/// Probes writability by creating and removing a uniquely named file.
+fn check_dir_writable(dir: &Path) -> Result<()> {
+    let probe = dir.join(format!(".txwatch-write-probe-{}", std::process::id()));
+    match fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(_) => bail!("cursor_file directory '{}' is not writable", dir.display()),
+    }
+}
+
 // ── Env-var interpolation ─────────────────────────────────────────────────────
 
 /// Resolves a `${VAR_NAME}` reference to the corresponding environment variable.
-/// Values that don't match the `${...}` pattern are returned unchanged.
+///
+/// Supported syntax: the whole value must be exactly `${VAR_NAME}`, where `VAR_NAME`
+/// contains only ASCII letters, digits and underscores. Values containing no `$`
+/// reference are returned unchanged. Any other `$` pattern (`$VAR` without braces,
+/// `${VAR:-default}`, or a reference embedded in a longer string) is rejected with an
+/// error rather than silently passed through as a literal.
 fn resolve_env_interpolation(value: &str) -> Result<String> {
-    match value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
-        Some(var_name) => env::var(var_name)
-            .with_context(|| format!("env var '{}' referenced in config is not set", var_name)),
-        None => Ok(value.to_owned()),
+    if let Some(var_name) = value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+        let valid = !var_name.is_empty()
+            && var_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            bail!(
+                "unsupported env var interpolation '{}': only '${{VAR_NAME}}' is supported",
+                value
+            );
+        }
+        return std::env::var(var_name)
+            .with_context(|| format!("env var '{}' referenced in config is not set", var_name));
     }
+    let looks_like_reference = value
+        .match_indices('$')
+        .any(|(i, _)| matches!(
+            value[i + 1..].chars().next(),
+            Some(c) if c == '{' || c == '_' || c.is_ascii_alphabetic()
+        ));
+    if looks_like_reference {
+        bail!(
+            "unsupported env var interpolation '{}': only a value of exactly '${{VAR_NAME}}' is supported",
+            value
+        );
+    }
+    Ok(value.to_owned())
 }
 
 impl AppConfig {
@@ -326,6 +567,7 @@ impl AppConfig {
             if let Some(secret) = &contract.webhook_secret {
                 contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
             }
+            contract.webhook_url = resolve_env_interpolation(&contract.webhook_url)?;
         }
         Ok(())
     }
@@ -350,8 +592,20 @@ impl AppConfig {
         if self.contracts.is_empty() {
             bail!("at least one [[contracts]] entry is required");
         }
+        // #256: enforce the hard contract limit with a clear error message.
+        if self.contracts.len() > MAX_CONTRACTS {
+            bail!(
+                "too many contracts: {} configured, maximum is {} \
+                 (reduce the number of [[contracts]] entries)",
+                self.contracts.len(),
+                MAX_CONTRACTS
+            );
+        }
         for contract in &mut self.contracts {
             contract.validate()?;
+        }
+        if let Some(path) = &self.cursor_file {
+            validate_cursor_file(path)?;
         }
         let mut seen = std::collections::HashSet::new();
         for contract in &self.contracts {
@@ -369,6 +623,30 @@ impl AppConfig {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn env_interpolation_passes_plain_values_through() {
+        assert_eq!(resolve_env_interpolation("plain-secret").unwrap(), "plain-secret");
+        assert_eq!(resolve_env_interpolation("price$5").unwrap(), "price$5");
+    }
+
+    #[test]
+    fn env_interpolation_resolves_braced_var() {
+        std::env::set_var("TXWATCH_TEST_INTERP_SECRET", "s3cret");
+        assert_eq!(
+            resolve_env_interpolation("${TXWATCH_TEST_INTERP_SECRET}").unwrap(),
+            "s3cret"
+        );
+    }
+
+    #[test]
+    fn env_interpolation_rejects_unsupported_patterns() {
+        for bad in ["$VAR", "${VAR:-default}", "prefix-${VAR}", "${}", "${VAR}-suffix"] {
+            let err = resolve_env_interpolation(bad).unwrap_err().to_string();
+            assert!(err.contains("unsupported env var interpolation"), "{bad}: {err}");
+        }
+    }
 
     fn valid_contract() -> WatchedContract {
         WatchedContract {
@@ -378,7 +656,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
-            horizon_base_url_override: None,
+            test_horizon_base_url: None,
         }
     }
 
@@ -451,6 +729,170 @@ mod tests {
         assert!(c.validate().is_ok());
     }
 
+    // ── Issue #278: mTLS config ──────────────────────────────────────────────
+
+    fn fixture_path(name: &str) -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../notifier/tests/fixtures")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn tls_section_parses_from_toml_with_optional_ca() {
+        let raw = format!(
+            r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[rules]]
+            type = "AnyTransaction"
+            [tls]
+            client_cert = "{}"
+            client_key = "{}"
+            "#,
+            fixture_path("client-cert.pem"),
+            fixture_path("client-key.pem"),
+        );
+        let mut c: WatchedContract = toml::from_str(&raw).unwrap();
+        assert!(c.tls.as_ref().unwrap().ca_cert.is_none());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_rejects_missing_client_cert_file() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: "/nonexistent/client.pem".into(),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_cert"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_rejects_missing_ca_cert_file() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some("/nonexistent/ca.pem".into()),
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.ca_cert"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_rejects_empty_key_path() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: "  ".into(),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_key must not be empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_accepts_existing_files() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some(fixture_path("client-cert.pem")),
+        });
+        assert!(c.validate().is_ok());
+    }
+
+    // ── Issue #279: cursor_file validation ───────────────────────────────────
+
+    fn cursor_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "txwatch-cursor-{}-{}",
+            name,
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn app_config_with_cursor(cursor_file: String) -> AppConfig {
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![valid_contract()],
+            cursor_file: Some(cursor_file),
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+        }
+    }
+
+    #[test]
+    fn cursor_file_existing_valid_json_is_accepted() {
+        let dir = cursor_test_dir("valid-json");
+        let file = dir.join("cursors.json");
+        fs::write(&file, r#"{"CABC": "123-1"}"#).unwrap();
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        assert!(cfg.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_existing_invalid_json_is_rejected() {
+        let dir = cursor_test_dir("invalid-json");
+        let file = dir.join("cursors.json");
+        fs::write(&file, "{ not json").unwrap();
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("is not valid JSON"), "got: {}", err);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_missing_file_in_existing_dir_is_accepted() {
+        let dir = cursor_test_dir("missing-file");
+        let file = dir.join("not-yet-created.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        assert!(cfg.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_missing_directory_is_rejected() {
+        let dir = cursor_test_dir("missing-dir").join("no-such-subdir");
+        let file = dir.join("cursors.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "got: {}", err);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_file_unwritable_directory_fails_with_clear_message() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = cursor_test_dir("readonly-dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let file = dir.join("cursors.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        // Restore permissions so cleanup succeeds.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(err.contains("is not writable"), "got: {}", err);
+    }
+
+    #[test]
+    fn insufficient_funds_rule_parses_from_toml() {
+        let rule: AlertRule = toml::from_str("type = \"InsufficientFunds\"").unwrap();
+        assert!(matches!(rule, AlertRule::InsufficientFunds));
+        assert_eq!(rule.label(), "InsufficientFunds");
+    }
+
     #[test]
     fn rejects_empty_rules() {
         let mut c = valid_contract();
@@ -461,16 +903,14 @@ mod tests {
     #[test]
     fn rejects_zero_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
+        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: Some(0), threshold_stroops: None }];
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_too_large_large_transfer_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::LargeTransfer {
-            threshold_xlm: MAX_LARGE_TRANSFER_THRESHOLD_XLM + 1,
-        }];
+        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: Some(MAX_LARGE_TRANSFER_THRESHOLD_XLM + 1), threshold_stroops: None }];
         let err = c.validate().unwrap_err();
         assert!(err
             .to_string()
@@ -618,6 +1058,114 @@ mod tests {
     }
 
     #[test]
+    fn source_account_match_accepts_valid_g_address() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "G".to_string() + &"A".repeat(55),
+        }];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn source_account_match_rejects_wrong_length() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "G".to_string() + &"A".repeat(54),
+        }];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("SourceAccountMatch"));
+    }
+
+    #[test]
+    fn source_account_match_rejects_wrong_prefix() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "C".to_string() + &"A".repeat(55),
+        }];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn tags_accept_valid_key_values() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([
+            ("team".to_string(), "defi".to_string()),
+            ("severity".to_string(), "high".to_string()),
+        ]));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn tags_accept_exactly_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("k".repeat(64), "v".repeat(64))]));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn tags_reject_empty_key() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("".to_string(), "defi".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag key must not be empty"));
+    }
+
+    #[test]
+    fn tags_reject_blank_value() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("team".to_string(), "   ".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag value must not be empty"));
+    }
+
+    #[test]
+    fn tags_reject_key_over_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("k".repeat(65), "v".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag key"));
+        assert!(err.to_string().contains("at most 64 characters"));
+    }
+
+    #[test]
+    fn tags_reject_value_over_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("team".to_string(), "v".repeat(65))]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag value"));
+    }
+
+    #[test]
+    fn tags_deserialise_from_toml() {
+        let raw = r#"
+            label = "My Contract"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            tags = { team = "defi", env = "prod", severity = "high" }
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let c: WatchedContract = toml::from_str(raw).unwrap();
+        let tags = c.tags.unwrap();
+        assert_eq!(tags.get("team").map(String::as_str), Some("defi"));
+        assert_eq!(tags.len(), 3);
+    }
+
+    #[test]
+    fn source_account_match_deserialises_from_toml() {
+        let raw = r#"
+            type = "SourceAccountMatch"
+            source_account = "GABC"
+        "#;
+        let rule: AlertRule = toml::from_str(raw).unwrap();
+        assert!(matches!(
+            rule,
+            AlertRule::SourceAccountMatch { ref source_account } if source_account == "GABC"
+        ));
+    }
+
+    #[test]
     fn rejects_poll_interval_too_low() {
         for val in 0u64..5 {
             let mut cfg = AppConfig {
@@ -627,6 +1175,8 @@ mod tests {
                 http_pool_max_idle_per_host: None,
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
+                cursor_file: None,
+                contracts: vec![],
             };
             let err = cfg.validate().unwrap_err();
             assert!(
@@ -680,8 +1230,95 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
+        // `{:#}` renders the full context chain, including the field path.
+        let error_msg = format!("{:#}", result.unwrap_err());
         assert!(error_msg.contains("failed to parse config file"));
         assert!(error_msg.contains("field: poll_interval_seconds"));
+    }
+
+    // ── #256: MaxContractCheck tests ──────────────────────────────────────────
+
+    /// Build an AppConfig with `n` distinct contracts for limit testing.
+    fn cfg_with_n_contracts(n: usize) -> AppConfig {
+        let contracts = (0..n)
+            .map(|i| {
+                // Generate a unique 56-char contract ID starting with 'C'.
+                let suffix = format!("{:0>55}", i); // 55 zero-padded digits
+                let contract_id = format!("C{}", &suffix[..55]);
+                WatchedContract {
+                    label: format!("Contract {}", i),
+                    contract_id,
+                    network: Network::Testnet,
+                    rules: vec![AlertRule::AnyTransaction],
+                    webhook_url: "https://example.com/hook".into(),
+                    webhook_secret: None,
+                    horizon_base_url_override: None,
+                }
+            })
+            .collect();
+
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts,
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+        }
+    }
+
+    /// #256: Exactly MAX_CONTRACTS contracts should be accepted.
+    #[test]
+    fn accepts_exactly_max_contracts() {
+        let mut cfg = cfg_with_n_contracts(MAX_CONTRACTS);
+        assert!(
+            cfg.validate().is_ok(),
+            "exactly {} contracts should be valid",
+            MAX_CONTRACTS
+        );
+    }
+
+    /// #256: Exceeding MAX_CONTRACTS must return a clear error.
+    #[test]
+    fn rejects_more_than_max_contracts() {
+        let mut cfg = cfg_with_n_contracts(MAX_CONTRACTS + 1);
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too many contracts"),
+            "error should mention 'too many contracts', got: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&MAX_CONTRACTS.to_string()),
+            "error should mention the limit ({}), got: {}",
+            MAX_CONTRACTS,
+            msg
+        );
+    }
+
+    /// #256: The warn threshold is 80% of MAX_CONTRACTS = 80.
+    /// This test documents the threshold value so it doesn't drift silently.
+    #[test]
+    fn warn_threshold_is_80_percent_of_max_contracts() {
+        let warn_threshold = (MAX_CONTRACTS * 80) / 100;
+        assert_eq!(
+            warn_threshold, 80,
+            "80%% of MAX_CONTRACTS ({}) should be 80",
+            MAX_CONTRACTS
+        );
+    }
+
+    /// #256: A config with exactly MAX_CONTRACTS * 80 / 100 + 1 contracts (81)
+    /// is valid (it should pass validation and only log a warning at startup).
+    #[test]
+    fn accepts_81_contracts_warn_threshold_config_is_valid() {
+        let warn_threshold = (MAX_CONTRACTS * 80) / 100; // 80
+        let mut cfg = cfg_with_n_contracts(warn_threshold + 1); // 81
+        assert!(
+            cfg.validate().is_ok(),
+            "{} contracts should be valid (only a warning is emitted at startup)",
+            warn_threshold + 1
+        );
     }
 }
