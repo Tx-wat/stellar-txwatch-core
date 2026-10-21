@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_path_to_error::Deserializer as PathDeserializer;
-use std::{fmt, fs, path::Path};
+use std::{env, fmt, fs, path::Path};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -396,6 +396,15 @@ impl AppConfig {
         if self.contracts.is_empty() {
             bail!("at least one [[contracts]] entry is required");
         }
+        // #256: enforce the hard contract limit with a clear error message.
+        if self.contracts.len() > MAX_CONTRACTS {
+            bail!(
+                "too many contracts: {} configured, maximum is {} \
+                 (reduce the number of [[contracts]] entries)",
+                self.contracts.len(),
+                MAX_CONTRACTS
+            );
+        }
         for contract in &mut self.contracts {
             contract.validate()?;
         }
@@ -691,11 +700,14 @@ mod tests {
         for val in 0u64..5 {
             let mut cfg = AppConfig {
                 poll_interval_seconds: val,
+                contracts: vec![],
+                cursor_file: None,
                 http_pool_max_idle_per_host: None,
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
             };
             let err = cfg.validate().unwrap_err();
+            assert!(
                 err.to_string().contains("poll_interval_seconds must be >= 5"),
                 "val={} should be rejected: {}", val, err
             );
@@ -749,5 +761,91 @@ mod tests {
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("failed to parse config file"));
         assert!(error_msg.contains("field: poll_interval_seconds"));
+    }
+
+    // ── #256: MaxContractCheck tests ──────────────────────────────────────────
+
+    /// Build an AppConfig with `n` distinct contracts for limit testing.
+    fn cfg_with_n_contracts(n: usize) -> AppConfig {
+        let contracts = (0..n)
+            .map(|i| {
+                // Generate a unique 56-char contract ID starting with 'C'.
+                let suffix = format!("{:0>55}", i); // 55 zero-padded digits
+                let contract_id = format!("C{}", &suffix[..55]);
+                WatchedContract {
+                    label: format!("Contract {}", i),
+                    contract_id,
+                    network: Network::Testnet,
+                    rules: vec![AlertRule::AnyTransaction],
+                    webhook_url: "https://example.com/hook".into(),
+                    webhook_secret: None,
+                    horizon_base_url_override: None,
+                }
+            })
+            .collect();
+
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts,
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+        }
+    }
+
+    /// #256: Exactly MAX_CONTRACTS contracts should be accepted.
+    #[test]
+    fn accepts_exactly_max_contracts() {
+        let mut cfg = cfg_with_n_contracts(MAX_CONTRACTS);
+        assert!(
+            cfg.validate().is_ok(),
+            "exactly {} contracts should be valid",
+            MAX_CONTRACTS
+        );
+    }
+
+    /// #256: Exceeding MAX_CONTRACTS must return a clear error.
+    #[test]
+    fn rejects_more_than_max_contracts() {
+        let mut cfg = cfg_with_n_contracts(MAX_CONTRACTS + 1);
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too many contracts"),
+            "error should mention 'too many contracts', got: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&MAX_CONTRACTS.to_string()),
+            "error should mention the limit ({}), got: {}",
+            MAX_CONTRACTS,
+            msg
+        );
+    }
+
+    /// #256: The warn threshold is 80% of MAX_CONTRACTS = 80.
+    /// This test documents the threshold value so it doesn't drift silently.
+    #[test]
+    fn warn_threshold_is_80_percent_of_max_contracts() {
+        let warn_threshold = (MAX_CONTRACTS * 80) / 100;
+        assert_eq!(
+            warn_threshold, 80,
+            "80%% of MAX_CONTRACTS ({}) should be 80",
+            MAX_CONTRACTS
+        );
+    }
+
+    /// #256: A config with exactly MAX_CONTRACTS * 80 / 100 + 1 contracts (81)
+    /// is valid (it should pass validation and only log a warning at startup).
+    #[test]
+    fn accepts_81_contracts_warn_threshold_config_is_valid() {
+        let warn_threshold = (MAX_CONTRACTS * 80) / 100; // 80
+        let mut cfg = cfg_with_n_contracts(warn_threshold + 1); // 81
+        assert!(
+            cfg.validate().is_ok(),
+            "{} contracts should be valid (only a warning is emitted at startup)",
+            warn_threshold + 1
+        );
     }
 }

@@ -43,3 +43,6 @@ criterion/
 
 # Misc scratch files
 vrickish.md
+
+# Cursor persistence files generated during testing
+txwatch_*.json

@@ -24,8 +24,6 @@ use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 #[cfg(feature = "metrics")]
 pub mod metrics;
 
-/// Bind address for the optional `/metrics` HTTP endpoint.
-/// Set via `AppConfig::metrics_addr` when the `metrics` feature is enabled.
 #[cfg(feature = "metrics")]
 pub use metrics::serve_metrics;
 
@@ -685,10 +683,20 @@ fn startup_log_fields(cfg: &AppConfig) -> (String, String, String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use txwatch_config::{AlertRule, Network};
+    use reqwest::Client;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use txwatch_config::{AlertRule, AppConfig, Network, WatchedContract};
+
+    use crate::cursor::CursorMap;
+    use crate::enrichment::fetch_soroban_details;
+    use crate::horizon::HorizonPage;
+    use crate::poller::{poll_contract, startup_log_fields};
+
+    fn empty_page() -> serde_json::Value {
+        serde_json::json!({ "_embedded": { "records": [] } })
+    }
 
     fn ops_page(function_name: &str) -> serde_json::Value {
         serde_json::json!({
@@ -698,9 +706,26 @@ mod tests {
         })
     }
 
-    fn empty_page() -> serde_json::Value {
-        serde_json::json!({ "_embedded": { "records": [] } })
+    fn make_contract(
+        label: &str,
+        contract_id: &str,
+        network: Network,
+        webhook_url: &str,
+        rules: Vec<AlertRule>,
+        horizon_override: Option<String>,
+    ) -> WatchedContract {
+        WatchedContract {
+            label: label.to_string(),
+            contract_id: contract_id.to_string(),
+            network,
+            rules,
+            webhook_url: webhook_url.to_string(),
+            webhook_secret: None,
+            horizon_base_url_override: horizon_override,
+        }
     }
+
+    const CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
     /// Issue #23: when Horizon returns inline operations via join=operations,
     /// the poller must parse them correctly without making a separate /operations request.
@@ -708,7 +733,6 @@ mod tests {
     async fn inline_operations_parsed_correctly() {
         let server = MockServer::start().await;
 
-        // Transactions page with inline operations (join=operations response shape)
         let tx_with_ops = serde_json::json!({
             "_embedded": {
                 "records": [{
@@ -733,14 +757,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Subsequent requests return empty page
         Mock::given(method("GET"))
             .and(path_regex("/accounts/.*/transactions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
             .mount(&server)
             .await;
 
-        // Webhook receiver
         let receiver = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
@@ -764,7 +786,6 @@ mod tests {
         assert_eq!(txs, 1);
         assert_eq!(alerts, 1, "FunctionCalled(withdraw) should fire from inline operations");
 
-        // Verify no /operations request was made (inline ops used instead)
         let reqs = server.received_requests().await.unwrap();
         assert!(
             reqs.iter().all(|r| !r.url.path().contains("/operations")),
@@ -784,8 +805,7 @@ mod tests {
         let client = Client::new();
         let url = format!(
             "{}/accounts/{}/transactions?cursor=now&order=asc&limit=200&join=operations",
-            server.uri(),
-            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            server.uri(), CONTRACT_ID
         );
         let page: HorizonPage<serde_json::Value> = client.get(&url).send().await.unwrap().json().await.unwrap();
         assert!(page._embedded.records.is_empty());
@@ -847,7 +867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn horizon_429_returns_meaningful_error() {
+    async fn horizon_429_returns_ok_after_backoff() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path_regex("/accounts/.*/transactions"))
@@ -934,8 +954,8 @@ mod tests {
         let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_err(), "expected Err when Horizon returns 500");
         assert_eq!(
-            cursors.get(contract_id).map(String::as_str),
-            Some("now"),
+            cursors.get(CONTRACT_ID),
+            "now",
             "cursor must not advance when the transactions fetch fails"
         );
     }
@@ -1094,10 +1114,10 @@ mod tests {
                 "paging_token": format!("{}", i),
             }));
         }
-        let page1 = serde_json::json!({ "_embedded": { "records": records1 }});
+        let page1 = serde_json::json!({ "_embedded": { "records": records1 } });
         let page2 = serde_json::json!({ "_embedded": { "records": [
             { "hash": "tx201", "created_at": "2020-01-01T00:00:01Z", "successful": true, "paging_token": "201" }
-        ] }});
+        ] } });
 
         Mock::given(method("GET"))
             .and(path_regex("/accounts/.*/transactions"))

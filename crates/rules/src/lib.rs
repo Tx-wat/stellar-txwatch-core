@@ -3,6 +3,10 @@
 
 //! txwatch-rules evaluates `AlertRule` conditions against enriched Stellar transactions
 //! and constructs structured `AlertPayload` webhook bodies.
+//!
+//! Also exposes `HorizonOperation` and `extract_soroban_details` so that the pure
+//! data-extraction logic lives in this crate (no I/O, fully unit-testable) and the
+//! poller only handles HTTP concerns.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -16,6 +20,59 @@ use txwatch_config::AlertRule;
 /// as a reference for validating that u64 is sufficient for any realistic transaction
 /// amount, since 500 trillion is well below u64::MAX (18.4 quintillion).
 pub const MAX_XLM_SUPPLY_STROOPS: u64 = 500_000_000_000_000_000;
+
+// ── Horizon operation shape ───────────────────────────────────────────────────
+
+/// A single Horizon operation record.
+///
+/// Only the fields relevant to Soroban enrichment are captured; unknown fields
+/// are ignored by serde so this struct stays forward-compatible with Horizon API changes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HorizonOperation {
+    /// The operation type string as returned by Horizon (e.g. `"invoke_host_function"`,
+    /// `"payment"`).
+    #[serde(rename = "type")]
+    pub op_type: String,
+    /// Present on `invoke_host_function` operations — the Soroban function name.
+    pub function: Option<String>,
+    /// Present on `payment` operations — amount as a decimal string (e.g. `"1000.0000000"`).
+    pub amount: Option<String>,
+}
+
+/// Extract Soroban function names and total payment amount from a list of operations.
+///
+/// This is a pure data transformation with no I/O — it lives in `txwatch-rules` so it
+/// can be unit-tested without spinning up mock HTTP servers.
+///
+/// # Returns
+/// `(function_names, amount_stroops)` where:
+/// - `function_names` contains one entry per `invoke_host_function` op that has a
+///   `function` field.
+/// - `amount_stroops` is `Some(total)` when at least one `payment` op is present,
+///   otherwise `None`. Amounts are summed using saturating arithmetic.
+pub fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Option<u64>) {
+    let mut function_names: Vec<String> = Vec::new();
+    let mut total_stroops: u64 = 0;
+    let mut has_payment = false;
+
+    for op in ops {
+        if op.op_type == "invoke_host_function" {
+            if let Some(f) = op.function {
+                function_names.push(f);
+            }
+        }
+        if op.op_type == "payment" {
+            if let Some(amt_str) = op.amount {
+                if let Ok(xlm) = amt_str.parse::<f64>() {
+                    total_stroops = total_stroops.saturating_add((xlm * 10_000_000.0) as u64);
+                    has_payment = true;
+                }
+            }
+        }
+    }
+
+    (function_names, if has_payment { Some(total_stroops) } else { None })
+}
 
 // ── Horizon transaction shape ─────────────────────────────────────────────────
 
@@ -746,5 +803,94 @@ mod tests {
         assert_eq!(obj["timestamp_iso"].as_str(), Some("2024-01-15T12:00:00Z"));
         assert_eq!(obj["horizon_link"].as_str(), Some("https://horizon-testnet.stellar.org/transactions/abc123"));
         assert_eq!(obj["explorer_link"].as_str(), Some("https://stellar.expert/explorer/testnet/tx/abc123"));
+    }
+
+    // ── #253: extract_soroban_details unit tests ─────────────────────────────
+
+    fn make_op(op_type: &str, function: Option<&str>, amount: Option<&str>) -> HorizonOperation {
+        HorizonOperation {
+            op_type: op_type.to_string(),
+            function: function.map(|s| s.to_string()),
+            amount: amount.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn extract_returns_function_name_from_invoke_host_function_op() {
+        let ops = vec![make_op("invoke_host_function", Some("withdraw"), None)];
+        let (names, amount) = extract_soroban_details(ops);
+        assert_eq!(names, vec!["withdraw"]);
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_returns_multiple_function_names_from_multiple_ops() {
+        let ops = vec![
+            make_op("invoke_host_function", Some("deposit"), None),
+            make_op("invoke_host_function", Some("withdraw"), None),
+        ];
+        let (names, amount) = extract_soroban_details(ops);
+        assert_eq!(names, vec!["deposit", "withdraw"]);
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_ignores_invoke_host_function_op_with_no_function_field() {
+        let ops = vec![make_op("invoke_host_function", None, None)];
+        let (names, amount) = extract_soroban_details(ops);
+        assert!(names.is_empty());
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_returns_payment_amount_in_stroops() {
+        // 1000.0000000 XLM = 10_000_000_000 stroops
+        let ops = vec![make_op("payment", None, Some("1000.0000000"))];
+        let (names, amount) = extract_soroban_details(ops);
+        assert!(names.is_empty());
+        assert_eq!(amount, Some(10_000_000_000));
+    }
+
+    #[test]
+    fn extract_sums_multiple_payment_ops() {
+        let ops = vec![
+            make_op("payment", None, Some("500.0000000")),
+            make_op("payment", None, Some("500.0000000")),
+        ];
+        let (_, amount) = extract_soroban_details(ops);
+        assert_eq!(amount, Some(10_000_000_000));
+    }
+
+    #[test]
+    fn extract_returns_none_amount_when_no_payment_ops() {
+        let ops = vec![make_op("invoke_host_function", Some("transfer"), None)];
+        let (_, amount) = extract_soroban_details(ops);
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_handles_empty_ops_list() {
+        let (names, amount) = extract_soroban_details(vec![]);
+        assert!(names.is_empty());
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_ignores_unknown_op_types() {
+        let ops = vec![make_op("create_account", None, None)];
+        let (names, amount) = extract_soroban_details(ops);
+        assert!(names.is_empty());
+        assert!(amount.is_none());
+    }
+
+    #[test]
+    fn extract_combines_function_names_and_payment_in_same_tx() {
+        let ops = vec![
+            make_op("invoke_host_function", Some("transfer"), None),
+            make_op("payment", None, Some("200.0000000")),
+        ];
+        let (names, amount) = extract_soroban_details(ops);
+        assert_eq!(names, vec!["transfer"]);
+        assert_eq!(amount, Some(2_000_000_000));
     }
 }
