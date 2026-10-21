@@ -91,6 +91,22 @@ type               = "HighFee"
 threshold_stroops  = 100000
 ```
 
+### `SourceAccountMatch`
+
+| Field            | Type   | Required | Description                                          |
+|------------------|--------|----------|------------------------------------------------------|
+| `source_account` | string | yes      | Stellar G-address (56 chars, starts with `G`)        |
+
+Matches when the transaction's source account is exactly `source_account`.
+Useful for alerting on activity from a known whale, admin, or operator key.
+Transactions whose Horizon record has no `source_account` never match.
+
+```toml
+[[contracts.rules]]
+type           = "SourceAccountMatch"
+source_account = "GABC..."
+```
+
 ## Evaluation order
 
 Rules are evaluated in the order they appear in the config file.
@@ -132,6 +148,7 @@ The webhook payload includes two rule-related fields:
 | `FunctionCalled` | `"FunctionCalled"` |
 | `AdminFunctionCalled` | `"AdminFunctionCalled"` |
 | `HighFee` | `"HighFee"` |
+| `SourceAccountMatch` | `"SourceAccountMatch"` |
 
 ## Adding a new rule type
 

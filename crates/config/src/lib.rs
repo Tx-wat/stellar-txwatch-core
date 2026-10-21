@@ -80,6 +80,8 @@ pub enum AlertRule {
         #[serde(default)]
         threshold_xlm: Option<u64>,
     },
+    /// Fires when the transaction's source account equals `source_account`.
+    SourceAccountMatch { source_account: String },
 }
 
 impl AlertRule {
@@ -152,6 +154,17 @@ impl AlertRule {
                     _ => {}
                 }
             }
+            AlertRule::SourceAccountMatch { source_account } => {
+                // Stellar account (G-) addresses are 56 base32 characters.
+                if source_account.len() != 56 || !source_account.starts_with('G') {
+                    bail!(
+                        "contract '{}': SourceAccountMatch source_account '{}' is not a valid \
+                         Stellar account address (must start with 'G' and be 56 characters)",
+                        contract_label,
+                        source_account
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -174,6 +187,9 @@ impl AlertRule {
                 } else {
                     format!("HighFee(>={} stroops)", threshold_stroops)
                 }
+            }
+            AlertRule::SourceAccountMatch { source_account } => {
+                format!("SourceAccountMatch({})", source_account)
             }
         }
     }}
@@ -615,6 +631,47 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::HighFee { threshold_stroops: 0, threshold_xlm: None }];
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn source_account_match_accepts_valid_g_address() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "G".to_string() + &"A".repeat(55),
+        }];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn source_account_match_rejects_wrong_length() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "G".to_string() + &"A".repeat(54),
+        }];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("SourceAccountMatch"));
+    }
+
+    #[test]
+    fn source_account_match_rejects_wrong_prefix() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "C".to_string() + &"A".repeat(55),
+        }];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn source_account_match_deserialises_from_toml() {
+        let raw = r#"
+            type = "SourceAccountMatch"
+            source_account = "GABC"
+        "#;
+        let rule: AlertRule = toml::from_str(raw).unwrap();
+        assert!(matches!(
+            rule,
+            AlertRule::SourceAccountMatch { ref source_account } if source_account == "GABC"
+        ));
     }
 
     #[test]

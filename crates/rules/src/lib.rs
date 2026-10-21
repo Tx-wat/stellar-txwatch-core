@@ -32,6 +32,8 @@ pub struct HorizonTransaction {
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
     pub result_xdr: Option<String>,
+    /// G-address of the account that submitted the transaction.
+    pub source_account: Option<String>,
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -55,6 +57,8 @@ pub struct EnrichedTransaction {
     pub amount_stroops: Option<u64>,
     /// Fee charged for this transaction in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// G-address of the account that submitted the transaction.
+    pub source_account: Option<String>,
 }
 
 impl EnrichedTransaction {
@@ -84,6 +88,7 @@ impl EnrichedTransaction {
                     .as_deref()
                     .and_then(|s| s.parse::<u64>().ok())
             }),
+            source_account: tx.source_account,
         })
     }
 }
@@ -205,6 +210,10 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .fee_charged_stroops
             .map(|f| f >= *threshold_stroops)
             .unwrap_or(false),
+
+        AlertRule::SourceAccountMatch { source_account } => {
+            tx.source_account.as_deref() == Some(source_account.as_str())
+        }
     })
 }
 
@@ -229,6 +238,9 @@ fn rule_label(rule: &AlertRule) -> String {
                 format!("HighFee(>={} stroops)", threshold_stroops)
             }
         }
+        AlertRule::SourceAccountMatch { source_account } => {
+            format!("SourceAccountMatch({})", source_account)
+        }
     }
 }
 
@@ -240,6 +252,7 @@ fn rule_type(rule: &AlertRule) -> String {
         AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
         AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
         AlertRule::HighFee { .. } => "HighFee".into(),
+        AlertRule::SourceAccountMatch { .. } => "SourceAccountMatch".into(),
     }
 }
 
@@ -275,6 +288,7 @@ mod tests {
             function_names: function_names.iter().map(|s| s.to_string()).collect(),
             amount_stroops,
             fee_charged_stroops: None,
+            source_account: None,
         }
     }
 
@@ -488,6 +502,7 @@ mod tests {
                 function_names: vec![],
                 amount_stroops: None,
                 fee_charged_stroops: None,
+                source_account: None,
             };
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -556,6 +571,61 @@ mod tests {
         assert!(payloads.is_empty());
     }
 
+    // ── SourceAccountMatch (issue #303) ───────────────────────────────────────
+
+    const SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const OTHER: &str = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    fn source_rule(source_account: &str) -> AlertRule {
+        AlertRule::SourceAccountMatch {
+            source_account: source_account.into(),
+        }
+    }
+
+    #[test]
+    fn source_account_match_fires_on_exact_match() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some(SOURCE.into());
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_type, "SourceAccountMatch");
+        assert_eq!(
+            payloads[0].rule_triggered,
+            format!("SourceAccountMatch({})", SOURCE)
+        );
+    }
+
+    #[test]
+    fn source_account_match_does_not_fire_on_different_account() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some(OTHER.into());
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn source_account_match_does_not_fire_when_source_account_is_missing() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn from_horizon_carries_source_account() {
+        let raw = HorizonTransaction {
+            hash: "h2".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            source_account: Some(SOURCE.into()),
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.source_account.as_deref(), Some(SOURCE));
+    }
+
     #[test]
     fn enriched_transaction_parses_timestamp() {
         let raw = HorizonTransaction {
@@ -566,6 +636,7 @@ mod tests {
             fee_charged: Some("100".into()),
             envelope_xdr: None,
             result_xdr: None,
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
@@ -582,6 +653,7 @@ mod tests {
             fee_charged:  None,
             envelope_xdr: None,
             result_xdr:   None,
+            source_account: None,
         };
         let result = EnrichedTransaction::from_horizon(raw, vec![], None, None);
         assert!(result.is_err(), "expected Err for invalid timestamp");
