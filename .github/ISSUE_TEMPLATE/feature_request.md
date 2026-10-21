@@ -1,23 +1,27 @@
 ---
-name: Feature request
-about: Suggest a new feature or enhancement.
-title: "[FEATURE] "
-labels: enhancement
-assignees: ''
+name: Feature Request
+about: Suggest a new feature or improvement for TxWatch
+title: "[feat]: "
+labels: ["enhancement"]
+assignees: []
 ---
 
-## Summary
+## Problem Statement
 
-<!-- Describe the feature or enhancement. -->
+<!-- What problem does this feature solve? Who is affected and how often?
+     e.g. "As an operator running TxWatch against multiple contracts, I have no way to..." -->
 
-## Motivation
+## Proposed Solution
 
-<!-- Why is this useful? Who will benefit? -->
+<!-- Describe the feature you'd like and how it should work.
+     Include config changes, CLI flags, webhook payload additions, etc. if relevant. -->
 
-## Proposed solution
+## Alternatives Considered
 
-<!-- How should it work? -->
+<!-- What other approaches did you consider, and why did you rule them out? -->
 
-## Alternatives considered
+## Additional Context
 
-<!-- Any alternate approaches or ideas? -->
+<!-- Links, mockups, prior art, related issues, or any other context.
+     If this involves a new alert rule, describe the trigger condition and what fields
+     the AlertPayload should include. -->

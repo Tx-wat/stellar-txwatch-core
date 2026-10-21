@@ -12,8 +12,9 @@ Config is a TOML file passed via `--config` (default: `config/example.toml`).
 > resulting in `429 Too Many Requests` responses. Sustained polling across six or more contracts at intervals below
 > 10 seconds is known to trigger rate limiting in production. The recommended minimum is
 > `poll_interval_seconds = 10`; for high-volume deployments with many contracts, `poll_interval_seconds = 30` or
-> higher is advised. TxWatch logs a startup warning when `poll_interval_seconds < 10` and more than 5 contracts
-> are configured.
+> higher is advised. TxWatch logs a startup warning when `poll_interval_seconds < 10`, regardless of how many
+> contracts are configured. The warning includes the estimated requests per minute
+> (`contracts × 60 / poll_interval_seconds`).
 
 > **Contract limit:** A maximum of **100** `[[contracts]]` entries are allowed per configuration file. Exceeding this limit is rejected at startup to prevent exhausting memory or file descriptors from too many concurrent Horizon polling tasks.
 
@@ -29,32 +30,7 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `webhook_url` | string | yes      | `http://` or `https://` endpoint that receives alert JSON.   |
 | `webhook_secret` | string | no    | If set, an HMAC-SHA256 signature of the request body is sent as `X-TxWatch-Signature: sha256=<hmac>`. Never sends the raw secret over the wire. |
 
-### `[contracts.tls]` (optional mutual TLS)
-
-Use this when the webhook receiver requires the client to present a certificate.
-All paths are PEM files and must exist when the config is loaded; a missing file fails validation.
-
-| Field         | Type   | Required | Description                                                                 |
-|---------------|--------|----------|-----------------------------------------------------------------------------|
-| `client_cert` | string | yes      | PEM client certificate presented to the webhook receiver.                   |
-| `client_key`  | string | yes      | PEM private key (PKCS#8) matching `client_cert`. Its contents are never logged. |
-| `ca_cert`     | string | no       | PEM CA bundle used to validate the webhook server's certificate, in addition to system roots. |
-
-```toml
-[[contracts]]
-label = "Internal alerts"
-contract_id = "C..."
-network = "mainnet"
-webhook_url = "https://internal.example.com/alerts"
-rules = [{ type = "AnyTransaction" }]
-
-[contracts.tls]
-client_cert = "/path/to/client.pem"
-client_key  = "/path/to/client.key"
-ca_cert     = "/path/to/ca.pem"
-```
-
-Only webhook delivery uses the client certificate; Horizon requests are unaffected.
+> **Env var interpolation:** `webhook_secret` supports exactly one interpolation form: the whole value must be `${VAR_NAME}` (ASCII letters, digits and underscores), which is replaced by the environment variable's value at load time. Any other `$` pattern — `$VAR` without braces, `${VAR:-default}`, or a reference embedded in a longer string — is rejected at startup with an `unsupported env var interpolation` error. Values with no `$` reference are used as-is.
 
 ### Network field values
 
@@ -119,6 +95,23 @@ Fires when the invoked function is any entry in `function_names`.
 [[contracts.rules]]
 type           = "AdminFunctionCalled"
 function_names = ["set_admin", "upgrade", "initialize"]
+```
+
+### `HighFee`
+Fires when the transaction's total fee exceeds the threshold. Set exactly one of
+`threshold_stroops` (raw stroops, > 0) or `threshold_xlm` (whole XLM, > 0); setting both is an error.
+`threshold_xlm` is converted to stroops during validation (1 XLM = 10,000,000 stroops).
+
+```toml
+[[contracts.rules]]
+type               = "HighFee"
+threshold_stroops  = 100000
+```
+
+```toml
+[[contracts.rules]]
+type           = "HighFee"
+threshold_xlm  = 1             # equivalent to threshold_stroops = 10000000
 ```
 
 ## Webhook payload

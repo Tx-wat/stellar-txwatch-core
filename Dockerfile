@@ -2,10 +2,10 @@
 FROM rust:alpine AS builder
 WORKDIR /build
 COPY . .
-RUN apk add --no-cache musl-dev && \
-    cargo build --release -p txwatch
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf && \
+    OPENSSL_STATIC=1 cargo build --release -p txwatch
 
-# Runtime stage: minimal image with only the binary
-FROM alpine:latest
+# Runtime stage: distroless base (CA certificates, no shell, non-root user)
+FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /build/target/release/txwatch /usr/local/bin/txwatch
 ENTRYPOINT ["txwatch"]
