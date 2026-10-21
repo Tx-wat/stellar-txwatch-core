@@ -291,7 +291,7 @@ fn default_http_tcp_keepalive_secs() -> Option<u64> {
     None
 }
 
-fn deserialize_toml_with_field_context<'de, T>(raw: &'de str, path: &Path) -> Result<T>
+fn deserialize_toml_with_field_context<'de, T>(raw: &'de str) -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -333,7 +333,7 @@ impl AppConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("cannot read config file '{}'", path.display()))?;
-        let mut cfg: AppConfig = deserialize_toml_with_field_context(&raw, path)
+        let mut cfg: AppConfig = deserialize_toml_with_field_context(&raw)
             .with_context(|| format!("failed to parse config file '{}'", path.display()))?;
         cfg.resolve_env_vars()?;
         cfg.validate()?;

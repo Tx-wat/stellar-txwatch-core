@@ -257,9 +257,10 @@ pub async fn run_with_shutdown(
 /// Falls back to a separate `/transactions/{hash}/operations` fetch only when
 /// the inline `operations` array is absent (older Horizon versions).
 #[tracing::instrument(skip(client, contract, cursors), fields(
-    contract    = %contract.label,
-    contract_id = %contract.contract_id,
-    network     = %contract.network.as_str()
+    contract     = %contract.label,
+    contract_id  = %contract.contract_id,
+    network      = %contract.network.as_str(),
+    transactions = tracing::field::Empty
 ))]
 async fn poll_contract(
     client:   &Client,
@@ -426,6 +427,7 @@ async fn poll_contract(
             "poll cycle complete");
     }
 
+    tracing::Span::current().record("transactions", tx_count);
     Ok((tx_count, alert_count))
 }
 
@@ -584,6 +586,73 @@ mod tests {
             reqs.iter().all(|r| !r.url.path().contains("/operations")),
             "no separate /operations request should be made when inline ops are present"
         );
+    }
+
+    /// In-memory log sink so tests can assert on formatted span fields.
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogBuf {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The poll_contract span carries the contract label and the transaction count.
+    #[tokio::test]
+    async fn poll_contract_span_records_contract_and_transaction_count() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .mount(&server)
+            .await;
+
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "now".to_string());
+        let contract = WatchedContract {
+            label: "span-test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+
+        let buf = LogBuf::default();
+        // Span close events print the final field values, including the transaction count.
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        poll_contract(&Client::new(), &contract, &mut cursors, false).await.unwrap();
+
+        let out = buf.contents();
+        assert!(out.contains("contract=span-test"), "span should record the label, got: {}", out);
+        assert!(out.contains("transactions=0"), "span should record the tx count, got: {}", out);
     }
 
     #[tokio::test]

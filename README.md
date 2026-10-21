@@ -132,6 +132,9 @@ Commands:
 `--config` defaults to `config/example.toml`. It can also be set with the
 `TXWATCH_CONFIG` environment variable; the `--config` flag takes precedence when both are set.
 
+Optional OpenTelemetry trace export: build with `--features opentelemetry` and set
+`OTEL_EXPORTER_OTLP_ENDPOINT`. See [docs/configuration.md](docs/configuration.md#opentelemetry-trace-export-optional).
+
 ---
 
 ## Config

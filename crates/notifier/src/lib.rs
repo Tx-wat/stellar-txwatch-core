@@ -46,7 +46,14 @@ pub async fn send_webhook(
     payload: &AlertPayload,
     secret: Option<&str>,
 ) -> Result<DeliveryResult> {
-    let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
+    let span = span!(
+        Level::INFO,
+        "send_webhook",
+        contract = %payload.label,
+        rule = %payload.rule_triggered,
+        url = %url,
+        status = tracing::field::Empty
+    );
     let _enter = span.enter();
 
     let body = serde_json::to_string(payload)?;
@@ -73,6 +80,7 @@ pub async fn send_webhook(
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 let final_status = resp.status().as_u16();
+                span.record("status", final_status);
                 // Issue #24: log response body at debug level.
                 // HTTP 2xx = delivery success regardless of body content.
                 // Some receivers return 200 OK with an error body; we treat
@@ -97,6 +105,7 @@ pub async fn send_webhook(
             }
             Ok(resp) => {
                 let status = resp.status();
+                span.record("status", status.as_u16());
                 warn!(
                     timestamp = %ts,
                     attempt   = attempt,
@@ -192,6 +201,59 @@ mod tests {
             horizon_link:        "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link:       "https://stellar.expert/explorer/testnet/tx/abc123".into(),
         }
+    }
+
+    /// In-memory log sink so tests can assert on formatted span fields.
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl LogBuf {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The send_webhook span carries the target URL and the HTTP status of the response.
+    #[tokio::test]
+    async fn send_webhook_span_records_url_and_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = build_client().unwrap();
+        let url    = format!("{}/hook", server.uri());
+        send_webhook(&client, &url, &sample_payload(), None).await.unwrap();
+
+        let out = buf.contents();
+        assert!(out.contains(&format!("url={}", url)), "span should record the URL, got: {}", out);
+        assert!(out.contains("status=200"), "span should record the HTTP status, got: {}", out);
     }
 
     #[tokio::test]
