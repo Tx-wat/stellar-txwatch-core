@@ -1,31 +1,51 @@
 ---
-name: Bug report
-about: Report a bug in TxWatch.
-title: "[BUG] "
-labels: bug
-assignees: ''
+name: Bug Report
+about: Report a reproducible bug in TxWatch
+title: "[bug]: "
+labels: ["bug"]
+assignees: []
 ---
 
-## Summary
+## TxWatch Version
 
-<!-- Describe the bug. What happened? -->
+<!-- Output of `cargo run -p txwatch -- --version` or the release tag (e.g. v0.2.0) -->
 
-## Expected behavior
+## Config Snippet
 
-<!-- What did you expect to happen? -->
+<!-- Paste a minimal config that reproduces the issue. Remove all secrets, webhook URLs, and contract IDs. -->
 
-## Steps to reproduce
+```toml
 
-1. 
-2. 
-3. 
+```
+
+## Expected Behavior
+
+<!-- What you expected to happen -->
+
+## Actual Behavior
+
+<!-- What actually happened. Include any error messages exactly as shown. -->
+
+## Logs
+
+<!-- Run with RUST_LOG=debug and paste the relevant output below -->
+
+```
+RUST_LOG=debug cargo run -p txwatch -- --config config/your-config.toml watch
+```
+
+## Steps to Reproduce
+
+1.
+2.
+3.
 
 ## Environment
 
-- TxWatch version:
 - OS:
-- Config:
+- Rust version (`rustc --version`):
+- How installed: (cargo build / Docker / pre-built binary)
 
-## Additional context
+## Additional Context
 
-<!-- Any logs, screenshots, or additional details -->
+<!-- Any other context, screenshots, Horizon API responses, or links -->

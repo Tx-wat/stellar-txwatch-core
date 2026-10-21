@@ -1,3 +1,48 @@
+# Cargo build output
 /target
-Cargo.lock
+debug/
+*.pdb
+
+# Cargo.lock is checked in for binaries; keep it tracked
+# Cargo.lock
+
+# Test snapshots (insta, assert_snapshot, etc.)
+*.snap
+*.snap.new
+**/__snapshots__/
+snapshots/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS-specific
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# Coverage reports
+lcov.info
+cov/
+tarpaulin-report.html
+*.profraw
+*.profdata
+
+# Benchmark artifacts
+criterion/
+
+# Local environment / config overrides
+.env
+.env.local
+*.local.toml
+
+# Misc scratch files
 vrickish.md
+
+# Cursor persistence files generated during testing
+txwatch_*.json
