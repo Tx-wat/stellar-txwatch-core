@@ -14,6 +14,7 @@ use std::time::Duration;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use reqwest::Client;
 use txwatch_config::{AlertRule, AppConfig};
 use txwatch_rules::{evaluate, EnrichedTransaction};
 
@@ -302,6 +303,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
                 successful: true,
                 paging_token: "1".into(),
                 fee_charged: None,
+                operation_count: None,
                 envelope_xdr: None,
                 result_xdr: None,
             },
@@ -317,6 +319,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
                 successful: false,
                 paging_token: "2".into(),
                 fee_charged: None,
+                operation_count: None,
                 envelope_xdr: None,
                 result_xdr: None,
             },
@@ -371,6 +374,7 @@ async fn large_transfer_fires_above_threshold() {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
         },
@@ -424,6 +428,7 @@ async fn function_called_rule_fires_on_exact_match() {
                 successful: true,
                 paging_token: "1".into(),
                 fee_charged: None,
+                operation_count: None,
                 envelope_xdr: None,
                 result_xdr: None,
             },
@@ -439,6 +444,7 @@ async fn function_called_rule_fires_on_exact_match() {
                 successful: true,
                 paging_token: "2".into(),
                 fee_charged: None,
+                operation_count: None,
                 envelope_xdr: None,
                 result_xdr: None,
             },
@@ -538,10 +544,12 @@ async fn high_fee_rule_fires_on_fee_charged() {
             successful: true,
             paging_token: "1".into(),
             fee_charged: Some("50000".into()),
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
         },
         vec![],
+        None,
         None,
     )
     .unwrap();
@@ -619,6 +627,9 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -670,6 +681,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
     let cfg = AppConfig {
         poll_interval_seconds: 1,
         contracts: vec![contract],
+        cursor_file: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,

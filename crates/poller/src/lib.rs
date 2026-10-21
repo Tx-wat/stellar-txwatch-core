@@ -291,8 +291,6 @@ async fn poll_contract(
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
 
         let records = page._embedded.records;
-
-        let records = page._embedded.records;
         if records.is_empty() {
             break;
         }
@@ -654,13 +652,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
-        let result = poll_contract(&client, &contract, &mut cursors).await;
+        let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0));
     }
@@ -683,12 +682,14 @@ mod tests {
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+        let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
+        assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
         );
