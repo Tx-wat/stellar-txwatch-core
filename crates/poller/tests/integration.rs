@@ -67,6 +67,7 @@ async fn run_polls_once_and_fires_webhook() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
+        max_alerts_per_cycle: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -129,6 +130,7 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
+        max_alerts_per_cycle: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -167,6 +169,7 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
+        max_alerts_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -700,6 +703,7 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
+        max_alerts_per_cycle: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,

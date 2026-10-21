@@ -406,6 +406,38 @@ impl WatchedContract {
             );
         }
 
+        if self.max_alerts_per_cycle == Some(0) {
+            bail!(
+                "contract '{}': max_alerts_per_cycle must be >= 1 when set",
+                self.label
+            );
+        }
+
+        if let Some(horizon_url) = &self.horizon_url {
+            let parsed_horizon = Url::parse(horizon_url).map_err(|e| {
+                anyhow!(
+                    "contract '{}': horizon_url '{}' is not a valid URL: {}",
+                    self.label,
+                    horizon_url,
+                    e
+                )
+            })?;
+            if parsed_horizon.scheme() != "http" && parsed_horizon.scheme() != "https" {
+                bail!(
+                    "contract '{}': horizon_url '{}' must use http or https scheme",
+                    self.label,
+                    horizon_url
+                );
+            }
+            if parsed_horizon.host().is_none() {
+                bail!(
+                    "contract '{}': horizon_url '{}' has no host",
+                    self.label,
+                    horizon_url
+                );
+            }
+        }
+
         if self.rules.is_empty() {
             bail!("contract '{}': at least one rule is required", self.label);
         }
@@ -456,6 +488,11 @@ pub struct AppConfig {
     /// Default: false.
     #[serde(default)]
     pub http_connection_verbose: Option<bool>,
+    /// Maximum webhooks sent per contract in a single poll cycle. Alerts above the cap
+    /// are logged and suppressed, not silently dropped. Unset (default) means unlimited.
+    /// A contract's own `max_alerts_per_cycle` takes precedence over this value.
+    #[serde(default)]
+    pub max_alerts_per_cycle: Option<u64>,
 }
 
 fn default_http_pool_max_idle_per_host() -> Option<usize> {
@@ -664,6 +701,116 @@ mod tests {
     fn valid_config_passes() {
         let mut c = valid_contract();
         assert!(c.validate().is_ok());
+    }
+
+    /// #268: horizon_url is optional and absent by default.
+    /// #269: max_alerts_per_cycle is optional and defaults to unlimited.
+    #[test]
+    fn max_alerts_per_cycle_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.max_alerts_per_cycle.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    /// #269: the global cap and per-contract override both parse from TOML.
+    #[test]
+    fn max_alerts_per_cycle_is_parsed_globally_and_per_contract() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            max_alerts_per_cycle = 50
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            max_alerts_per_cycle = 5
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.max_alerts_per_cycle, Some(50));
+        assert_eq!(cfg.contracts[0].max_alerts_per_cycle, Some(5));
+    }
+
+    #[test]
+    fn rejects_zero_max_alerts_per_cycle_on_contract() {
+        let mut c = valid_contract();
+        c.max_alerts_per_cycle = Some(0);
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_zero_global_max_alerts_per_cycle() {
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![valid_contract()],
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: Some(0),
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
+    }
+
+    #[test]
+    fn horizon_url_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.horizon_url.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    /// #268: horizon_url is parsed from TOML.
+    #[test]
+    fn horizon_url_is_parsed_from_toml() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            horizon_url = "https://my-private-horizon.example.com"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            cfg.contracts[0].horizon_url.as_deref(),
+            Some("https://my-private-horizon.example.com")
+        );
+    }
+
+    #[test]
+    fn accepts_valid_https_horizon_url() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("https://my-private-horizon.example.com".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_http_horizon_url_for_local_replica() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("http://127.0.0.1:8000".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_horizon_url_that_is_not_a_url() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("not a url".into());
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("horizon_url"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_horizon_url_with_ftp_scheme() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("ftp://horizon.example.com".into());
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("must use http or https"), "got: {}", err);
     }
 
     #[test]
@@ -991,6 +1138,14 @@ mod tests {
     }
 
     #[test]
+    fn futurenet_explorer_url_points_to_futurenet_path() {
+        assert_eq!(
+            Network::Futurenet.explorer_base_url(),
+            "https://stellar.expert/explorer/futurenet"
+        );
+    }
+
+    #[test]
     fn rejects_duplicate_labels() {
         let c = valid_contract();
         let mut cfg = AppConfig {
@@ -1000,6 +1155,7 @@ mod tests {
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
             cursor_file: None,
+            max_alerts_per_cycle: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -1014,6 +1170,7 @@ mod tests {
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
             cursor_file: None,
+            max_alerts_per_cycle: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(

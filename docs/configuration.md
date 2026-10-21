@@ -7,6 +7,7 @@ Config is a TOML file passed via `--config` (default: `config/example.toml`).
 | Field                   | Type | Required | Description                           |
 |-------------------------|------|----------|---------------------------------------|
 | `poll_interval_seconds` | u64  | yes      | How often to poll Horizon (seconds). Must be >= 5 and ≤ 3600. |
+| `max_alerts_per_cycle` | u64 | no | Maximum webhooks sent per contract in one poll cycle. Alerts above the cap are logged (`alert cap reached: N additional alerts suppressed this cycle`) and counted in the 60-second summary, not silently dropped. Must be >= 1. Default: unlimited. A contract's own `max_alerts_per_cycle` overrides this value. |
 
 > **Horizon rate limits:** Polling too frequently across many contracts can exhaust Horizon's per-IP request quota,
 > resulting in `429 Too Many Requests` responses. Sustained polling across six or more contracts at intervals below
@@ -42,6 +43,8 @@ Valid `network` values and their corresponding Horizon endpoints:
 | `mainnet` | https://horizon.stellar.org |
 | `testnet` | https://horizon-testnet.stellar.org |
 | `futurenet` | https://horizon-futurenet.stellar.org |
+
+> **Futurenet explorer limitation:** explorer links for `futurenet` point to Stellar Expert (`https://stellar.expert/explorer/futurenet`). Futurenet is a development network that can be reset at any time, and Stellar Expert's coverage of it is not guaranteed. If that link does not show your transaction, use the [Stellar Laboratory](https://laboratory.stellar.org/) instead.
 
 Any value outside this list will cause a TOML parse error. For example:
 
