@@ -71,6 +71,8 @@ pub enum AlertRule {
     /// Fires when a transaction fails because the source account cannot cover the fee
     /// (Horizon result code `txINSUFFICIENT_BALANCE`). Other failures do not match.
     InsufficientFunds,
+    /// Fires when the transaction invokes any Soroban host function, regardless of name.
+    SorobanInvocation,
     LargeTransfer       { threshold_xlm: u64 },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
@@ -128,7 +130,10 @@ impl AlertRule {
                     *name = name.to_lowercase();
                 }
             }
-            AlertRule::AnyTransaction | AlertRule::TransactionFailed | AlertRule::InsufficientFunds => {}
+            AlertRule::AnyTransaction
+            | AlertRule::TransactionFailed
+            | AlertRule::InsufficientFunds
+            | AlertRule::SorobanInvocation => {}
             AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
                 match (*threshold_xlm, *threshold_stroops) {
                     (Some(_), s) if s > 0 => bail!(
@@ -163,6 +168,7 @@ impl AlertRule {
             AlertRule::AnyTransaction => "AnyTransaction".into(),
             AlertRule::TransactionFailed => "TransactionFailed".into(),
             AlertRule::InsufficientFunds => "InsufficientFunds".into(),
+            AlertRule::SorobanInvocation => "SorobanInvocation".into(),
             AlertRule::LargeTransfer { threshold_xlm } => {
                 format!("LargeTransfer(>={}XLM)", threshold_xlm)
             }

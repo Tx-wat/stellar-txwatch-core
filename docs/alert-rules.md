@@ -26,6 +26,19 @@ Matches transactions where `successful = false`.
 type = "TransactionFailed"
 ```
 
+### `SorobanInvocation`
+Matches any transaction that invokes at least one Soroban host function
+(`invoke_host_function`), whichever function is called. Native-only transactions such as
+payments or offers do not match.
+
+**Use case:** monitor all smart-contract activity on a contract without listing function names.
+Use `FunctionCalled` or `AdminFunctionCalled` when you only care about specific functions.
+
+```toml
+[[contracts.rules]]
+type = "SorobanInvocation"
+```
+
 ### `InsufficientFunds`
 Matches transactions that failed because the source account could not cover the fee
 (Horizon result code `txINSUFFICIENT_BALANCE`, decoded from `result_xdr`). Other failures
@@ -141,6 +154,7 @@ The webhook payload includes two rule-related fields:
 | `AnyTransaction` | `"AnyTransaction"` |
 | `TransactionFailed` | `"TransactionFailed"` |
 | `InsufficientFunds` | `"InsufficientFunds"` |
+| `SorobanInvocation` | `"SorobanInvocation"` |
 | `LargeTransfer` | `"LargeTransfer"` |
 | `FunctionCalled` | `"FunctionCalled"` |
 | `AdminFunctionCalled` | `"AdminFunctionCalled"` |

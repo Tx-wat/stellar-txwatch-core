@@ -206,6 +206,8 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             !tx.successful && tx.result_code == Some(TX_INSUFFICIENT_BALANCE)
         }
 
+        AlertRule::SorobanInvocation => !tx.function_names.is_empty(),
+
         AlertRule::LargeTransfer { threshold_xlm } => {
             let threshold_stroops = threshold_xlm
                 .checked_mul(10_000_000)
@@ -243,6 +245,7 @@ fn rule_label(rule: &AlertRule) -> String {
         AlertRule::AnyTransaction => "AnyTransaction".into(),
         AlertRule::TransactionFailed => "TransactionFailed".into(),
         AlertRule::InsufficientFunds => "InsufficientFunds".into(),
+        AlertRule::SorobanInvocation => "SorobanInvocation".into(),
         AlertRule::LargeTransfer { threshold_xlm } => {
             format!("LargeTransfer(>={}XLM)", threshold_xlm)
         }
@@ -265,6 +268,7 @@ fn rule_type(rule: &AlertRule) -> String {
         AlertRule::AnyTransaction => "AnyTransaction".into(),
         AlertRule::TransactionFailed => "TransactionFailed".into(),
         AlertRule::InsufficientFunds => "InsufficientFunds".into(),
+        AlertRule::SorobanInvocation => "SorobanInvocation".into(),
         AlertRule::LargeTransfer { .. } => "LargeTransfer".into(),
         AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
         AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
@@ -425,6 +429,31 @@ mod tests {
         assert_eq!(transaction_result_code("%%% not base64 %%%"), None);
         assert_eq!(transaction_result_code("AAAAAAAAAGQ="), None); // 8 bytes only
         assert_eq!(transaction_result_code(""), None);
+    }
+
+    // ── Issue #281: SorobanInvocation ────────────────────────────────────────
+
+    #[test]
+    fn soroban_invocation_fires_with_one_function_name() {
+        let tx = make_tx(true, &["deposit"], None);
+        let payloads = run(&[AlertRule::SorobanInvocation], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_triggered, "SorobanInvocation");
+        assert_eq!(payloads[0].rule_type, "SorobanInvocation");
+    }
+
+    #[test]
+    fn soroban_invocation_fires_with_multiple_function_names() {
+        let tx = make_tx(true, &["deposit", "withdraw"], None);
+        let payloads = run(&[AlertRule::SorobanInvocation], &tx);
+        assert_eq!(payloads.len(), 1);
+    }
+
+    #[test]
+    fn soroban_invocation_does_not_fire_for_native_only_transaction() {
+        let tx = make_tx(true, &[], Some(100_000_000));
+        let payloads = run(&[AlertRule::SorobanInvocation], &tx);
+        assert!(payloads.is_empty());
     }
 
     #[test]
