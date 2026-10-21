@@ -166,7 +166,7 @@ webhook_url = "https://hooks.example.com/my-webhook"
 |---|---|
 | `AnyTransaction` | Any transaction touches the contract |
 | `TransactionFailed` | A transaction fails (`successful = false`) |
-| `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM |
+| `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM, or ≥ `threshold_stroops` stroops (exactly one) |
 | `FunctionCalled` | A specific Soroban function is invoked |
 | `AdminFunctionCalled` | Any function in a named list is invoked |
 | `HighFee` | Transaction fee exceeds configured threshold |

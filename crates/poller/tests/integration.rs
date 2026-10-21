@@ -360,9 +360,7 @@ async fn large_transfer_fires_above_threshold() {
     let client = txwatch_notifier::build_client().unwrap();
     let contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::LargeTransfer {
-            threshold_xlm: 5_000,
-        }],
+        vec![AlertRule::LargeTransfer { threshold_xlm: Some(5_000), threshold_stroops: None }],
     );
 
     let tx = EnrichedTransaction::from_horizon(
@@ -668,7 +666,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
 
     let mut contract = helpers::contract(
         &format!("{}/hook", receiver.uri()),
-        vec![AlertRule::LargeTransfer { threshold_xlm: 1000 }],
+        vec![AlertRule::LargeTransfer { threshold_xlm: Some(1000), threshold_stroops: None }],
     );
     contract.horizon_base_url_override = Some(horizon.uri());
 
