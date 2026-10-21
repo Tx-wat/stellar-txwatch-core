@@ -32,6 +32,9 @@ pub struct HorizonTransaction {
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
     pub result_xdr: Option<String>,
+    /// Present only on fee-bump transactions: the wrapped inner transaction record.
+    #[serde(default)]
+    pub inner_transaction: Option<serde_json::Value>,
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -55,6 +58,8 @@ pub struct EnrichedTransaction {
     pub amount_stroops: Option<u64>,
     /// Fee charged for this transaction in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// True when the transaction is a fee-bump wrapper (Horizon `inner_transaction` present).
+    pub fee_bump: bool,
 }
 
 impl EnrichedTransaction {
@@ -72,6 +77,8 @@ impl EnrichedTransaction {
             )
         })?;
 
+        let fee_bump = tx.inner_transaction.is_some();
+
         Ok(Self {
             hash:          tx.hash,
             timestamp,
@@ -84,6 +91,7 @@ impl EnrichedTransaction {
                     .as_deref()
                     .and_then(|s| s.parse::<u64>().ok())
             }),
+            fee_bump,
         })
     }
 }
@@ -109,6 +117,9 @@ pub struct AlertPayload {
     pub amount_xlm: Option<u64>,
     /// Fee charged in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// True when the transaction is a fee-bump wrapper.
+    #[serde(default)]
+    pub fee_bump: bool,
     /// Unix timestamp (seconds).
     pub timestamp: i64,
     /// ISO 8601 timestamp string.
@@ -151,6 +162,7 @@ pub fn evaluate(
                 function_names: tx.function_names.clone(),
                 amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
                 fee_charged_stroops: tx.fee_charged_stroops,
+                fee_bump: tx.fee_bump,
                 timestamp,
                 timestamp_iso: timestamp_iso.clone(),
                 horizon_link: horizon_link.clone(),
@@ -275,6 +287,7 @@ mod tests {
             function_names: function_names.iter().map(|s| s.to_string()).collect(),
             amount_stroops,
             fee_charged_stroops: None,
+            fee_bump: false,
         }
     }
 
@@ -488,6 +501,7 @@ mod tests {
                 function_names: vec![],
                 amount_stroops: None,
                 fee_charged_stroops: None,
+                fee_bump: false,
             };
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -566,9 +580,54 @@ mod tests {
             fee_charged: Some("100".into()),
             envelope_xdr: None,
             result_xdr: None,
+            inner_transaction: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
+    }
+
+    /// #266: a Horizon record carrying `inner_transaction` is a fee-bump wrapper.
+    #[test]
+    fn fee_bump_transaction_sets_fee_bump_flag() {
+        let raw = HorizonTransaction {
+            hash: "fb1".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: Some("200".into()),
+            envelope_xdr: None,
+            result_xdr: None,
+            inner_transaction: Some(serde_json::json!({ "hash": "inner1" })),
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert!(enriched.fee_bump);
+    }
+
+    /// #266: a plain transaction (no `inner_transaction`) leaves the flag false.
+    #[test]
+    fn non_fee_bump_transaction_clears_fee_bump_flag() {
+        let raw = HorizonTransaction {
+            hash: "nfb1".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: Some("100".into()),
+            envelope_xdr: None,
+            result_xdr: None,
+            inner_transaction: None,
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert!(!enriched.fee_bump);
+    }
+
+    /// #266: the fee_bump flag is propagated onto the AlertPayload.
+    #[test]
+    fn fee_bump_flag_propagates_to_alert_payload() {
+        let mut tx = make_tx(true, &[], None);
+        tx.fee_bump = true;
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert!(payloads[0].fee_bump);
     }
 
     /// Issue #65: from_horizon must return Err when created_at is not a valid RFC 3339 timestamp.
@@ -582,6 +641,7 @@ mod tests {
             fee_charged:  None,
             envelope_xdr: None,
             result_xdr:   None,
+            inner_transaction: None,
         };
         let result = EnrichedTransaction::from_horizon(raw, vec![], None, None);
         assert!(result.is_err(), "expected Err for invalid timestamp");
@@ -656,6 +716,7 @@ mod tests {
             function_names: vec!["transfer".into()],
             amount_xlm: Some(15000),
             fee_charged_stroops: Some(50000),
+            fee_bump: false,
             timestamp: 1705316096,
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
