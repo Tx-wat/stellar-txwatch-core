@@ -10,6 +10,7 @@ use reqwest::Client;
 use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, span, warn, Level};
+use txwatch_config::Network;
 use txwatch_rules::AlertPayload;
 
 const MAX_RETRIES: u32 = 3;
@@ -136,14 +137,14 @@ pub async fn send_webhook(
 
 /// Build a synthetic `AlertPayload` suitable for `test-webhook`.
 pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
-    test_payload_with_network(label, webhook_url, "testnet", "https://horizon-testnet.stellar.org")
+    test_payload_with_network(label, webhook_url, &Network::Testnet, "https://horizon-testnet.stellar.org")
 }
 
 /// Build a synthetic `AlertPayload` with an explicit network name and Horizon base URL.
 pub fn test_payload_with_network(
     label: &str,
     webhook_url: &str,
-    network: &str,
+    network: &Network,
     horizon_base_url: &str,
 ) -> AlertPayload {
     let now     = Utc::now();
@@ -151,7 +152,7 @@ pub fn test_payload_with_network(
     AlertPayload {
         label:               label.to_string(),
         contract_id:         "CTEST000000000000000000000000000000000000000000000000000".into(),
-        network:             network.to_string(),
+        network:             network.clone(),
         rule_type:           "TestWebhook".into(),
         rule_triggered:      "TestWebhook".into(),
         transaction_hash:    tx_hash.into(),
@@ -181,7 +182,7 @@ mod tests {
         AlertPayload {
             label:               "Test Contract".into(),
             contract_id:         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network:             "testnet".into(),
+            network:             Network::Testnet,
             rule_type:           "AnyTransaction".into(),
             rule_triggered:      "AnyTransaction".into(),
             transaction_hash:    "abc123".into(),
@@ -382,7 +383,7 @@ mod tests {
         let p = test_payload_with_network(
             "Label",
             "https://example.com/hook",
-            "mainnet",
+            &Network::Mainnet,
             "https://horizon.stellar.org",
         );
         assert!(p.horizon_link.starts_with("https://horizon.stellar.org/transactions/"));

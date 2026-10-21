@@ -239,7 +239,7 @@ async fn any_transaction_fires_webhook() {
         let payloads = evaluate(
             &contract.label,
             &contract.contract_id,
-            contract.network.as_str(),
+            &contract.network,
             &horizon.uri(),
             "https://stellar.expert/explorer/testnet",
             &contract.rules,
@@ -332,7 +332,7 @@ async fn transaction_failed_rule_fires_only_on_failure() {
         let payloads = evaluate(
             &contract.label,
             &contract.contract_id,
-            contract.network.as_str(),
+            &contract.network,
             &horizon.uri(),
             "https://stellar.expert/explorer/testnet",
             &contract.rules,
@@ -384,7 +384,7 @@ async fn large_transfer_fires_above_threshold() {
     let payloads = evaluate(
         &contract.label,
         &contract.contract_id,
-        contract.network.as_str(),
+        &contract.network,
         "https://horizon-testnet.stellar.org",
         "https://stellar.expert/explorer/testnet",
         &contract.rules,
@@ -454,7 +454,7 @@ async fn function_called_rule_fires_on_exact_match() {
         let payloads = evaluate(
             &contract.label,
             &contract.contract_id,
-            contract.network.as_str(),
+            &contract.network,
             "https://horizon-testnet.stellar.org",
             "https://stellar.expert/explorer/testnet",
             &contract.rules,
@@ -551,7 +551,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
     let payloads = evaluate(
         &contract.label,
         &contract.contract_id,
-        contract.network.as_str(),
+        &contract.network,
         &horizon.uri(),
         "https://stellar.expert/explorer/testnet",
         &contract.rules,

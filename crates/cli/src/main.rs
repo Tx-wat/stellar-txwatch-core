@@ -134,9 +134,8 @@ async fn main() -> Result<()> {
                 ));
             }
             let first_contract = &cfg.contracts[0];
-            let network_name = first_contract.network.as_str();
             let horizon_base_url = first_contract.network.horizon_base_url();
-            let payload = test_payload_with_network(&label, &url, network_name, horizon_base_url);
+            let payload = test_payload_with_network(&label, &url, &first_contract.network, horizon_base_url);
             let client  = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");

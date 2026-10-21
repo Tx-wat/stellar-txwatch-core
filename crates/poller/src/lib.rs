@@ -386,7 +386,7 @@ async fn poll_contract(
         let payloads = evaluate(
             &contract.label,
             &contract.contract_id,
-            contract.network.as_str(),
+            &contract.network,
             canonical_base,
             contract.network.explorer_base_url(),
             &contract.rules,

@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use txwatch_config::AlertRule;
+use txwatch_config::{AlertRule, Network};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -95,7 +95,9 @@ impl EnrichedTransaction {
 pub struct AlertPayload {
     pub label: String,
     pub contract_id: String,
-    pub network: String,
+    /// Serialises as the lowercase name (`"mainnet"`, `"testnet"`, `"futurenet"`),
+    /// so the webhook wire format is unchanged from the old `String` field.
+    pub network: Network,
     /// Stable machine-readable rule variant (e.g. `"LargeTransfer"`).
     pub rule_type: String,
     pub rule_triggered: String,
@@ -126,7 +128,7 @@ pub struct AlertPayload {
 pub fn evaluate(
     label: &str,
     contract_id: &str,
-    network: &str,
+    network: &Network,
     horizon_base: &str,
     explorer_base: &str,
     rules: &[AlertRule],
@@ -143,7 +145,7 @@ pub fn evaluate(
             Ok(true) => Some(AlertPayload {
                 label: label.to_string(),
                 contract_id: contract_id.to_string(),
-                network: network.to_string(),
+                network: network.clone(),
                 rule_type: rule_type(rule),
                 rule_triggered: rule_label(rule),
                 transaction_hash: tx.hash.clone(),
@@ -258,7 +260,7 @@ impl AlertPayload {
 mod tests {
     use super::*;
     use chrono::Datelike;
-    use txwatch_config::AlertRule;
+    use txwatch_config::{AlertRule, Network};
 
     fn make_tx(
         successful: bool,
@@ -282,7 +284,7 @@ mod tests {
         evaluate(
             "Label",
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "testnet",
+            &Network::Testnet,
             "https://horizon-testnet.stellar.org",
             "https://stellar.expert/explorer/testnet",
             rules,
@@ -491,7 +493,7 @@ mod tests {
             };
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "testnet", horizon_base, explorer_base,
+                &Network::Testnet, horizon_base, explorer_base,
                 &[AlertRule::AnyTransaction], &tx,
             );
             payloads.remove(0)
@@ -644,11 +646,41 @@ mod tests {
     }
 
     #[test]
+    fn alert_payload_network_keeps_lowercase_wire_format() {
+        for (network, wire) in [
+            (Network::Mainnet, "mainnet"),
+            (Network::Testnet, "testnet"),
+            (Network::Futurenet, "futurenet"),
+        ] {
+            let payload = AlertPayload {
+                label: "x".into(),
+                contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                network,
+                rule_type: "AnyTransaction".into(),
+                rule_triggered: "AnyTransaction".into(),
+                transaction_hash: "abc".into(),
+                function_name: None,
+                function_names: vec![],
+                amount_xlm: None,
+                fee_charged_stroops: None,
+                timestamp: 0,
+                timestamp_iso: "1970-01-01T00:00:00Z".into(),
+                horizon_link: String::new(),
+                explorer_link: String::new(),
+            };
+            let json: serde_json::Value = serde_json::to_value(&payload).unwrap();
+            assert_eq!(json["network"], wire);
+            let round_tripped: AlertPayload = serde_json::from_value(json).unwrap();
+            assert_eq!(round_tripped, payload);
+        }
+    }
+
+    #[test]
     fn alert_payload_serialises_to_valid_json_with_all_fields_present() {
         let payload = AlertPayload {
             label: "My Contract".into(),
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network: "testnet".into(),
+            network: Network::Testnet,
             rule_type: "LargeTransfer".into(),
             rule_triggered: "LargeTransfer(>=10000XLM)".into(),
             transaction_hash: "abc123".into(),

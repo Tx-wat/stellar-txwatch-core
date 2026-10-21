@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-txwatch-rules = { path = "../rules" }
+txwatch-config = { path = "../config" }
+txwatch-rules  = { path = "../rules" }
 reqwest       = { workspace = true }
 serde_json    = { workspace = true }
 anyhow        = { workspace = true }
