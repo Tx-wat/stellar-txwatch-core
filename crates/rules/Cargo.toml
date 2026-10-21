@@ -10,3 +10,10 @@ serde_json     = { workspace = true }
 anyhow         = { workspace = true }
 chrono         = { workspace = true }
 tracing        = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name    = "eval_benchmark"
+harness = false

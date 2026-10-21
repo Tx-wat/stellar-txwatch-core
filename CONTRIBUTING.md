@@ -125,6 +125,30 @@ cargo test -p txwatch-poller   # includes integration tests
 
 Add `-- --nocapture` to see log output while tests run.
 
+## Rule evaluation benchmark
+
+`crates/rules/benches/eval_benchmark.rs` measures `evaluate()` throughput with Criterion:
+
+```bash
+cargo bench -p txwatch-rules
+```
+
+Scenarios:
+
+1. One `AnyTransaction` rule, 10,000 transactions
+2. One rule of each type (6 rules), 1,000 transactions
+3. 50 `FunctionCalled` rules (worst-case rule count), 1,000 transactions
+
+Baseline (Codespace, release build, `--warm-up-time 1 --measurement-time 2`; numbers vary by machine):
+
+| Scenario | Median time | Throughput |
+|---|---|---|
+| 1 rule, 10k txs | ~12.1 ms | ~825 K tx/s |
+| 6 rules, 1k txs | ~1.50 ms | ~669 K tx/s |
+| 50 rules, 1k txs | ~0.85 ms | ~1.18 M tx/s |
+
+Scenario 3 is faster per transaction than scenario 2 because the `FunctionCalled` rules fail fast on the single invoked function name, while the `AdminFunctionCalled` and `LargeTransfer` rules in scenario 2 do more work. Compare runs on the same machine only.
+
 ## Adding Tests
 
 ### Where to put tests
