@@ -4,7 +4,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::{env, fmt, fs, path::Path};
+use std::{env, fmt, fs, path::Path, str::FromStr};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -81,6 +81,22 @@ impl Network {
 impl fmt::Display for Network {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Network {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "mainnet" => Ok(Network::Mainnet),
+            "testnet" => Ok(Network::Testnet),
+            "futurenet" => Ok(Network::Futurenet),
+            other => bail!(
+                "unknown network '{}'. Valid values: mainnet, testnet, futurenet.",
+                other
+            ),
+        }
     }
 }
 
@@ -672,6 +688,28 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::HighFee { threshold_stroops: 0, threshold_xlm: None }];
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn network_from_str_parses_valid_variants() {
+        assert_eq!("mainnet".parse::<Network>().unwrap(), Network::Mainnet);
+        assert_eq!("testnet".parse::<Network>().unwrap(), Network::Testnet);
+        assert_eq!("futurenet".parse::<Network>().unwrap(), Network::Futurenet);
+    }
+
+    #[test]
+    fn network_from_str_rejects_unknown_value_with_helpful_message() {
+        let err = "main".parse::<Network>().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "unknown network 'main'. Valid values: mainnet, testnet, futurenet."
+        );
+    }
+
+    #[test]
+    fn network_from_str_is_case_sensitive() {
+        assert!("Mainnet".parse::<Network>().is_err());
+        assert!("".parse::<Network>().is_err());
     }
 
     #[test]
