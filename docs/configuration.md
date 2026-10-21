@@ -117,9 +117,10 @@ function_names = ["set_admin", "upgrade", "initialize"]
 
 ## Environment variables
 
-| Variable   | Default | Description                                      |
-|------------|---------|--------------------------------------------------|
-| `RUST_LOG` | `info`  | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+| Variable         | Default               | Description                                                                 |
+|------------------|-----------------------|-----------------------------------------------------------------------------|
+| `RUST_LOG`       | `info`                | Log level: `error`, `warn`, `info`, `debug`, `trace`                        |
+| `TXWATCH_CONFIG` | `config/example.toml` | Path to the TOML config file. Used when `--config` is not passed; the `--config` flag takes precedence. |
 
 Note: setting `RUST_LOG=debug` will show per-contract idle poll cycles — the
 poller emits `"no new transactions"` debug logs with the contract `label` and

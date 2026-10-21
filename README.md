@@ -129,7 +129,8 @@ Commands:
   test-webhook --url <URL>     Send a test payload to a webhook URL and exit
 ```
 
-`--config` defaults to `config/example.toml`.
+`--config` defaults to `config/example.toml`. It can also be set with the
+`TXWATCH_CONFIG` environment variable; the `--config` flag takes precedence when both are set.
 
 ---
 
