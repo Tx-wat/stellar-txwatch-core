@@ -858,3 +858,82 @@ async fn contracts_polled_concurrently() {
         DELAY_MS as f64 * 1.8 + 300.0,
     );
 }
+
+/// Runs one poll cycle where Horizon returns a single transaction invoking
+/// `invoked_fn`, with the contract configured for `configured_fn`, and asserts
+/// the AdminFunctionCalled webhook fires with the expected rule_type.
+async fn admin_function_poll_fires_webhook(configured_fn: &str, invoked_fn: &str) {
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // First transactions request returns one tx with an inline invoke_host_function op.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": {
+                "records": [{
+                    "hash":         "admin001",
+                    "created_at":   "2024-06-01T10:00:00Z",
+                    "successful":   true,
+                    "paging_token": "700",
+                    "fee_charged":  "100",
+                    "envelope_xdr": null,
+                    "result_xdr":   null,
+                    "operations":   [{ "type": "invoke_host_function", "function": invoked_fn }]
+                }]
+            }
+        })))
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+
+    // All subsequent transaction requests return an empty page.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    // Webhook receiver: expect exactly 1 POST carrying the AdminFunctionCalled rule.
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .and(wiremock::matchers::body_partial_json(serde_json::json!({
+            "rule_type": "AdminFunctionCalled"
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AdminFunctionCalled {
+            function_names: vec![configured_fn.into()],
+        }],
+    );
+    contract.horizon_base_url_override = Some(horizon.uri());
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        cursor_file: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    // Drive the loop for one full poll cycle; MockServer drop verifies the webhook count.
+    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+}
+
+/// Issue #270: mixed-case config name matches a lowercase invocation.
+#[tokio::test]
+async fn admin_function_mixed_case_config_matches_lowercase_invocation() {
+    admin_function_poll_fires_webhook("Set_Admin", "set_admin").await;
+}
+
+/// Issue #270: lowercase config name matches an uppercase invocation.
+#[tokio::test]
+async fn admin_function_lowercase_config_matches_uppercase_invocation() {
+    admin_function_poll_fires_webhook("set_admin", "SET_ADMIN").await;
+}
