@@ -41,6 +41,11 @@ enum Command {
         /// Do not actually send webhooks; only log matched rules
         #[arg(long)]
         dry_run: bool,
+
+        /// Run exactly one poll cycle across all contracts, then exit.
+        /// Exit codes: 0 = every contract polled successfully, 1 = any contract failed
+        #[arg(long)]
+        poll_once: bool,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -145,8 +150,17 @@ async fn main() -> Result<()> {
             println!("Test webhook delivered successfully to {}", url);
         }
 
-        Command::Watch { dry_run } => {
+        Command::Watch { dry_run, poll_once } => {
             let cfg = AppConfig::from_file(&cli.config)?;
+
+            if poll_once {
+                let failed = txwatch_poller::run_once(cfg, dry_run).await?;
+                if failed > 0 {
+                    return Err(anyhow::anyhow!("{} contract poll(s) failed", failed));
+                }
+                info!("poll-once cycle completed for all contracts");
+                return Ok(());
+            }
 
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             let (shutdown_tx, shutdown_rx) = watch::channel(false);

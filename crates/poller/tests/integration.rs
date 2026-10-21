@@ -857,3 +857,79 @@ async fn contracts_polled_concurrently() {
         DELAY_MS as f64 * 1.8 + 300.0,
     );
 }
+
+/// `run_once` polls every contract exactly one cycle and reports no failures on success.
+#[tokio::test]
+async fn run_once_polls_each_contract_once_and_reports_no_failures() {
+    let horizon = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::tx_page("tx_once", "1", true)))
+        .expect(1)
+        .mount(&horizon)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex("/transactions/.*/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [] }
+        })))
+        .mount(&horizon)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
+    contract.horizon_base_url_override = Some(horizon.uri());
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 10,
+        contracts: vec![contract],
+        cursor_file: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    let failed = txwatch_poller::run_once(cfg, false).await.unwrap();
+    assert_eq!(failed, 0);
+}
+
+/// `run_once` keeps going past a failing contract and reports how many failed.
+#[tokio::test]
+async fn run_once_counts_failed_contracts() {
+    let horizon = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&horizon)
+        .await;
+
+    let mut first = helpers::contract("https://hooks.example.com/a", vec![AlertRule::AnyTransaction]);
+    first.horizon_base_url_override = Some(horizon.uri());
+    let mut second = helpers::contract("https://hooks.example.com/b", vec![AlertRule::AnyTransaction]);
+    second.label = "Second Contract".into();
+    second.contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+    second.horizon_base_url_override = Some(horizon.uri());
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 10,
+        contracts: vec![first, second],
+        cursor_file: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    let failed = txwatch_poller::run_once(cfg, true).await.unwrap();
+    assert_eq!(failed, 2);
+}

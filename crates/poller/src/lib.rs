@@ -106,49 +106,9 @@ pub async fn run_with_shutdown(
     dry_run:    bool,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
-    let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+    let client = build_http_client(&cfg)?;
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .pool_max_idle_per_host(max_idle)
-        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
-        .build()
-        .context("failed to build HTTP client")?;
-
-    let mut cursors: HashMap<String, String> = if let Some(path) = &cfg.cursor_file {
-        match fs::read_to_string(path) {
-            Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
-                Ok(mut map) => {
-                    // Ensure every configured contract has a cursor entry.
-                    for c in &cfg.contracts {
-                        map.entry(c.contract_id.clone())
-                            .or_insert_with(|| "now".to_string());
-                    }
-                    map
-                }
-                Err(e) => {
-                    warn!(error = ?e, "failed to parse cursor_file; starting from 'now' for all contracts");
-                    cfg.contracts
-                        .iter()
-                        .map(|c| (c.contract_id.clone(), "now".to_string()))
-                        .collect()
-                }
-            },
-            Err(e) => {
-                debug!(error = ?e, "could not read cursor_file; starting from 'now'");
-                cfg.contracts
-                    .iter()
-                    .map(|c| (c.contract_id.clone(), "now".to_string()))
-                    .collect()
-            }
-        }
-    } else {
-        cfg.contracts
-            .iter()
-            .map(|c| (c.contract_id.clone(), "now".to_string()))
-            .collect()
-    };
+    let mut cursors = initial_cursors(&cfg);
 
     let interval      = Duration::from_secs(cfg.poll_interval_seconds);
     let summary_every = Duration::from_secs(60);
@@ -242,6 +202,74 @@ pub async fn run_with_shutdown(
 
     info!("TxWatch polling engine stopped cleanly");
     Ok(())
+}
+
+/// Run exactly one poll cycle over every contract, then return. Uses the same
+/// starting cursors as `run_with_shutdown`. Returns the number of contracts whose
+/// poll failed; a contract that fails is logged and does not stop the others.
+pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<usize> {
+    let client = build_http_client(&cfg)?;
+    let mut cursors = initial_cursors(&cfg);
+    let mut failed = 0;
+
+    for contract in &cfg.contracts {
+        if let Err(e) = poll_contract(&client, contract, &mut cursors, dry_run).await {
+            error!(contract = %contract.label, error = %e, "contract polling task failed");
+            failed += 1;
+        }
+    }
+
+    Ok(failed)
+}
+
+fn build_http_client(cfg: &AppConfig) -> Result<Client> {
+    let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
+    let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+
+    Client::builder()
+        .timeout(Duration::from_secs(15))
+        .pool_max_idle_per_host(max_idle)
+        .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
+        .build()
+        .context("failed to build HTTP client")
+}
+
+/// Starting cursor for each contract: the value from `cursor_file` when present,
+/// otherwise `"now"`.
+fn initial_cursors(cfg: &AppConfig) -> HashMap<String, String> {
+    if let Some(path) = &cfg.cursor_file {
+        match fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
+                Ok(mut map) => {
+                    // Ensure every configured contract has a cursor entry.
+                    for c in &cfg.contracts {
+                        map.entry(c.contract_id.clone())
+                            .or_insert_with(|| "now".to_string());
+                    }
+                    map
+                }
+                Err(e) => {
+                    warn!(error = ?e, "failed to parse cursor_file; starting from 'now' for all contracts");
+                    cfg.contracts
+                        .iter()
+                        .map(|c| (c.contract_id.clone(), "now".to_string()))
+                        .collect()
+                }
+            },
+            Err(e) => {
+                debug!(error = ?e, "could not read cursor_file; starting from 'now'");
+                cfg.contracts
+                    .iter()
+                    .map(|c| (c.contract_id.clone(), "now".to_string()))
+                    .collect()
+            }
+        }
+    } else {
+        cfg.contracts
+            .iter()
+            .map(|c| (c.contract_id.clone(), "now".to_string()))
+            .collect()
+    }
 }
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
