@@ -4,7 +4,10 @@
 //! exposing `send_webhook` and `test_payload` helpers for webhook delivery.
 
 use anyhow::{anyhow, Result};
+use chrono::Utc;
+use hmac::{Hmac, Mac};
 use reqwest::Client;
+use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, span, warn, Level};
 use txwatch_rules::AlertPayload;
@@ -42,7 +45,6 @@ pub async fn send_webhook(
     url: &str,
     payload: &AlertPayload,
     secret: Option<&str>,
-    mut shutdown: oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
     let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
     let _enter = span.enter();
@@ -117,12 +119,7 @@ pub async fn send_webhook(
         }
 
         if attempt < MAX_RETRIES {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))) => {}
-                _ = &mut shutdown => {
-                    return Err(anyhow!("webhook retry aborted: shutdown signal received"));
-                }
-            }
+            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
         }
     }
 

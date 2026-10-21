@@ -14,6 +14,8 @@ use std::time::Duration;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use reqwest::Client;
+
 use txwatch_config::{AlertRule, AppConfig};
 use txwatch_rules::{evaluate, EnrichedTransaction};
 
@@ -543,6 +545,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
         },
         vec![],
         None,
+        Some(50_000),
     )
     .unwrap();
 
@@ -617,6 +620,9 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
         contracts: vec![contract],
         cursor_file: None,
     };
@@ -669,6 +675,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
+        cursor_file: None,
         contracts: vec![contract],
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
@@ -686,7 +693,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
     assert_eq!(body["amount_xlm"].as_u64(), Some(5000));
 
     let requests = horizon.received_requests().await.unwrap();
-    assert!(requests.iter().any(|r| r.url.contains("cursor=1")),
+    assert!(requests.iter().any(|r| r.url.as_str().contains("cursor=1")),
         "expected the second Horizon transaction request to advance the cursor to '1'");
 }
 
