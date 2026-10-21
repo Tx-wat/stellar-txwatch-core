@@ -116,7 +116,8 @@ All matching rules fire; there is no short-circuit.
 | `rule_triggered`   | string      | yes            | Human-readable rule description          |
 | `transaction_hash` | string      | yes            | Stellar transaction hash                 |
 | `function_name`    | string/null | no             | Soroban function name if available; `null` indicates a non-Soroban transaction |
-| `amount_xlm`       | u64/null    | no             | Transfer amount in XLM if available      |
+| `amount_xlm`       | u64/null    | no             | Transfer amount in whole XLM if available (truncated) |
+| `amount_stroops`   | u64/null    | no             | Transfer amount in stroops (1 XLM = 10,000,000) if available; full precision |
 | `timestamp`        | i64         | yes            | Unix timestamp (seconds) of transaction  |
 | `horizon_link`     | string      | yes            | Direct link to transaction on Horizon    |
 | `explorer_link`    | string      | yes            | Stellar Expert explorer link for the transaction |

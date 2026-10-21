@@ -106,6 +106,7 @@ function_names = ["set_admin", "upgrade", "initialize"]
   "function_name":    "transfer",
   "function_names":   ["transfer"],
   "amount_xlm":       15000,
+  "amount_stroops":   150000000000,
   "timestamp":        1705316096,
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
   "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123..."

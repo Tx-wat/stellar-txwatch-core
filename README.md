@@ -188,6 +188,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "function_name":    "transfer",
   "function_names":   ["transfer"],
   "amount_xlm":       15000,
+  "amount_stroops":   150000000000,
   "fee_charged_stroops": 50000,
   "timestamp":        1705316096,
   "timestamp_iso":    "2024-01-15T12:00:00Z",

@@ -688,6 +688,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
     assert_eq!(body["rule_type"].as_str(), Some("LargeTransfer"));
     assert_eq!(body["rule_triggered"].as_str(), Some("LargeTransfer(>=1000XLM)"));
     assert_eq!(body["amount_xlm"].as_u64(), Some(5000));
+    assert_eq!(body["amount_stroops"].as_u64(), Some(50_000_000_000));
 
     let requests = horizon.received_requests().await.unwrap();
     assert!(requests.iter().any(|r| r.url.as_str().contains("cursor=1")),
