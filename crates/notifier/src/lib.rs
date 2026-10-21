@@ -14,6 +14,9 @@ use txwatch_rules::AlertPayload;
 
 const MAX_RETRIES: u32 = 3;
 
+/// Backoff base for webhook retries: attempt `n` waits `RETRY_BASE_DELAY * 2^n`.
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+
 /// Structured result returned by a successful `send_webhook` call.
 #[derive(Debug, PartialEq)]
 pub struct DeliveryResult {
@@ -45,6 +48,18 @@ pub async fn send_webhook(
     url: &str,
     payload: &AlertPayload,
     secret: Option<&str>,
+) -> Result<DeliveryResult> {
+    send_webhook_with_backoff(client, url, payload, secret, RETRY_BASE_DELAY).await
+}
+
+/// Same as [`send_webhook`], with the backoff base supplied by the caller.
+/// The delay before retry `n` is `base * 2^n`, so the production base yields 2 s → 4 s.
+async fn send_webhook_with_backoff(
+    client: &Client,
+    url: &str,
+    payload: &AlertPayload,
+    secret: Option<&str>,
+    base: Duration,
 ) -> Result<DeliveryResult> {
     let span = span!(Level::INFO, "send_webhook", contract = %payload.label, rule = %payload.rule_triggered);
     let _enter = span.enter();
@@ -119,7 +134,7 @@ pub async fn send_webhook(
         }
 
         if attempt < MAX_RETRIES {
-            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+            tokio::time::sleep(base * 2u32.pow(attempt)).await;
         }
     }
 
@@ -347,6 +362,8 @@ mod tests {
         assert_eq!(sig, &expected);
     }
 
+    /// Issue #307: a persistent 500 must produce exactly MAX_RETRIES requests — no more, no less.
+    /// A zero backoff base keeps the test fast without changing the retry count.
     #[tokio::test]
     async fn fails_after_max_retries() {
         let server = MockServer::start().await;
@@ -358,10 +375,21 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook_with_backoff(
+            &client, &url, &sample_payload(), None, Duration::ZERO,
+        ).await;
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("shutdown"), "error should mention shutdown, got: {}", msg);
+        assert!(msg.contains("500"), "error should carry HTTP 500, got: {}", msg);
+
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            MAX_RETRIES as usize,
+            "expected exactly {} attempts, got {}",
+            MAX_RETRIES,
+            received.len()
+        );
     }
 
     /// Issue #13: test_payload produces a structurally valid AlertPayload (56-char contract ID).
