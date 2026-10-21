@@ -1,7 +1,10 @@
 [package]
 name    = "txwatch-poller"
 version = "0.1.0"
+license = "Apache-2.0"
 edition = "2021"
+license   = "Apache-2.0"
+publish   = false
 
 [features]
 # Enable Prometheus metrics counters and optional /metrics HTTP endpoint.
@@ -18,11 +21,12 @@ tokio            = { workspace = true }
 anyhow           = { workspace = true }
 tracing          = { workspace = true }
 chrono           = { workspace = true }
-prometheus       = { version = "0.13", optional = true }
+prometheus       = { version = "0.13", default-features = false, optional = true }
 hyper            = { version = "1", features = ["http1", "server"], optional = true }
 hyper-util       = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util   = { version = "0.1", optional = true }
 
 [dev-dependencies]
 wiremock         = "0.6"
+tracing-subscriber = { workspace = true }
 tokio            = { workspace = true }
