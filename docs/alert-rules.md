@@ -26,6 +26,18 @@ Matches transactions where `successful = false`.
 type = "TransactionFailed"
 ```
 
+### `InsufficientFunds`
+Matches transactions that failed because the source account could not cover the fee
+(Horizon result code `txINSUFFICIENT_BALANCE`, decoded from `result_xdr`). Other failures
+such as `txBAD_SEQ` or `txFAILED` do not match, and successful transactions never match.
+
+**Use case:** catch fee-account top-up problems before they cause a run of failed transactions.
+
+```toml
+[[contracts.rules]]
+type = "InsufficientFunds"
+```
+
 ### `LargeTransfer`
 
 | Field           | Type | Required | Description                        |
@@ -128,6 +140,7 @@ The webhook payload includes two rule-related fields:
 |------|-------------------|
 | `AnyTransaction` | `"AnyTransaction"` |
 | `TransactionFailed` | `"TransactionFailed"` |
+| `InsufficientFunds` | `"InsufficientFunds"` |
 | `LargeTransfer` | `"LargeTransfer"` |
 | `FunctionCalled` | `"FunctionCalled"` |
 | `AdminFunctionCalled` | `"AdminFunctionCalled"` |

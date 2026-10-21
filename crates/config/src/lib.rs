@@ -68,6 +68,9 @@ impl fmt::Display for Network {
 pub enum AlertRule {
     AnyTransaction,
     TransactionFailed,
+    /// Fires when a transaction fails because the source account cannot cover the fee
+    /// (Horizon result code `txINSUFFICIENT_BALANCE`). Other failures do not match.
+    InsufficientFunds,
     LargeTransfer       { threshold_xlm: u64 },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
@@ -125,7 +128,7 @@ impl AlertRule {
                     *name = name.to_lowercase();
                 }
             }
-            AlertRule::AnyTransaction | AlertRule::TransactionFailed => {}
+            AlertRule::AnyTransaction | AlertRule::TransactionFailed | AlertRule::InsufficientFunds => {}
             AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
                 match (*threshold_xlm, *threshold_stroops) {
                     (Some(_), s) if s > 0 => bail!(
@@ -159,6 +162,7 @@ impl AlertRule {
         match self {
             AlertRule::AnyTransaction => "AnyTransaction".into(),
             AlertRule::TransactionFailed => "TransactionFailed".into(),
+            AlertRule::InsufficientFunds => "InsufficientFunds".into(),
             AlertRule::LargeTransfer { threshold_xlm } => {
                 format!("LargeTransfer(>={}XLM)", threshold_xlm)
             }
@@ -698,6 +702,13 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&dir);
         assert!(err.contains("is not writable"), "got: {}", err);
+    }
+
+    #[test]
+    fn insufficient_funds_rule_parses_from_toml() {
+        let rule: AlertRule = toml::from_str("type = \"InsufficientFunds\"").unwrap();
+        assert!(matches!(rule, AlertRule::InsufficientFunds));
+        assert_eq!(rule.label(), "InsufficientFunds");
     }
 
     #[test]
