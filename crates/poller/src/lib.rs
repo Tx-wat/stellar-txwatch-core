@@ -783,6 +783,59 @@ mod tests {
         assert!(horizon_urls.contains("testnet=https://horizon-testnet.stellar.org"));
     }
 
+    // ── extract_soroban_details (#304) ───────────────────────────────────────
+
+    fn payment_op(amount: &str) -> HorizonOperation {
+        HorizonOperation {
+            op_type:  "payment".into(),
+            function: None,
+            amount:   Some(amount.into()),
+        }
+    }
+
+    fn invoke_op(function: &str) -> HorizonOperation {
+        HorizonOperation {
+            op_type:  "invoke_host_function".into(),
+            function: Some(function.into()),
+            amount:   None,
+        }
+    }
+
+    #[test]
+    fn extract_sums_two_payment_ops() {
+        let ops = vec![payment_op("1.0000000"), payment_op("2.5000000")];
+        let (function_names, total) = extract_soroban_details(ops);
+
+        assert!(function_names.is_empty());
+        assert_eq!(total, Some(35_000_000), "1.0 + 2.5 XLM is 35_000_000 stroops");
+    }
+
+    #[test]
+    fn extract_saturates_when_payment_sum_overflows_u64() {
+        // Each op is 1.2e19 stroops, which fits in u64 on its own (max ≈ 1.8e19),
+        // but the sum does not. saturating_add must clamp it to u64::MAX.
+        let ops = vec![
+            payment_op("1200000000000.0000000"),
+            payment_op("1200000000000.0000000"),
+        ];
+        let (_, total) = extract_soroban_details(ops);
+
+        assert_eq!(total, Some(u64::MAX));
+    }
+
+    #[test]
+    fn extract_populates_function_names_and_total_for_mixed_ops() {
+        let ops = vec![
+            invoke_op("withdraw"),
+            payment_op("10.0000000"),
+            payment_op("0.5000000"),
+        ];
+        let (function_names, total) = extract_soroban_details(ops);
+
+        assert_eq!(function_names, vec!["withdraw"]);
+        assert_eq!(total, Some(105_000_000), "10.5 XLM is 105_000_000 stroops");
+    }
+
     #[tokio::test]
     async fn poll_handles_pagination_two_pages() {
         let server = MockServer::start().await;
