@@ -10,6 +10,29 @@ use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
 
+/// Stroops per XLM (1 XLM = 10^7 stroops).
+pub const STROOPS_PER_XLM: u64 = 10_000_000;
+
+/// Formats a stroop amount as whole or decimal XLM, e.g. `5_000_000` → `"0.5"`.
+pub fn format_xlm(stroops: u64) -> String {
+    let whole = stroops / STROOPS_PER_XLM;
+    let frac = stroops % STROOPS_PER_XLM;
+    if frac == 0 {
+        whole.to_string()
+    } else {
+        format!("{}.{}", whole, format!("{:07}", frac).trim_end_matches('0'))
+    }
+}
+
+/// Human-readable `LargeTransfer` label, e.g. `"LargeTransfer(>=10000XLM)"`.
+pub fn large_transfer_label(threshold_xlm: Option<u64>, threshold_stroops: Option<u64>) -> String {
+    match (threshold_xlm, threshold_stroops) {
+        (Some(xlm), None) => format!("LargeTransfer(>={}XLM)", xlm),
+        (None, Some(stroops)) => format!("LargeTransfer(>={}XLM)", format_xlm(stroops)),
+        _ => "LargeTransfer".into(),
+    }
+}
+
 // ── Network ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -62,6 +85,22 @@ impl fmt::Display for Network {
     }
 }
 
+impl FromStr for Network {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "mainnet" => Ok(Network::Mainnet),
+            "testnet" => Ok(Network::Testnet),
+            "futurenet" => Ok(Network::Futurenet),
+            other => bail!(
+                "unknown network '{}'. Valid values: mainnet, testnet, futurenet.",
+                other
+            ),
+        }
+    }
+}
+
 // ── AlertRule ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -93,19 +132,47 @@ pub enum AlertRule {
 impl AlertRule {
     pub fn validate(&mut self, contract_label: &str) -> Result<()> {
         match self {
-            AlertRule::LargeTransfer { threshold_xlm } => {
-                if *threshold_xlm == 0 {
-                    bail!(
-                        "contract '{}': LargeTransfer threshold_xlm must be > 0",
+            AlertRule::LargeTransfer { threshold_xlm, threshold_stroops } => {
+                match (*threshold_xlm, *threshold_stroops) {
+                    (Some(_), Some(_)) => bail!(
+                        "contract '{}': LargeTransfer: specify either threshold_stroops or \
+                         threshold_xlm, not both",
                         contract_label
-                    );
-                }
-                if *threshold_xlm > MAX_LARGE_TRANSFER_THRESHOLD_XLM {
-                    bail!(
-                        "contract '{}': LargeTransfer threshold_xlm must be <= {}",
-                        contract_label,
-                        MAX_LARGE_TRANSFER_THRESHOLD_XLM
-                    );
+                    ),
+                    (None, None) => bail!(
+                        "contract '{}': LargeTransfer requires threshold_xlm or threshold_stroops",
+                        contract_label
+                    ),
+                    (Some(xlm), None) => {
+                        if xlm == 0 {
+                            bail!(
+                                "contract '{}': LargeTransfer threshold_xlm must be > 0",
+                                contract_label
+                            );
+                        }
+                        if xlm > MAX_LARGE_TRANSFER_THRESHOLD_XLM {
+                            bail!(
+                                "contract '{}': LargeTransfer threshold_xlm must be <= {}",
+                                contract_label,
+                                MAX_LARGE_TRANSFER_THRESHOLD_XLM
+                            );
+                        }
+                    }
+                    (None, Some(stroops)) => {
+                        if stroops == 0 {
+                            bail!(
+                                "contract '{}': LargeTransfer threshold_stroops must be > 0",
+                                contract_label
+                            );
+                        }
+                        if stroops > MAX_LARGE_TRANSFER_THRESHOLD_XLM * STROOPS_PER_XLM {
+                            bail!(
+                                "contract '{}': LargeTransfer threshold_stroops must be <= {}",
+                                contract_label,
+                                MAX_LARGE_TRANSFER_THRESHOLD_XLM * STROOPS_PER_XLM
+                            );
+                        }
+                    }
                 }
             }
             AlertRule::FunctionCalled { function_name } => {
@@ -836,16 +903,14 @@ mod tests {
     #[test]
     fn rejects_zero_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: 0 }];
+        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: Some(0), threshold_stroops: None }];
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rejects_too_large_large_transfer_threshold() {
         let mut c = valid_contract();
-        c.rules = vec![AlertRule::LargeTransfer {
-            threshold_xlm: MAX_LARGE_TRANSFER_THRESHOLD_XLM + 1,
-        }];
+        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: Some(MAX_LARGE_TRANSFER_THRESHOLD_XLM + 1), threshold_stroops: None }];
         let err = c.validate().unwrap_err();
         assert!(err
             .to_string()

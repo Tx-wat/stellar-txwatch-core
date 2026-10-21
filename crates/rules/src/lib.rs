@@ -200,6 +200,9 @@ pub struct AlertPayload {
     /// Amount in whole XLM (stroops / 10_000_000), present for LargeTransfer.
     #[serde(rename = "amount_xlm")]
     pub amount_xlm: Option<u64>,
+    /// Amount in stroops (1 XLM = 10_000_000), present for LargeTransfer.
+    /// Full precision alongside the truncated `amount_xlm`.
+    pub amount_stroops: Option<u64>,
     /// Fee charged in stroops.
     pub fee_charged_stroops: Option<u64>,
     /// Memo type of the transaction (`"text"`, `"hash"`, `"id"`, `"return"`, `"none"`).
@@ -254,6 +257,7 @@ pub fn evaluate(
                 function_name: tx.function_names.first().cloned(),
                 function_names: tx.function_names.clone(),
                 amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+                amount_stroops: tx.amount_stroops,
                 fee_charged_stroops: tx.fee_charged_stroops,
                 memo_type: tx.memo_type.clone(),
                 memo: tx.memo.clone(),
@@ -298,7 +302,7 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
                 .checked_mul(10_000_000)
                 .context("threshold_xlm overflow when converting to stroops")?;
             tx.amount_stroops
-                .map(|s| s >= threshold_stroops)
+                .map(|s| s >= threshold)
                 .unwrap_or(false)
         }
 
@@ -609,9 +613,7 @@ mod tests {
         // exactly 10_000 XLM = 100_000_000_000 stroops
         let tx = make_tx(true, &[], Some(100_000_000_000));
         let payloads = run(
-            &[AlertRule::LargeTransfer {
-                threshold_xlm: 10_000,
-            }],
+            &[AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }],
             &tx,
         );
         assert_eq!(payloads.len(), 1);
@@ -622,9 +624,7 @@ mod tests {
     fn large_transfer_does_not_fire_below_threshold() {
         let tx = make_tx(true, &[], Some(9_999 * 10_000_000));
         let payloads = run(
-            &[AlertRule::LargeTransfer {
-                threshold_xlm: 10_000,
-            }],
+            &[AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }],
             &tx,
         );
         assert!(payloads.is_empty());
@@ -633,23 +633,30 @@ mod tests {
     #[test]
     fn large_transfer_no_amount_does_not_fire() {
         let tx = make_tx(true, &[], None);
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 1 }], &tx);
+        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: Some(1), threshold_stroops: None }], &tx);
         assert!(payloads.is_empty());
     }
 
     #[test]
     fn large_transfer_overflow_is_handled_gracefully() {
         let tx = make_tx(true, &[], Some(1_000_000_000_000_000));
-        let payloads = run(&[AlertRule::LargeTransfer {
-            threshold_xlm: u64::MAX,
-        }], &tx);
+        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: Some(u64::MAX), threshold_stroops: None }], &tx);
         assert!(payloads.is_empty(), "overflowing LargeTransfer thresholds should not panic");
+    }
+
+    #[test]
+    fn large_transfer_payload_keeps_sub_xlm_precision() {
+        let tx = make_tx(true, &[], Some(5_000_001));
+        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: None, threshold_stroops: Some(5_000_000) }], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].amount_xlm, Some(0));
+        assert_eq!(payloads[0].amount_stroops, Some(5_000_001));
     }
 
     #[test]
     fn large_transfer_fires_at_exact_threshold() {
         let tx = make_tx(true, &[], Some(10_000 * 10_000_000));
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }], &tx);
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].amount_xlm, Some(10_000));
     }
@@ -657,7 +664,7 @@ mod tests {
     #[test]
     fn large_transfer_does_not_fire_one_stroop_below_threshold() {
         let tx = make_tx(true, &[], Some(10_000 * 10_000_000 - 1));
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }], &tx);
         assert!(payloads.is_empty());
     }
 
@@ -763,9 +770,7 @@ mod tests {
         let rules = vec![
             AlertRule::AnyTransaction,
             AlertRule::TransactionFailed,
-            AlertRule::LargeTransfer {
-                threshold_xlm: 10_000,
-            },
+            AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None },
             AlertRule::AdminFunctionCalled {
                 function_names: vec!["set_admin".into()],
             },
@@ -822,6 +827,27 @@ mod tests {
         );
         assert_eq!(p.horizon_link,  p2.horizon_link);
         assert_eq!(p.explorer_link, p2.explorer_link);
+    }
+
+    #[test]
+    fn large_transfer_stroops_fires_at_exact_threshold() {
+        let tx = make_tx(true, &[], Some(5_000_000));
+        let payloads = run(
+            &[AlertRule::LargeTransfer { threshold_xlm: None, threshold_stroops: Some(5_000_000) }],
+            &tx,
+        );
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_triggered, "LargeTransfer(>=0.5XLM)");
+    }
+
+    #[test]
+    fn large_transfer_stroops_does_not_fire_one_stroop_below_threshold() {
+        let tx = make_tx(true, &[], Some(4_999_999));
+        let payloads = run(
+            &[AlertRule::LargeTransfer { threshold_xlm: None, threshold_stroops: Some(5_000_000) }],
+            &tx,
+        );
+        assert!(payloads.is_empty());
     }
 
     #[test]
@@ -1059,6 +1085,7 @@ mod tests {
             function_name: Some("transfer".into()),
             function_names: vec!["transfer".into()],
             amount_xlm: Some(15000),
+            amount_stroops: Some(150_000_000_000),
             fee_charged_stroops: Some(50000),
             memo_type: Some("text".into()),
             memo: Some("order-1234".into()),
@@ -1082,6 +1109,7 @@ mod tests {
         assert_eq!(obj["function_name"].as_str(), Some("transfer"));
         assert_eq!(obj["function_names"].as_array().map(|a| a.len()), Some(1));
         assert_eq!(obj["amount_xlm"].as_u64(), Some(15000));
+        assert_eq!(obj["amount_stroops"].as_u64(), Some(150_000_000_000));
         assert_eq!(obj["fee_charged_stroops"].as_u64(), Some(50000));
         assert_eq!(obj["timestamp"].as_i64(), Some(1705316096));
         assert_eq!(obj["timestamp_iso"].as_str(), Some("2024-01-15T12:00:00Z"));

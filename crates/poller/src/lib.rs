@@ -952,6 +952,7 @@ mod tests {
         cursors.insert(contract_id.to_string(), "now".to_string());
 
         let contract = WatchedContract {
+            rules: vec![],
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,
@@ -982,6 +983,7 @@ mod tests {
         cursors.insert(contract_id.to_string(), "now".to_string());
 
         let contract = WatchedContract {
+            rules: vec![],
             label: "test".into(),
             contract_id: contract_id.into(),
             network: Network::Testnet,

@@ -170,7 +170,7 @@ webhook_url = "https://hooks.example.com/my-webhook"
 |---|---|
 | `AnyTransaction` | Any transaction touches the contract |
 | `TransactionFailed` | A transaction fails (`successful = false`) |
-| `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM |
+| `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM, or ≥ `threshold_stroops` stroops (exactly one) |
 | `FunctionCalled` | A specific Soroban function is invoked |
 | `AdminFunctionCalled` | Any function in a named list is invoked |
 | `HighFee` | Transaction fee exceeds configured threshold |
@@ -192,6 +192,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "function_name":    "transfer",
   "function_names":   ["transfer"],
   "amount_xlm":       15000,
+  "amount_stroops":   150000000000,
   "fee_charged_stroops": 50000,
   "memo_type":        "text",
   "memo":             "order-1234",

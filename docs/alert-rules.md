@@ -53,11 +53,15 @@ type = "InsufficientFunds"
 
 ### `LargeTransfer`
 
-| Field           | Type | Required | Description                        |
-|-----------------|------|----------|------------------------------------|
-| `threshold_xlm` | u64  | yes      | Minimum transfer amount in XLM (> 0) |
+| Field               | Type | Required | Description                                              |
+|---------------------|------|----------|----------------------------------------------------------|
+| `threshold_xlm`     | u64  | one of   | Minimum transfer amount in whole XLM (> 0)               |
+| `threshold_stroops` | u64  | one of   | Minimum transfer amount in stroops, 1 XLM = 10,000,000 (> 0) |
 
-Matches when the payment amount (extracted from Horizon operations) is ≥ `threshold_xlm` XLM.
+Exactly one of `threshold_xlm` or `threshold_stroops` must be set. Use `threshold_stroops`
+for sub-XLM precision (e.g. `5000000` = 0.5 XLM). Existing `threshold_xlm` configs are unchanged.
+
+Matches when the payment amount (extracted from Horizon operations) is ≥ the threshold.
 The `amount_xlm` field in the webhook payload contains the actual transferred amount.
 
 **Note:** Amount is extracted from `payment` operation records. Soroban token transfers
@@ -67,6 +71,12 @@ that do not produce a native `payment` operation will not populate `amount_xlm`.
 [[contracts.rules]]
 type          = "LargeTransfer"
 threshold_xlm = 10000
+```
+
+```toml
+[[contracts.rules]]
+type              = "LargeTransfer"
+threshold_stroops = 5000000   # 0.5 XLM
 ```
 
 ### `FunctionCalled`
