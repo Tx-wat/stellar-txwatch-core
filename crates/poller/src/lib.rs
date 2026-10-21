@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::Ordering,
     sync::Arc,
     time::Duration,
 };
@@ -73,13 +73,8 @@ struct OpsEmbedded {
 
 // ── Summary counters ──────────────────────────────────────────────────────────
 
-#[derive(Default)]
-struct Counters {
-    transactions: AtomicU64,
-    alerts: AtomicU64,
-    interval_transactions: AtomicU64,
-    interval_alerts: AtomicU64,
-}
+mod counters;
+pub(crate) use counters::Counters;
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
@@ -181,9 +176,11 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     }
 
     let counters_for_summary = Arc::clone(&counters);
+    let labels_for_summary: Vec<String> = cfg.contracts.iter().map(|c| c.label.clone()).collect();
     let _summary_guard = tokio::spawn(async move {
         loop {
             let c = Arc::clone(&counters_for_summary);
+            let labels = labels_for_summary.clone();
             let handle = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(summary_every).await;
@@ -197,6 +194,16 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
                         alerts_interval       = interval_alerts,
                         "60-second summary"
                     );
+                    // One structured line per contract, so operators can tell
+                    // which contract is generating traffic.
+                    for (contract, txs, alerts) in c.take_interval_per_contract(&labels) {
+                        info!(
+                            contract              = %contract,
+                            transactions_interval = txs,
+                            alerts_interval       = alerts,
+                            "60-second summary (per contract)"
+                        );
+                    }
                 }
             });
             if let Err(e) = handle.await {
@@ -251,6 +258,7 @@ async fn poll_cycle(
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
                     counters.interval_transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
+                    counters.record_contract(&contract.label, txs, alerts);
                     // Issue #25: increment Prometheus counters when metrics feature is enabled.
                     #[cfg(feature = "metrics")]
                     {
@@ -748,7 +756,8 @@ mod tests {
             horizon_base_url_override: Some(server.uri()),
         };
 
-        let err = poll_contract(&client, &contract, &mut cursors).await.unwrap_err();
+        let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
+        assert!(
             err.to_string().contains("503"),
             "error must contain HTTP status 503, got: {}", err
         );
@@ -851,6 +860,34 @@ mod tests {
     fn rate_limit_warning_silent_at_or_above_threshold() {
         assert_eq!(rate_limit_warning(10, 100), None);
         assert_eq!(rate_limit_warning(30, 1), None);
+    }
+
+    #[test]
+    fn per_contract_summary_has_an_entry_for_every_configured_contract() {
+        let counters = Counters::default();
+        let labels = vec!["Contract A".to_string(), "Contract B".to_string()];
+
+        counters.record_contract("Contract A", 3, 1);
+        counters.record_contract("Contract A", 2, 0);
+
+        let summary = counters.take_interval_per_contract(&labels);
+        assert_eq!(
+            summary,
+            vec![
+                ("Contract A".to_string(), 5, 1),
+                ("Contract B".to_string(), 0, 0),
+            ]
+        );
+
+        // Interval counters reset after each summary.
+        let summary = counters.take_interval_per_contract(&labels);
+        assert_eq!(
+            summary,
+            vec![
+                ("Contract A".to_string(), 0, 0),
+                ("Contract B".to_string(), 0, 0),
+            ]
+        );
     }
 
     #[test]
