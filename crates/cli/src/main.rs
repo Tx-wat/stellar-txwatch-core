@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
