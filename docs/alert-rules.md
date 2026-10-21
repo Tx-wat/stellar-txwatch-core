@@ -79,19 +79,29 @@ function_names = ["set_admin", "upgrade", "initialize"]
 
 ### `HighFee`
 
-| Field                | Type | Required | Description                           |
-|----------------------|------|----------|---------------------------------------|
-| `threshold_stroops`  | u64  | yes      | Fee threshold in stroops (> 0)        |
+| Field                | Type | Required | Description                                                   |
+|----------------------|------|----------|---------------------------------------------------------------|
+| `threshold_stroops`  | u64  | one of   | Fee threshold in stroops (> 0)                                |
+| `threshold_xlm`      | u64  | one of   | Fee threshold in whole XLM (> 0); converted to stroops at validation time |
 
-Matches when the transaction's total fee exceeds `threshold_stroops`.
-The `fee_charged` field in the webhook payload contains the actual fee paid in stroops.
+Exactly one of `threshold_stroops` or `threshold_xlm` must be set. Setting both is a config error.
+
+Matches when the transaction's total fee exceeds the threshold.
+The `fee_charged_stroops` field in the webhook payload contains the actual fee paid in stroops.
 
 **Note:** Stroops are the smallest unit of XLM (1 XLM = 10,000,000 stroops).
+`threshold_xlm = 1` is equivalent to `threshold_stroops = 10000000`.
 
 ```toml
 [[contracts.rules]]
 type               = "HighFee"
 threshold_stroops  = 100000
+```
+
+```toml
+[[contracts.rules]]
+type           = "HighFee"
+threshold_xlm  = 1
 ```
 
 ## Evaluation order
@@ -101,18 +111,22 @@ All matching rules fire; there is no short-circuit.
 
 ## Webhook payload fields
 
-| Field              | Type        | Always present | Description                              |
-|--------------------|-------------|----------------|------------------------------------------|
-| `label`            | string      | yes            | Contract label from config               |
-| `contract_id`      | string      | yes            | Stellar C-address                        |
-| `network`          | string      | yes            | `mainnet` / `testnet` / `futurenet`      |
-| `rule_triggered`   | string      | yes            | Human-readable rule description          |
-| `transaction_hash` | string      | yes            | Stellar transaction hash                 |
-| `function_name`    | string/null | no             | Soroban function name if available; `null` indicates a non-Soroban transaction |
-| `amount_xlm`       | u64/null    | no             | Transfer amount in XLM if available      |
-| `timestamp`        | i64         | yes            | Unix timestamp (seconds) of transaction  |
-| `horizon_link`     | string      | yes            | Direct link to transaction on Horizon    |
-| `explorer_link`    | string      | yes            | Stellar Expert explorer link for the transaction |
+| Field                 | Type        | Always present | Description                              |
+|-----------------------|-------------|----------------|------------------------------------------|
+| `label`               | string      | yes            | Contract label from config               |
+| `contract_id`         | string      | yes            | Stellar C-address                        |
+| `network`             | string      | yes            | `mainnet` / `testnet` / `futurenet`      |
+| `rule_type`           | string      | yes            | Stable machine-readable rule variant (see [Stable rule_type values](#stable-rule_type-values)) |
+| `rule_triggered`      | string      | yes            | Human-readable rule description          |
+| `transaction_hash`    | string      | yes            | Stellar transaction hash                 |
+| `function_name`       | string/null | no             | First invoked Soroban function name if available; `null` indicates a non-Soroban transaction |
+| `function_names`      | [string]    | yes            | All invoked Soroban function names in the transaction (may contain multiple entries) |
+| `amount_xlm`          | u64/null    | no             | Transfer amount in XLM if available      |
+| `fee_charged_stroops` | u64/null    | no             | Fee charged for the transaction in stroops |
+| `timestamp`           | i64         | yes            | Unix timestamp (seconds) of transaction  |
+| `timestamp_iso`       | string      | yes            | ISO 8601 timestamp of the transaction    |
+| `horizon_link`        | string      | yes            | Direct link to transaction on Horizon    |
+| `explorer_link`       | string      | yes            | Stellar Expert explorer link for the transaction |
 
 > `horizon_link` and `explorer_link` are always present in every alert payload, even when `function_name` is `null` for a non-Soroban transaction.
 

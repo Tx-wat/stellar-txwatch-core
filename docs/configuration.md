@@ -97,6 +97,23 @@ type           = "AdminFunctionCalled"
 function_names = ["set_admin", "upgrade", "initialize"]
 ```
 
+### `HighFee`
+Fires when the transaction's total fee exceeds the threshold. Set exactly one of
+`threshold_stroops` (raw stroops, > 0) or `threshold_xlm` (whole XLM, > 0); setting both is an error.
+`threshold_xlm` is converted to stroops during validation (1 XLM = 10,000,000 stroops).
+
+```toml
+[[contracts.rules]]
+type               = "HighFee"
+threshold_stroops  = 100000
+```
+
+```toml
+[[contracts.rules]]
+type           = "HighFee"
+threshold_xlm  = 1             # equivalent to threshold_stroops = 10000000
+```
+
 ## Webhook payload
 
 ```json
