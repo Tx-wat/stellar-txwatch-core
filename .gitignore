@@ -1,31 +1,45 @@
-# Build output
+# Cargo build output
 /target
+debug/
+*.pdb
 
-# Test snapshots (insta / similar snapshot testing frameworks)
-**/*.snap
-**/*.snap.new
+# Cargo.lock is checked in for binaries; keep it tracked
+# Cargo.lock
+
+# Test snapshots (insta, assert_snapshot, etc.)
+*.snap
+*.snap.new
+**/__snapshots__/
 snapshots/
-**/snapshots/
 
-# Environment and secrets
-.env
-.env.*
-*.secret
-*.pem
-*.key
-
-# Editor and IDE files
-.vscode/
+# IDE and editor files
 .idea/
+.vscode/
 *.swp
 *.swo
 *~
 
-# OS-generated files
+# OS-specific
 .DS_Store
+.AppleDouble
+.LSOverride
 Thumbs.db
+Desktop.ini
 
-# Temporary and scratch files
-*.tmp
-*.bak
+# Coverage reports
+lcov.info
+cov/
+tarpaulin-report.html
+*.profraw
+*.profdata
+
+# Benchmark artifacts
+criterion/
+
+# Local environment / config overrides
+.env
+.env.local
+*.local.toml
+
+# Misc scratch files
 vrickish.md

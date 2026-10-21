@@ -32,6 +32,10 @@ pub struct HorizonTransaction {
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
     pub result_xdr: Option<String>,
+    /// Memo type: `"text"`, `"hash"`, `"id"`, `"return"` or `"none"`.
+    pub memo_type: Option<String>,
+    /// Memo value; absent when `memo_type` is `"none"`.
+    pub memo: Option<String>,
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -55,10 +59,20 @@ pub struct EnrichedTransaction {
     pub amount_stroops: Option<u64>,
     /// Fee charged for this transaction in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// Memo type from Horizon (`"text"`, `"hash"`, `"id"`, `"return"`, `"none"`).
+    pub memo_type: Option<String>,
+    /// Memo value from Horizon, if the transaction carries one.
+    pub memo: Option<String>,
 }
 
 impl EnrichedTransaction {
     /// Build from a raw Horizon record plus optional Soroban operation details.
+    ///
+    /// # Fee precedence
+    /// An explicitly passed `fee_charged_stroops` always takes precedence over
+    /// the record's own `fee_charged`. `tx.fee_charged` is parsed only as a
+    /// fallback when `fee_charged_stroops` is `None`. The poller passes `None`
+    /// (the only call site outside tests), so the Horizon record's value is used.
     pub fn from_horizon(
         tx: HorizonTransaction,
         function_names: Vec<String>,
@@ -84,6 +98,8 @@ impl EnrichedTransaction {
                     .as_deref()
                     .and_then(|s| s.parse::<u64>().ok())
             }),
+            memo_type:     tx.memo_type,
+            memo:          tx.memo,
         })
     }
 }
@@ -109,6 +125,10 @@ pub struct AlertPayload {
     pub amount_xlm: Option<u64>,
     /// Fee charged in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// Memo type of the transaction (`"text"`, `"hash"`, `"id"`, `"return"`, `"none"`).
+    pub memo_type: Option<String>,
+    /// Memo value of the transaction, if any.
+    pub memo: Option<String>,
     /// Unix timestamp (seconds).
     pub timestamp: i64,
     /// ISO 8601 timestamp string.
@@ -151,6 +171,8 @@ pub fn evaluate(
                 function_names: tx.function_names.clone(),
                 amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
                 fee_charged_stroops: tx.fee_charged_stroops,
+                memo_type: tx.memo_type.clone(),
+                memo: tx.memo.clone(),
                 timestamp,
                 timestamp_iso: timestamp_iso.clone(),
                 horizon_link: horizon_link.clone(),
@@ -188,6 +210,9 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
                 .unwrap_or(false)
         }
 
+        // Exact, case-sensitive match: Soroban function names are case-sensitive
+        // symbols, so `Withdraw` and `withdraw` are different functions.
+        // (`AdminFunctionCalled` below is deliberately case-insensitive.)
         AlertRule::FunctionCalled { function_name } => tx
             .function_names
             .iter()
@@ -240,6 +265,8 @@ mod tests {
             function_names: function_names.iter().map(|s| s.to_string()).collect(),
             amount_stroops,
             fee_charged_stroops: None,
+            memo_type: None,
+            memo: None,
         }
     }
 
@@ -378,6 +405,40 @@ mod tests {
     }
 
     #[test]
+    fn function_called_is_case_sensitive() {
+        let tx = make_tx(true, &["withdraw"], None);
+        let payloads = run(
+            &[AlertRule::FunctionCalled {
+                function_name: "Withdraw".into(),
+            }],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "FunctionCalled must not match a different casing"
+        );
+    }
+
+    #[test]
+    fn explicit_fee_takes_precedence_over_record_fee() {
+        let raw = |fee: Option<&str>| HorizonTransaction {
+            hash: "h".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: fee.map(Into::into),
+            envelope_xdr: None,
+            result_xdr: None,
+        };
+
+        let explicit = EnrichedTransaction::from_horizon(raw(Some("100")), vec![], None, Some(999)).unwrap();
+        assert_eq!(explicit.fee_charged_stroops, Some(999));
+
+        let fallback = EnrichedTransaction::from_horizon(raw(Some("100")), vec![], None, None).unwrap();
+        assert_eq!(fallback.fee_charged_stroops, Some(100));
+    }
+
+    #[test]
     fn admin_function_called_fires_on_any_match() {
         let tx = make_tx(true, &["upgrade"], None);
         let payloads = run(
@@ -453,6 +514,8 @@ mod tests {
                 function_names: vec![],
                 amount_stroops: None,
                 fee_charged_stroops: None,
+                memo_type: None,
+                memo: None,
             };
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -531,9 +594,46 @@ mod tests {
             fee_charged: Some("100".into()),
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
+    }
+
+    #[test]
+    fn from_horizon_maps_memo_fields() {
+        let raw = HorizonTransaction {
+            hash: "h2".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "2".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            memo_type: Some("text".into()),
+            memo: Some("order-1234".into()),
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.memo_type.as_deref(), Some("text"));
+        assert_eq!(enriched.memo.as_deref(), Some("order-1234"));
+
+        let payloads = evaluate(
+            "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "testnet", "https://horizon-testnet.stellar.org",
+            "https://stellar.expert/explorer/testnet",
+            &[AlertRule::AnyTransaction], &enriched,
+        );
+        assert_eq!(payloads[0].memo_type.as_deref(), Some("text"));
+        assert_eq!(payloads[0].memo.as_deref(), Some("order-1234"));
+    }
+
+    #[test]
+    fn horizon_transaction_memo_fields_default_to_none_when_absent() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1"}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert!(tx.memo_type.is_none());
+        assert!(tx.memo.is_none());
     }
 
     /// Issue #65: from_horizon must return Err when created_at is not a valid RFC 3339 timestamp.
@@ -621,6 +721,8 @@ mod tests {
             function_names: vec!["transfer".into()],
             amount_xlm: Some(15000),
             fee_charged_stroops: Some(50000),
+            memo_type: Some("text".into()),
+            memo: Some("order-1234".into()),
             timestamp: 1705316096,
             timestamp_iso: "2024-01-15T12:00:00Z".into(),
             horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),

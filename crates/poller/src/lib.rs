@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::Ordering,
     sync::Arc,
     time::Duration,
 };
@@ -75,13 +75,8 @@ struct OpsEmbedded {
 
 // ── Summary counters ──────────────────────────────────────────────────────────
 
-#[derive(Default)]
-struct Counters {
-    transactions: AtomicU64,
-    alerts: AtomicU64,
-    interval_transactions: AtomicU64,
-    interval_alerts: AtomicU64,
-}
+mod counters;
+pub(crate) use counters::Counters;
 
 // ── Pagination helper ─────────────────────────────────────────────────────────
 
@@ -174,7 +169,8 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
 }
 
 /// Run the polling loop forever. Each contract is polled concurrently via a
-/// tokio JoinSet; one slow or failing contract never blocks the others.
+/// tokio JoinSet, capped at `MAX_CONCURRENT_POLLS` in flight by a semaphore;
+/// one slow or failing contract never blocks the others.
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
 /// alerts fired.
 pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
@@ -248,19 +244,28 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
         "TxWatch polling engine started"
     );
 
-    if cfg.poll_interval_seconds < 10 && cfg.contracts.len() > 5 {
+    if let Some(requests_per_minute) = rate_limit_warning(cfg.poll_interval_seconds, cfg.contracts.len()) {
         warn!(
             poll_interval_seconds = cfg.poll_interval_seconds,
             contracts = cfg.contracts.len(),
-            "polling interval is very short with many contracts — Horizon rate limits may apply; \
-             consider poll_interval_seconds >= 10"
+            estimated_requests_per_minute = requests_per_minute,
+            "polling interval is below {}s: estimated {} requests/minute ({} contract(s) x 60 / {}s). \
+             Public Horizon enforces a per-IP request quota and answers with 429 Too Many Requests \
+             when it is exceeded; consider poll_interval_seconds >= {}",
+            MIN_RECOMMENDED_POLL_INTERVAL_SECS,
+            requests_per_minute,
+            cfg.contracts.len(),
+            cfg.poll_interval_seconds,
+            MIN_RECOMMENDED_POLL_INTERVAL_SECS,
         );
     }
 
     let counters_for_summary = Arc::clone(&counters);
+    let labels_for_summary: Vec<String> = cfg.contracts.iter().map(|c| c.label.clone()).collect();
     let _summary_guard = tokio::spawn(async move {
         loop {
             let c = Arc::clone(&counters_for_summary);
+            let labels = labels_for_summary.clone();
             let handle = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(summary_every).await;
@@ -274,6 +279,16 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
                         alerts_interval       = interval_alerts,
                         "60-second summary"
                     );
+                    // One structured line per contract, so operators can tell
+                    // which contract is generating traffic.
+                    for (contract, txs, alerts) in c.take_interval_per_contract(&labels) {
+                        info!(
+                            contract              = %contract,
+                            transactions_interval = txs,
+                            alerts_interval       = alerts,
+                            "60-second summary (per contract)"
+                        );
+                    }
                 }
             });
             if let Err(e) = handle.await {
@@ -283,13 +298,52 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     });
 
     loop {
-        for contract in &cfg.contracts {
-            match poll_contract(&client, contract, &mut cursors, dry_run).await {
+        poll_cycle(&client, &cfg.contracts, &mut cursors, dry_run, &counters, MAX_CONCURRENT_POLLS).await;
+        tokio::time::sleep(interval).await;
+    }
+
+    info!("TxWatch polling engine stopped cleanly");
+    Ok(())
+}
+
+/// Maximum number of contracts polled at the same time in one cycle. Caps open
+/// connections and file descriptors when many contracts are configured.
+const MAX_CONCURRENT_POLLS: usize = 20;
+
+/// Poll every contract once, concurrently via a `JoinSet`, with at most
+/// `max_concurrent` polls in flight (enforced by a `Semaphore`). One slow or
+/// failing contract never blocks the others. Cursors are updated after all
+/// polls in the cycle have finished.
+async fn poll_cycle(
+    client:         &Client,
+    contracts:      &[WatchedContract],
+    cursors:        &mut HashMap<String, String>,
+    dry_run:        bool,
+    counters:       &Arc<Counters>,
+    max_concurrent: usize,
+) {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
+    let mut set = tokio::task::JoinSet::new();
+
+    for contract in contracts {
+        let client    = client.clone();
+        let contract  = contract.clone();
+        let counters  = Arc::clone(counters);
+        let semaphore = Arc::clone(&semaphore);
+        let cursor    = cursors.get(&contract.contract_id).cloned();
+        set.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            let mut local: HashMap<String, String> = HashMap::new();
+            if let Some(c) = cursor {
+                local.insert(contract.contract_id.clone(), c);
+            }
+            match poll_contract(&client, &contract, &mut local, dry_run).await {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
                     counters.interval_transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
+                    counters.record_contract(&contract.label, txs, alerts);
                     // Issue #25: increment Prometheus counters when metrics feature is enabled.
                     #[cfg(feature = "metrics")]
                     {
@@ -299,12 +353,53 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
                 }
                 Err(e) => error!(error = %e, "contract polling task failed"),
             }
-        }
-        tokio::time::sleep(interval).await;
+            local
+        });
     }
 
-    info!("TxWatch polling engine stopped cleanly");
-    Ok(())
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(local) => cursors.extend(local),
+            Err(e) => error!(error = ?e, "contract polling task panicked"),
+        }
+    }
+}
+
+/// Spawn the periodic summary logger. It holds only a `Weak<Counters>`, so once
+/// the polling loop drops its last `Arc<Counters>` the task exits cleanly
+/// instead of keeping the counters alive. A panic inside the logger is logged
+/// and the logger is restarted.
+fn spawn_summary_logger(
+    counters:    &Arc<Counters>,
+    n_contracts: usize,
+    every:       Duration,
+) -> tokio::task::JoinHandle<()> {
+    let weak = Arc::downgrade(counters);
+    tokio::spawn(async move {
+        loop {
+            let weak = weak.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(every).await;
+                    let Some(c) = weak.upgrade() else { break };
+                    let interval_txs    = c.interval_transactions.swap(0, Ordering::Relaxed);
+                    let interval_alerts = c.interval_alerts.swap(0, Ordering::Relaxed);
+                    info!(
+                        contracts             = n_contracts,
+                        transactions_total    = c.transactions.load(Ordering::Relaxed),
+                        alerts_total          = c.alerts.load(Ordering::Relaxed),
+                        transactions_interval = interval_txs,
+                        alerts_interval       = interval_alerts,
+                        "60-second summary"
+                    );
+                }
+            });
+            match handle.await {
+                Ok(()) => break,
+                Err(e) => error!(error = ?e, "summary logger panicked — restarting"),
+            }
+        }
+    })
 }
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
@@ -335,37 +430,50 @@ async fn poll_contract(
     // `canonical_base` is always the production Horizon URL and is used only for
     // building horizon_link in payloads, so links always point to the real network.
     let poll_base = contract
-        .horizon_base_url_override
+        .test_horizon_base_url
         .as_deref()
         .unwrap_or_else(|| contract.network.horizon_base_url());
     let canonical_base = contract.network.horizon_base_url();
 
-    // Issue #23: use join=operations to fetch operations inline, eliminating
-    // one HTTP request per transaction.
-    let first_url = format!(
-        "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations",
-        poll_base, contract.contract_id, cursor
-    );
+    // Collect all pages of transactions.
+    let mut all_records: Vec<HorizonTransactionWithOps> = Vec::new();
+    let mut page_cursor = cursor.clone();
 
-    // Fetch the first page manually so we can handle Horizon 429 with a back-off
-    // before handing off to the generic paginate() helper for subsequent pages.
-    let first_response = client
-        .get(&first_url)
-        .send()
-        .await
-        .with_context(|| format!("GET {} failed", first_url))?;
+    loop {
+        // Issue #23: use join=operations to fetch operations inline, eliminating
+        // one HTTP request per transaction.
+        let url = format!(
+            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations",
+            poll_base, contract.contract_id, page_cursor
+        );
 
-    if first_response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = first_response
-            .headers()
-            .get("Retry-After")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5);
-        warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
-        tokio::time::sleep(Duration::from_secs(retry_after)).await;
-        return Ok((0, 0));
-    }
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {} failed", url))?;
+
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5);
+            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
+            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+            return Ok((0, 0));
+        }
+
+        let page: HorizonPage = response
+            .json()
+            .await
+            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+
+        let records = page._embedded.records;
+        if records.is_empty() {
+            break;
+        }
 
     if !first_response.status().is_success() {
         let status = first_response.status();
@@ -545,6 +653,18 @@ async fn fetch_soroban_details(
     Ok(extract_soroban_details(page._embedded.records))
 }
 
+/// Polling intervals below this many seconds trigger a startup rate-limit warning.
+const MIN_RECOMMENDED_POLL_INTERVAL_SECS: u64 = 10;
+
+/// Returns the estimated Horizon requests per minute when the configured interval is
+/// below [`MIN_RECOMMENDED_POLL_INTERVAL_SECS`] (for any number of contracts), else `None`.
+fn rate_limit_warning(poll_interval_seconds: u64, n_contracts: usize) -> Option<u64> {
+    if poll_interval_seconds >= MIN_RECOMMENDED_POLL_INTERVAL_SECS || poll_interval_seconds == 0 {
+        return None;
+    }
+    Some(n_contracts as u64 * 60 / poll_interval_seconds)
+}
+
 // ── Startup log field helpers (for testing) ──────────────────────────────────
 
 #[cfg(test)]
@@ -635,7 +755,7 @@ mod tests {
             rules:       vec![AlertRule::FunctionCalled { function_name: "withdraw".into() }],
             webhook_url: format!("{}/hook", receiver.uri()),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            test_horizon_base_url: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
@@ -747,7 +867,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            test_horizon_base_url: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
@@ -777,7 +897,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            test_horizon_base_url: Some(server.uri()),
         };
 
         let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
@@ -808,7 +928,7 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            test_horizon_base_url: Some(server.uri()),
         };
 
         let result = poll_contract(&client, &contract, &mut cursors, false).await;
@@ -817,6 +937,100 @@ mod tests {
             cursors.get(contract_id).map(String::as_str),
             Some("now"),
             "cursor must not advance when the transactions fetch fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_contract_skips_tx_with_enrichment_error_and_advances_cursor() {
+        let server = MockServer::start().await;
+        let body = serde_json::json!({
+            "_embedded": { "records": [
+                {
+                    "hash": "bad_tx",
+                    "created_at": "not-a-timestamp",
+                    "successful": true,
+                    "paging_token": "1",
+                    "operations": [{ "type": "invoke_host_function", "function": "transfer" }]
+                },
+                {
+                    "hash": "good_tx",
+                    "created_at": "2024-06-01T10:00:00Z",
+                    "successful": true,
+                    "paging_token": "2",
+                    "operations": [{ "type": "invoke_host_function", "function": "transfer" }]
+                }
+            ] }
+        });
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let client      = Client::new();
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "now".to_string());
+
+        let contract = WatchedContract {
+            label:       "test".into(),
+            contract_id: contract_id.into(),
+            network:     Network::Testnet,
+            rules:       vec![AlertRule::AnyTransaction],
+            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_secret: None,
+            horizon_base_url_override: Some(server.uri()),
+        };
+
+        let (tx_count, _alerts) = poll_contract(&client, &contract, &mut cursors, true)
+            .await
+            .expect("poll_contract should succeed");
+
+        assert_eq!(
+            cursors.get(contract_id).map(String::as_str),
+            Some("2"),
+            "cursor must advance to the second transaction's paging_token"
+        );
+        assert_eq!(tx_count, 1, "only the valid transaction counts");
+    }
+
+    #[test]
+    fn rate_limit_warning_fires_below_threshold_for_single_contract() {
+        assert_eq!(rate_limit_warning(5, 1), Some(12));
+        assert_eq!(rate_limit_warning(5, 6), Some(72));
+    }
+
+    #[test]
+    fn rate_limit_warning_silent_at_or_above_threshold() {
+        assert_eq!(rate_limit_warning(10, 100), None);
+        assert_eq!(rate_limit_warning(30, 1), None);
+    }
+
+    #[test]
+    fn per_contract_summary_has_an_entry_for_every_configured_contract() {
+        let counters = Counters::default();
+        let labels = vec!["Contract A".to_string(), "Contract B".to_string()];
+
+        counters.record_contract("Contract A", 3, 1);
+        counters.record_contract("Contract A", 2, 0);
+
+        let summary = counters.take_interval_per_contract(&labels);
+        assert_eq!(
+            summary,
+            vec![
+                ("Contract A".to_string(), 5, 1),
+                ("Contract B".to_string(), 0, 0),
+            ]
+        );
+
+        // Interval counters reset after each summary.
+        let summary = counters.take_interval_per_contract(&labels);
+        assert_eq!(
+            summary,
+            vec![
+                ("Contract A".to_string(), 0, 0),
+                ("Contract B".to_string(), 0, 0),
+            ]
         );
     }
 
@@ -835,7 +1049,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/a".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    test_horizon_base_url: None,
                 },
                 WatchedContract {
                     label:       "Contract B".into(),
@@ -844,7 +1058,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/b".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    test_horizon_base_url: None,
                 },
                 WatchedContract {
                     label:       "Contract C".into(),
@@ -853,7 +1067,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/c".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    test_horizon_base_url: None,
                 },
             ],
             cursor_file: None,
@@ -912,7 +1126,7 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: format!("{}/hooks", server.uri()),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            test_horizon_base_url: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
