@@ -89,7 +89,8 @@ pub async fn run(cfg: AppConfig) -> Result<()> {
 }
 
 /// Run the polling loop forever. Each contract is polled concurrently via a
-/// tokio JoinSet; one slow or failing contract never blocks the others.
+/// tokio JoinSet, capped at `MAX_CONCURRENT_POLLS` in flight by a semaphore;
+/// one slow or failing contract never blocks the others.
 /// Logs a summary every 60 seconds: contracts watched, transactions processed,
 /// alerts fired.
 pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
@@ -205,8 +206,46 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
     });
 
     loop {
-        for contract in &cfg.contracts {
-            match poll_contract(&client, contract, &mut cursors, dry_run).await {
+        poll_cycle(&client, &cfg.contracts, &mut cursors, dry_run, &counters, MAX_CONCURRENT_POLLS).await;
+        tokio::time::sleep(interval).await;
+    }
+
+    info!("TxWatch polling engine stopped cleanly");
+    Ok(())
+}
+
+/// Maximum number of contracts polled at the same time in one cycle. Caps open
+/// connections and file descriptors when many contracts are configured.
+const MAX_CONCURRENT_POLLS: usize = 20;
+
+/// Poll every contract once, concurrently via a `JoinSet`, with at most
+/// `max_concurrent` polls in flight (enforced by a `Semaphore`). One slow or
+/// failing contract never blocks the others. Cursors are updated after all
+/// polls in the cycle have finished.
+async fn poll_cycle(
+    client:         &Client,
+    contracts:      &[WatchedContract],
+    cursors:        &mut HashMap<String, String>,
+    dry_run:        bool,
+    counters:       &Arc<Counters>,
+    max_concurrent: usize,
+) {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
+    let mut set = tokio::task::JoinSet::new();
+
+    for contract in contracts {
+        let client    = client.clone();
+        let contract  = contract.clone();
+        let counters  = Arc::clone(counters);
+        let semaphore = Arc::clone(&semaphore);
+        let cursor    = cursors.get(&contract.contract_id).cloned();
+        set.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            let mut local: HashMap<String, String> = HashMap::new();
+            if let Some(c) = cursor {
+                local.insert(contract.contract_id.clone(), c);
+            }
+            match poll_contract(&client, &contract, &mut local, dry_run).await {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
@@ -221,12 +260,16 @@ pub async fn run_with(cfg: AppConfig, dry_run: bool) -> Result<()> {
                 }
                 Err(e) => error!(error = %e, "contract polling task failed"),
             }
-        }
-        tokio::time::sleep(interval).await;
+            local
+        });
     }
 
-    info!("TxWatch polling engine stopped cleanly");
-    Ok(())
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(local) => cursors.extend(local),
+            Err(e) => error!(error = ?e, "contract polling task panicked"),
+        }
+    }
 }
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
@@ -296,8 +339,6 @@ async fn poll_contract(
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
 
         let records = page._embedded.records;
         if records.is_empty() {

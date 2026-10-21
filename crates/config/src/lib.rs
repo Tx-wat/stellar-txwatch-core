@@ -353,6 +353,7 @@ impl AppConfig {
             if let Some(secret) = &contract.webhook_secret {
                 contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
             }
+            contract.webhook_url = resolve_env_interpolation(&contract.webhook_url)?;
         }
         Ok(())
     }
