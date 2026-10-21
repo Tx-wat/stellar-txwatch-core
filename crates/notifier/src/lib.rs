@@ -16,6 +16,9 @@ use txwatch_rules::AlertPayload;
 
 const MAX_RETRIES: u32 = 3;
 
+/// Backoff base for webhook retries: attempt `n` waits `RETRY_BASE_DELAY * 2^n`.
+const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+
 /// Structured result returned by a successful `send_webhook` call.
 #[derive(Debug, PartialEq)]
 pub struct DeliveryResult {
@@ -380,6 +383,8 @@ mod tests {
         assert!(!requests[0].headers.contains_key("x-txwatch-signature"));
     }
 
+    /// Issue #307: a persistent 500 must produce exactly MAX_RETRIES requests — no more, no less.
+    /// A zero backoff base keeps the test fast without changing the retry count.
     #[tokio::test]
     async fn fails_after_max_retries() {
         let server = MockServer::start().await;
@@ -391,7 +396,9 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook(&client, &url, &sample_payload(), None).await;
+        let result = send_webhook_with_backoff(
+            &client, &url, &sample_payload(), None, Duration::ZERO,
+        ).await;
         assert!(result.is_err());
     }
 

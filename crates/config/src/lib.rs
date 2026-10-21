@@ -86,6 +86,8 @@ pub enum AlertRule {
         #[serde(default)]
         threshold_xlm: Option<u64>,
     },
+    /// Fires when the transaction's source account equals `source_account`.
+    SourceAccountMatch { source_account: String },
 }
 
 impl AlertRule {
@@ -161,6 +163,17 @@ impl AlertRule {
                     _ => {}
                 }
             }
+            AlertRule::SourceAccountMatch { source_account } => {
+                // Stellar account (G-) addresses are 56 base32 characters.
+                if source_account.len() != 56 || !source_account.starts_with('G') {
+                    bail!(
+                        "contract '{}': SourceAccountMatch source_account '{}' is not a valid \
+                         Stellar account address (must start with 'G' and be 56 characters)",
+                        contract_label,
+                        source_account
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -187,6 +200,9 @@ impl AlertRule {
                 } else {
                     format!("HighFee(>={} stroops)", threshold_stroops)
                 }
+            }
+            AlertRule::SourceAccountMatch { source_account } => {
+                format!("SourceAccountMatch({})", source_account)
             }
         }
     }
@@ -263,6 +279,25 @@ pub struct WatchedContract {
     /// set programmatically in tests. Production code must leave this `None`.
     #[serde(skip, default)]
     pub test_horizon_base_url: Option<String>,
+}
+
+/// Maximum length, in characters, of a tag key or value.
+const MAX_TAG_LEN: usize = 64;
+
+fn validate_tag_part(contract_label: &str, kind: &str, part: &str) -> Result<()> {
+    if part.trim().is_empty() {
+        bail!("contract '{}': tag {} must not be empty", contract_label, kind);
+    }
+    if part.chars().count() > MAX_TAG_LEN {
+        bail!(
+            "contract '{}': tag {} '{}' must be at most {} characters",
+            contract_label,
+            kind,
+            part,
+            MAX_TAG_LEN
+        );
+    }
+    Ok(())
 }
 
 impl WatchedContract {
@@ -955,6 +990,114 @@ mod tests {
         let mut c = valid_contract();
         c.rules = vec![AlertRule::HighFee { threshold_stroops: 0, threshold_xlm: None }];
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn source_account_match_accepts_valid_g_address() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "G".to_string() + &"A".repeat(55),
+        }];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn source_account_match_rejects_wrong_length() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "G".to_string() + &"A".repeat(54),
+        }];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("SourceAccountMatch"));
+    }
+
+    #[test]
+    fn source_account_match_rejects_wrong_prefix() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "C".to_string() + &"A".repeat(55),
+        }];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn tags_accept_valid_key_values() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([
+            ("team".to_string(), "defi".to_string()),
+            ("severity".to_string(), "high".to_string()),
+        ]));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn tags_accept_exactly_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("k".repeat(64), "v".repeat(64))]));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn tags_reject_empty_key() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("".to_string(), "defi".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag key must not be empty"));
+    }
+
+    #[test]
+    fn tags_reject_blank_value() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("team".to_string(), "   ".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag value must not be empty"));
+    }
+
+    #[test]
+    fn tags_reject_key_over_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("k".repeat(65), "v".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag key"));
+        assert!(err.to_string().contains("at most 64 characters"));
+    }
+
+    #[test]
+    fn tags_reject_value_over_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("team".to_string(), "v".repeat(65))]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag value"));
+    }
+
+    #[test]
+    fn tags_deserialise_from_toml() {
+        let raw = r#"
+            label = "My Contract"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            tags = { team = "defi", env = "prod", severity = "high" }
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let c: WatchedContract = toml::from_str(raw).unwrap();
+        let tags = c.tags.unwrap();
+        assert_eq!(tags.get("team").map(String::as_str), Some("defi"));
+        assert_eq!(tags.len(), 3);
+    }
+
+    #[test]
+    fn source_account_match_deserialises_from_toml() {
+        let raw = r#"
+            type = "SourceAccountMatch"
+            source_account = "GABC"
+        "#;
+        let rule: AlertRule = toml::from_str(raw).unwrap();
+        assert!(matches!(
+            rule,
+            AlertRule::SourceAccountMatch { ref source_account } if source_account == "GABC"
+        ));
     }
 
     #[test]

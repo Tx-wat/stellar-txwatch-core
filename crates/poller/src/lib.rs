@@ -632,6 +632,7 @@ async fn poll_contract(
             canonical_base,
             contract.network.explorer_base_url(),
             &contract.rules,
+            contract.tags.as_ref(),
             &enriched,
         );
 

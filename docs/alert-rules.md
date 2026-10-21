@@ -176,6 +176,7 @@ The webhook payload includes two rule-related fields:
 | `FunctionCalled` | `"FunctionCalled"` |
 | `AdminFunctionCalled` | `"AdminFunctionCalled"` |
 | `HighFee` | `"HighFee"` |
+| `SourceAccountMatch` | `"SourceAccountMatch"` |
 
 ## Adding a new rule type
 

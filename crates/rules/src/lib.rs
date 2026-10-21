@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use txwatch_config::AlertRule;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -230,6 +231,7 @@ pub fn evaluate(
     horizon_base: &str,
     explorer_base: &str,
     rules: &[AlertRule],
+    tags: Option<&HashMap<String, String>>,
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
     let horizon_base  = horizon_base.trim_end_matches('/');
@@ -320,10 +322,35 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
             .fee_charged_stroops
             .map(|f| f >= *threshold_stroops)
             .unwrap_or(false),
+
+        AlertRule::SourceAccountMatch { source_account } => {
+            tx.source_account.as_deref() == Some(source_account.as_str())
+        }
     })
 }
 
 impl AlertPayload {
+    /// Build the webhook payload for `rule` matching `tx` on the contract described by `ctx`.
+    pub fn new(ctx: &PayloadContext<'_>, tx: &EnrichedTransaction, rule: &AlertRule) -> Self {
+        Self {
+            label: ctx.label.to_string(),
+            contract_id: ctx.contract_id.to_string(),
+            network: ctx.network.to_string(),
+            rule_type: rule_type(rule),
+            rule_triggered: rule_label(rule),
+            transaction_hash: tx.hash.clone(),
+            function_name: tx.function_names.first().cloned(),
+            function_names: tx.function_names.clone(),
+            amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+            fee_charged_stroops: tx.fee_charged_stroops,
+            timestamp: tx.timestamp.timestamp(),
+            timestamp_iso: tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            horizon_link: format!("{}/transactions/{}", ctx.horizon_base, tx.hash),
+            explorer_link: format!("{}/tx/{}", ctx.explorer_base, tx.hash),
+            tags: ctx.tags.cloned(),
+        }
+    }
+
     /// Builder helper to override the label (used by test-webhook).
     pub fn with_label(mut self, label: String) -> Self {
         self.label = label;
@@ -368,6 +395,7 @@ mod tests {
             "https://horizon-testnet.stellar.org",
             "https://stellar.expert/explorer/testnet",
             rules,
+            None,
             tx,
         )
     }
@@ -386,6 +414,71 @@ mod tests {
         let payloads = run(&[AlertRule::AnyTransaction], &tx);
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].rule_triggered, "AnyTransaction");
+    }
+
+    #[test]
+    fn alert_payload_new_populates_fields_from_context_and_transaction() {
+        let ctx = PayloadContext {
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: "https://stellar.expert/explorer/testnet",
+            tags: None,
+        };
+        let mut tx = make_tx(true, &["transfer", "withdraw"], Some(15_000 * 10_000_000));
+        tx.fee_charged_stroops = Some(500);
+
+        let payload = AlertPayload::new(&ctx, &tx, &AlertRule::AnyTransaction);
+
+        assert_eq!(payload.label, "Label");
+        assert_eq!(payload.network, "testnet");
+        assert_eq!(payload.rule_type, "AnyTransaction");
+        assert_eq!(payload.rule_triggered, "AnyTransaction");
+        assert_eq!(payload.transaction_hash, "abc123");
+        assert_eq!(payload.function_name.as_deref(), Some("transfer"));
+        assert_eq!(payload.function_names, vec!["transfer", "withdraw"]);
+        assert_eq!(payload.amount_xlm, Some(15_000));
+        assert_eq!(payload.fee_charged_stroops, Some(500));
+        assert_eq!(payload.timestamp_iso, "2024-01-15T12:00:00Z");
+        assert_eq!(
+            payload.horizon_link,
+            "https://horizon-testnet.stellar.org/transactions/abc123"
+        );
+        assert_eq!(
+            payload.explorer_link,
+            "https://stellar.expert/explorer/testnet/tx/abc123"
+        );
+    }
+
+    #[test]
+    fn evaluate_forwards_contract_tags_to_every_payload() {
+        let tags = HashMap::from([
+            ("team".to_string(), "defi".to_string()),
+            ("severity".to_string(), "high".to_string()),
+        ]);
+        let tx = make_tx(false, &[], None);
+        let payloads = evaluate(
+            "Label",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "testnet",
+            "https://horizon-testnet.stellar.org",
+            "https://stellar.expert/explorer/testnet",
+            &[AlertRule::AnyTransaction, AlertRule::TransactionFailed],
+            Some(&tags),
+            &tx,
+        );
+        assert_eq!(payloads.len(), 2);
+        for payload in &payloads {
+            assert_eq!(payload.tags.as_ref(), Some(&tags));
+        }
+    }
+
+    #[test]
+    fn evaluate_without_tags_yields_none() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert_eq!(payloads[0].tags, None);
     }
 
     #[test]
@@ -709,7 +802,7 @@ mod tests {
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 "testnet", horizon_base, explorer_base,
-                &[AlertRule::AnyTransaction], &tx,
+                &[AlertRule::AnyTransaction], None, &tx,
             );
             payloads.remove(0)
         }
@@ -771,6 +864,61 @@ mod tests {
             &tx,
         );
         assert!(payloads.is_empty());
+    }
+
+    // ── SourceAccountMatch (issue #303) ───────────────────────────────────────
+
+    const SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const OTHER: &str = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    fn source_rule(source_account: &str) -> AlertRule {
+        AlertRule::SourceAccountMatch {
+            source_account: source_account.into(),
+        }
+    }
+
+    #[test]
+    fn source_account_match_fires_on_exact_match() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some(SOURCE.into());
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_type, "SourceAccountMatch");
+        assert_eq!(
+            payloads[0].rule_triggered,
+            format!("SourceAccountMatch({})", SOURCE)
+        );
+    }
+
+    #[test]
+    fn source_account_match_does_not_fire_on_different_account() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some(OTHER.into());
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn source_account_match_does_not_fire_when_source_account_is_missing() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn from_horizon_carries_source_account() {
+        let raw = HorizonTransaction {
+            hash: "h2".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            envelope_xdr: None,
+            result_xdr: None,
+            source_account: Some(SOURCE.into()),
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.source_account.as_deref(), Some(SOURCE));
     }
 
     #[test]
