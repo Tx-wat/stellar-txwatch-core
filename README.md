@@ -189,6 +189,8 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "function_names":   ["transfer"],
   "amount_xlm":       15000,
   "fee_charged_stroops": 50000,
+  "memo_type":        "text",
+  "memo":             "order-1234",
   "timestamp":        1705316096,
   "timestamp_iso":    "2024-01-15T12:00:00Z",
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
@@ -207,6 +209,8 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
 - `function_names` — all invoked Soroban function names in the transaction (may contain multiple entries for multi-op transactions).
+- `memo_type` — the transaction memo type from Horizon (`"text"`, `"hash"`, `"id"`, `"return"` or `"none"`), or `null` if Horizon did not return one.
+- `memo` — the transaction memo value (e.g. an order ID or payment reference), or `null` when the transaction has no memo.
 - `horizon_link` — direct Horizon REST API URL for the transaction (e.g. `https://horizon-testnet.stellar.org/transactions/<hash>`); useful for fetching raw XDR or operation details programmatically.
 - `explorer_link` — Stellar Expert web explorer URL for the transaction (e.g. `https://stellar.expert/explorer/testnet/tx/<hash>`); useful for human-readable inspection in a browser.
 
