@@ -32,8 +32,14 @@ pub fn build_client() -> Result<Client> {
         .map_err(|e| anyhow!("failed to build HTTP client: {}", e))
 }
 
+/// Delay to wait after the failed `attempt` (1-based) before the next try:
+/// 2 s after the first failure, 4 s after the second.
+fn backoff_delay(attempt: u32) -> Duration {
+    Duration::from_secs(2u64.pow(attempt))
+}
+
 /// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
-/// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
+/// exponential backoff (2 s → 4 s between attempts). Logs each attempt.
 /// If `secret` is Some, adds an `X-TxWatch-Secret` header to every request.
 ///
 /// Delivery semantics: HTTP 2xx = success. The response body is logged at
@@ -122,7 +128,7 @@ pub async fn send_webhook(
 
         if attempt < MAX_RETRIES {
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))) => {}
+                _ = tokio::time::sleep(backoff_delay(attempt)) => {}
                 _ = &mut shutdown => {
                     return Err(anyhow!("webhook retry aborted: shutdown signal received"));
                 }
@@ -359,6 +365,12 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let sig = requests[0].headers.get("x-txwatch-signature").unwrap();
         assert_eq!(sig, &expected);
+    }
+
+    #[test]
+    fn backoff_delay_doubles_from_two_seconds() {
+        assert_eq!(backoff_delay(1), Duration::from_secs(2));
+        assert_eq!(backoff_delay(2), Duration::from_secs(4));
     }
 
     #[tokio::test]
