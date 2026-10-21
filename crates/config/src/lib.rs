@@ -178,6 +178,46 @@ impl AlertRule {
         }
     }}
 
+// ── TlsConfig ─────────────────────────────────────────────────────────────────
+
+/// Optional mutual-TLS settings for webhook delivery to one contract.
+/// All paths point to PEM files and are checked for existence at validation time.
+/// The private key contents are never logged.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM client certificate presented to the webhook receiver.
+    pub client_cert: String,
+    /// PEM private key (PKCS#8) matching `client_cert`.
+    pub client_key: String,
+    /// Optional PEM CA bundle used to validate the webhook server's certificate.
+    #[serde(default)]
+    pub ca_cert: Option<String>,
+}
+
+impl TlsConfig {
+    pub fn validate(&self, contract_label: &str) -> Result<()> {
+        let mut paths = vec![("client_cert", &self.client_cert), ("client_key", &self.client_key)];
+        if let Some(ca) = &self.ca_cert {
+            paths.push(("ca_cert", ca));
+        }
+        for (field, path) in paths {
+            if path.trim().is_empty() {
+                bail!("contract '{}': tls.{} must not be empty", contract_label, field);
+            }
+            if !Path::new(path).is_file() {
+                bail!(
+                    "contract '{}': tls.{} file '{}' does not exist or is not a file",
+                    contract_label,
+                    field,
+                    path
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,6 +231,8 @@ pub struct WatchedContract {
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
     pub webhook_secret: Option<String>,
+    /// Optional mutual-TLS settings for webhook delivery (`[contracts.tls]`).
+    pub tls: Option<TlsConfig>,
     /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
     #[serde(skip, default)]
     pub horizon_base_url_override: Option<String>,
@@ -242,6 +284,10 @@ impl WatchedContract {
         let label = self.label.clone();
         for rule in &mut self.rules {
             rule.validate(&label)?;
+        }
+
+        if let Some(tls) = &self.tls {
+            tls.validate(&self.label)?;
         }
 
         Ok(())
@@ -378,6 +424,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
+            tls: None,
             horizon_base_url_override: None,
         }
     }
@@ -448,6 +495,85 @@ mod tests {
     fn accepts_valid_https_webhook_url_with_path_and_query() {
         let mut c = valid_contract();
         c.webhook_url = "https://hooks.example.com/alerts?token=abc123".into();
+        assert!(c.validate().is_ok());
+    }
+
+    // ── Issue #278: mTLS config ──────────────────────────────────────────────
+
+    fn fixture_path(name: &str) -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../notifier/tests/fixtures")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn tls_section_parses_from_toml_with_optional_ca() {
+        let raw = format!(
+            r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[rules]]
+            type = "AnyTransaction"
+            [tls]
+            client_cert = "{}"
+            client_key = "{}"
+            "#,
+            fixture_path("client-cert.pem"),
+            fixture_path("client-key.pem"),
+        );
+        let mut c: WatchedContract = toml::from_str(&raw).unwrap();
+        assert!(c.tls.as_ref().unwrap().ca_cert.is_none());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_rejects_missing_client_cert_file() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: "/nonexistent/client.pem".into(),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_cert"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_rejects_missing_ca_cert_file() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some("/nonexistent/ca.pem".into()),
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.ca_cert"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_rejects_empty_key_path() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: "  ".into(),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_key must not be empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_accepts_existing_files() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some(fixture_path("client-cert.pem")),
+        });
         assert!(c.validate().is_ok());
     }
 

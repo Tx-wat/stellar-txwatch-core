@@ -6,10 +6,12 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
-use reqwest::Client;
+use reqwest::{Certificate, Client, Identity};
 use sha2::Sha256;
+use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, span, warn, Level};
+use txwatch_config::TlsConfig;
 use txwatch_rules::AlertPayload;
 
 const MAX_RETRIES: u32 = 3;
@@ -29,6 +31,39 @@ pub fn build_client() -> Result<Client> {
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| anyhow!("failed to build HTTP client: {}", e))
+}
+
+/// Build a client for a contract with `[contracts.tls]` set. The client presents
+/// the configured mTLS identity and, when `ca_cert` is set, trusts that CA bundle
+/// in addition to the system roots. Files are read once, here, at startup.
+/// Error messages name the file path but never include file contents.
+pub fn build_tls_client(tls: &TlsConfig) -> Result<Client> {
+    let cert = fs::read(&tls.client_cert)
+        .map_err(|e| anyhow!("cannot read tls.client_cert '{}': {}", tls.client_cert, e))?;
+    let key = fs::read(&tls.client_key)
+        .map_err(|e| anyhow!("cannot read tls.client_key '{}': {}", tls.client_key, e))?;
+    let identity = Identity::from_pkcs8_pem(&cert, &key).map_err(|e| {
+        anyhow!(
+            "invalid mTLS identity (client_cert '{}', client_key '{}'): {}",
+            tls.client_cert,
+            tls.client_key,
+            e
+        )
+    })?;
+
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .identity(identity);
+    if let Some(ca_path) = &tls.ca_cert {
+        let ca_pem = fs::read(ca_path)
+            .map_err(|e| anyhow!("cannot read tls.ca_cert '{}': {}", ca_path, e))?;
+        let ca = Certificate::from_pem(&ca_pem)
+            .map_err(|e| anyhow!("invalid tls.ca_cert '{}': {}", ca_path, e))?;
+        builder = builder.add_root_certificate(ca);
+    }
+    builder
+        .build()
+        .map_err(|e| anyhow!("failed to build mTLS HTTP client: {}", e))
 }
 
 /// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
@@ -194,6 +229,55 @@ mod tests {
             horizon_link:        "https://horizon-testnet.stellar.org/transactions/abc123".into(),
             explorer_link:       "https://stellar.expert/explorer/testnet/tx/abc123".into(),
         }
+    }
+
+    fn fixture(name: &str) -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn tls_paths(ca: Option<String>) -> TlsConfig {
+        TlsConfig {
+            client_cert: fixture("client-cert.pem"),
+            client_key: fixture("client-key.pem"),
+            ca_cert: ca,
+        }
+    }
+
+    /// Issue #278: a client identity built from the configured PEM files.
+    #[test]
+    fn build_tls_client_accepts_cert_and_key() {
+        assert!(build_tls_client(&tls_paths(None)).is_ok());
+    }
+
+    /// Issue #278: an optional CA bundle is loaded alongside the identity.
+    #[test]
+    fn build_tls_client_accepts_custom_ca() {
+        assert!(build_tls_client(&tls_paths(Some(fixture("client-cert.pem")))).is_ok());
+    }
+
+    /// Issue #278: a missing key file fails at startup with the path in the message.
+    #[test]
+    fn build_tls_client_rejects_missing_key_file() {
+        let tls = TlsConfig {
+            client_cert: fixture("client-cert.pem"),
+            client_key: fixture("does-not-exist.pem"),
+            ca_cert: None,
+        };
+        let err = build_tls_client(&tls).unwrap_err().to_string();
+        assert!(err.contains("tls.client_key"), "got: {}", err);
+        assert!(err.contains("does-not-exist.pem"), "got: {}", err);
+    }
+
+    /// Issue #278: a CA file that is not PEM is rejected.
+    #[test]
+    fn build_tls_client_rejects_invalid_ca_pem() {
+        let tls = tls_paths(Some(fixture("not-a-certificate.txt")));
+        let err = build_tls_client(&tls).unwrap_err().to_string();
+        assert!(err.contains("tls.ca_cert"), "got: {}", err);
     }
 
     #[tokio::test]

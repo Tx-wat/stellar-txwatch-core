@@ -29,6 +29,33 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `webhook_url` | string | yes      | `http://` or `https://` endpoint that receives alert JSON.   |
 | `webhook_secret` | string | no    | If set, an HMAC-SHA256 signature of the request body is sent as `X-TxWatch-Signature: sha256=<hmac>`. Never sends the raw secret over the wire. |
 
+### `[contracts.tls]` (optional mutual TLS)
+
+Use this when the webhook receiver requires the client to present a certificate.
+All paths are PEM files and must exist when the config is loaded; a missing file fails validation.
+
+| Field         | Type   | Required | Description                                                                 |
+|---------------|--------|----------|-----------------------------------------------------------------------------|
+| `client_cert` | string | yes      | PEM client certificate presented to the webhook receiver.                   |
+| `client_key`  | string | yes      | PEM private key (PKCS#8) matching `client_cert`. Its contents are never logged. |
+| `ca_cert`     | string | no       | PEM CA bundle used to validate the webhook server's certificate, in addition to system roots. |
+
+```toml
+[[contracts]]
+label = "Internal alerts"
+contract_id = "C..."
+network = "mainnet"
+webhook_url = "https://internal.example.com/alerts"
+rules = [{ type = "AnyTransaction" }]
+
+[contracts.tls]
+client_cert = "/path/to/client.pem"
+client_key  = "/path/to/client.key"
+ca_cert     = "/path/to/ca.pem"
+```
+
+Only webhook delivery uses the client certificate; Horizon requests are unaffected.
+
 ### Network field values
 
 Valid `network` values and their corresponding Horizon endpoints:
