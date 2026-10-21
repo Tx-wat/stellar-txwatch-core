@@ -9,6 +9,7 @@
 /// real Stellar network.
 mod helpers;
 
+use reqwest::Client;
 use std::time::Duration;
 
 use wiremock::matchers::{method, path, path_regex};
@@ -543,6 +544,7 @@ async fn high_fee_rule_fires_on_fee_charged() {
         },
         vec![],
         None,
+        Some(50_000),
     )
     .unwrap();
 
@@ -619,6 +621,9 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         poll_interval_seconds: 1,
         contracts: vec![contract],
         cursor_file: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
     };
 
     // Drive the loop for one full poll cycle (slightly more than the interval).
@@ -673,6 +678,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
+        cursor_file: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -686,7 +692,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
     assert_eq!(body["amount_xlm"].as_u64(), Some(5000));
 
     let requests = horizon.received_requests().await.unwrap();
-    assert!(requests.iter().any(|r| r.url.contains("cursor=1")),
+    assert!(requests.iter().any(|r| r.url.as_str().contains("cursor=1")),
         "expected the second Horizon transaction request to advance the cursor to '1'");
 }
 
