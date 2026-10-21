@@ -76,19 +76,29 @@ function_names = ["set_admin", "upgrade", "initialize"]
 
 ### `HighFee`
 
-| Field                | Type | Required | Description                           |
-|----------------------|------|----------|---------------------------------------|
-| `threshold_stroops`  | u64  | yes      | Fee threshold in stroops (> 0)        |
+| Field                | Type | Required | Description                                                   |
+|----------------------|------|----------|---------------------------------------------------------------|
+| `threshold_stroops`  | u64  | one of   | Fee threshold in stroops (> 0)                                |
+| `threshold_xlm`      | u64  | one of   | Fee threshold in whole XLM (> 0); converted to stroops at validation time |
 
-Matches when the transaction's total fee exceeds `threshold_stroops`.
-The `fee_charged` field in the webhook payload contains the actual fee paid in stroops.
+Exactly one of `threshold_stroops` or `threshold_xlm` must be set. Setting both is a config error.
+
+Matches when the transaction's total fee exceeds the threshold.
+The `fee_charged_stroops` field in the webhook payload contains the actual fee paid in stroops.
 
 **Note:** Stroops are the smallest unit of XLM (1 XLM = 10,000,000 stroops).
+`threshold_xlm = 1` is equivalent to `threshold_stroops = 10000000`.
 
 ```toml
 [[contracts.rules]]
 type               = "HighFee"
 threshold_stroops  = 100000
+```
+
+```toml
+[[contracts.rules]]
+type           = "HighFee"
+threshold_xlm  = 1
 ```
 
 ## Evaluation order
