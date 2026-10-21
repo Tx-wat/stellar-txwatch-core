@@ -126,7 +126,7 @@ jobs:
         run: cargo build --release -p txwatch
 
       - name: Upload txwatch binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: txwatch-linux-x86_64
           path: target/release/txwatch
