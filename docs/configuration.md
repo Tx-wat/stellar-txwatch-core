@@ -28,6 +28,7 @@ Each entry defines one watched Soroban contract. At least one entry is required.
 | `network`     | string | yes      | `mainnet`, `testnet`, or `futurenet`.                        |
 | `webhook_url` | string | yes      | `http://` or `https://` endpoint that receives alert JSON.   |
 | `webhook_secret` | string | no    | If set, an HMAC-SHA256 signature of the request body is sent as `X-TxWatch-Signature: sha256=<hmac>`. Never sends the raw secret over the wire. |
+| `horizon_url` | string | no | Optional Horizon base URL override (e.g. a private Horizon or local replica). Must be `http://` or `https://`. When omitted, the network's public Horizon is used. Payload `horizon_link` fields still point at the public Horizon. |
 
 ### Network field values
 

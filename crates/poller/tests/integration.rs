@@ -63,7 +63,7 @@ async fn run_polls_once_and_fires_webhook() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::AnyTransaction],
     );
-    contract.horizon_base_url_override = Some(horizon.uri());
+    contract.horizon_url = Some(horizon.uri());
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
@@ -121,7 +121,7 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
     let mut contract = helpers::contract(&format!("{}/hook", receiver.uri()), vec![
         AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None },
     ]);
-    contract.horizon_base_url_override = Some(horizon.uri());
+    contract.horizon_url = Some(horizon.uri());
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
@@ -151,7 +151,7 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         .await;
 
     let mut contract = helpers::contract(&format!("{}/hook", receiver.uri()), vec![AlertRule::AnyTransaction]);
-    contract.horizon_base_url_override = Some(horizon.uri());
+    contract.horizon_url = Some(horizon.uri());
 
     // Create a temporary cursor file with the contract_id -> "100" mapping.
     let tmp = std::env::temp_dir().join("txwatch_test_cursor.json");
@@ -621,7 +621,7 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::AnyTransaction],
     );
-    contract.horizon_base_url_override = Some(horizon.uri());
+    contract.horizon_url = Some(horizon.uri());
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
@@ -676,7 +676,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::LargeTransfer { threshold_xlm: 1000 }],
     );
-    contract.horizon_base_url_override = Some(horizon.uri());
+    contract.horizon_url = Some(horizon.uri());
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
@@ -703,7 +703,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
 }
 
 /// horizon_link in webhook payloads always points to the canonical Horizon URL
-/// even when polling against a mock server (horizon_base_url_override set). Closes #92.
+/// even when polling against a mock server (horizon_url set). Closes #92.
 #[tokio::test]
 async fn horizon_link_uses_canonical_url_not_mock_server() {
     let horizon = MockServer::start().await;
@@ -740,7 +740,7 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::AnyTransaction],
     );
-    contract.horizon_base_url_override = Some(horizon.uri());
+    contract.horizon_url = Some(horizon.uri());
 
     let canonical_base = txwatch_config::Network::Testnet.horizon_base_url();
 
@@ -834,7 +834,7 @@ async fn contracts_polled_concurrently() {
         } else {
             "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string()
         };
-        c.horizon_base_url_override = Some(horizon_uri.to_string());
+        c.horizon_url = Some(horizon_uri.to_string());
         c
     };
 

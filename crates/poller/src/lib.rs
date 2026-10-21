@@ -269,7 +269,7 @@ async fn poll_contract(
     // `canonical_base` is always the production Horizon URL and is used only for
     // building horizon_link in payloads, so links always point to the real network.
     let poll_base = contract
-        .horizon_base_url_override
+        .horizon_url
         .as_deref()
         .unwrap_or_else(|| contract.network.horizon_base_url());
     let canonical_base = contract.network.horizon_base_url();
@@ -562,7 +562,7 @@ mod tests {
             rules:       vec![AlertRule::FunctionCalled { function_name: "withdraw".into() }],
             webhook_url: format!("{}/hook", receiver.uri()),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            horizon_url: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
@@ -674,7 +674,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            horizon_url: Some(server.uri()),
         };
 
         // 429 is handled with a back-off and returns Ok((0,0)), not an error
@@ -704,7 +704,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            horizon_url: Some(server.uri()),
         };
 
         let err = poll_contract(&client, &contract, &mut cursors, false).await.unwrap_err();
@@ -735,7 +735,7 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            horizon_url: Some(server.uri()),
         };
 
         let result = poll_contract(&client, &contract, &mut cursors, false).await;
@@ -763,7 +763,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/a".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    horizon_url: None,
                 },
                 WatchedContract {
                     label:       "Contract B".into(),
@@ -772,7 +772,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/b".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    horizon_url: None,
                 },
                 WatchedContract {
                     label:       "Contract C".into(),
@@ -781,7 +781,7 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/c".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    horizon_url: None,
                 },
             ],
         };
@@ -839,7 +839,7 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: format!("{}/hooks", server.uri()),
             webhook_secret: None,
-            horizon_base_url_override: Some(server.uri()),
+            horizon_url: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());

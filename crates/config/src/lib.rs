@@ -191,9 +191,10 @@ pub struct WatchedContract {
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
     pub webhook_secret: Option<String>,
-    /// Override the Horizon base URL; never read from TOML — set programmatically in tests.
-    #[serde(skip, default)]
-    pub horizon_base_url_override: Option<String>,
+    /// Optional Horizon base URL override, e.g. a private Horizon or local replica.
+    /// Falls back to the network's public Horizon when absent.
+    #[serde(default)]
+    pub horizon_url: Option<String>,
 }
 
 impl WatchedContract {
@@ -233,6 +234,31 @@ impl WatchedContract {
                 self.label,
                 self.webhook_url
             );
+        }
+
+        if let Some(horizon_url) = &self.horizon_url {
+            let parsed_horizon = Url::parse(horizon_url).map_err(|e| {
+                anyhow!(
+                    "contract '{}': horizon_url '{}' is not a valid URL: {}",
+                    self.label,
+                    horizon_url,
+                    e
+                )
+            })?;
+            if parsed_horizon.scheme() != "http" && parsed_horizon.scheme() != "https" {
+                bail!(
+                    "contract '{}': horizon_url '{}' must use http or https scheme",
+                    self.label,
+                    horizon_url
+                );
+            }
+            if parsed_horizon.host().is_none() {
+                bail!(
+                    "contract '{}': horizon_url '{}' has no host",
+                    self.label,
+                    horizon_url
+                );
+            }
         }
 
         if self.rules.is_empty() {
@@ -378,7 +404,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
-            horizon_base_url_override: None,
+            horizon_url: None,
         }
     }
 
@@ -386,6 +412,65 @@ mod tests {
     fn valid_config_passes() {
         let mut c = valid_contract();
         assert!(c.validate().is_ok());
+    }
+
+    /// #268: horizon_url is optional and absent by default.
+    #[test]
+    fn horizon_url_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.horizon_url.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    /// #268: horizon_url is parsed from TOML.
+    #[test]
+    fn horizon_url_is_parsed_from_toml() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            horizon_url = "https://my-private-horizon.example.com"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            cfg.contracts[0].horizon_url.as_deref(),
+            Some("https://my-private-horizon.example.com")
+        );
+    }
+
+    #[test]
+    fn accepts_valid_https_horizon_url() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("https://my-private-horizon.example.com".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_http_horizon_url_for_local_replica() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("http://127.0.0.1:8000".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_horizon_url_that_is_not_a_url() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("not a url".into());
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("horizon_url"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_horizon_url_with_ftp_scheme() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("ftp://horizon.example.com".into());
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("must use http or https"), "got: {}", err);
     }
 
     #[test]
