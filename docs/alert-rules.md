@@ -108,18 +108,22 @@ All matching rules fire; there is no short-circuit.
 
 ## Webhook payload fields
 
-| Field              | Type        | Always present | Description                              |
-|--------------------|-------------|----------------|------------------------------------------|
-| `label`            | string      | yes            | Contract label from config               |
-| `contract_id`      | string      | yes            | Stellar C-address                        |
-| `network`          | string      | yes            | `mainnet` / `testnet` / `futurenet`      |
-| `rule_triggered`   | string      | yes            | Human-readable rule description          |
-| `transaction_hash` | string      | yes            | Stellar transaction hash                 |
-| `function_name`    | string/null | no             | Soroban function name if available; `null` indicates a non-Soroban transaction |
-| `amount_xlm`       | u64/null    | no             | Transfer amount in XLM if available      |
-| `timestamp`        | i64         | yes            | Unix timestamp (seconds) of transaction  |
-| `horizon_link`     | string      | yes            | Direct link to transaction on Horizon    |
-| `explorer_link`    | string      | yes            | Stellar Expert explorer link for the transaction |
+| Field                 | Type        | Always present | Description                              |
+|-----------------------|-------------|----------------|------------------------------------------|
+| `label`               | string      | yes            | Contract label from config               |
+| `contract_id`         | string      | yes            | Stellar C-address                        |
+| `network`             | string      | yes            | `mainnet` / `testnet` / `futurenet`      |
+| `rule_type`           | string      | yes            | Stable machine-readable rule variant (see [Stable rule_type values](#stable-rule_type-values)) |
+| `rule_triggered`      | string      | yes            | Human-readable rule description          |
+| `transaction_hash`    | string      | yes            | Stellar transaction hash                 |
+| `function_name`       | string/null | no             | First invoked Soroban function name if available; `null` indicates a non-Soroban transaction |
+| `function_names`      | [string]    | yes            | All invoked Soroban function names in the transaction (may contain multiple entries) |
+| `amount_xlm`          | u64/null    | no             | Transfer amount in XLM if available      |
+| `fee_charged_stroops` | u64/null    | no             | Fee charged for the transaction in stroops |
+| `timestamp`           | i64         | yes            | Unix timestamp (seconds) of transaction  |
+| `timestamp_iso`       | string      | yes            | ISO 8601 timestamp of the transaction    |
+| `horizon_link`        | string      | yes            | Direct link to transaction on Horizon    |
+| `explorer_link`       | string      | yes            | Stellar Expert explorer link for the transaction |
 
 > `horizon_link` and `explorer_link` are always present in every alert payload, even when `function_name` is `null` for a non-Soroban transaction.
 
