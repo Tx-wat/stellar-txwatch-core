@@ -56,3 +56,39 @@ webhook_url = "https://hooks.example.com/bridge-webhook"
 
   [[contracts.rules]]
   type = "TransactionFailed"
+
+# ---------------------------------------------------------------------------
+# Common configuration errors
+# ---------------------------------------------------------------------------
+# The examples below show frequent TOML parse/validation errors and their fixes.
+#
+# 1) Wrong section nesting for rules
+#    Wrong:  [contracts.rules]        (single brackets create a table, not an array)
+#    Error:  TOML parse error: invalid type: map, expected a sequence
+#            (or: expected a sequence for `contracts.rules`)
+#    Fix:    use double brackets so each rule is an array element:
+#              [[contracts.rules]]
+#              type = "TransactionFailed"
+#
+# 2) Invalid network value
+#    Wrong:  network = "main"
+#    Error:  invalid network "main": expected one of mainnet, testnet, futurenet
+#    Fix:    network = "mainnet"   # allowed: mainnet / testnet / futurenet
+#
+# 3) Duplicate contract labels
+#    Wrong:  two [[contracts]] blocks both with label = "Mainnet Vault"
+#    Error:  duplicate contract label "Mainnet Vault"
+#    Fix:    give every contract a unique label, e.g. "Mainnet Vault" and
+#            "Mainnet Vault Backup"
+#
+# 4) Missing required fields
+#    Wrong:  [[contracts]]
+#            label = "No Address"
+#            network = "testnet"
+#    Error:  missing field `contract_id`
+#    Fix:    include all required fields for each contract:
+#              [[contracts]]
+#              label       = "My Contract"
+#              contract_id = "C..."   # 56 chars, starts with 'C'
+#              network     = "testnet"
+#              webhook_url = "https://hooks.example.com/my-webhook"
