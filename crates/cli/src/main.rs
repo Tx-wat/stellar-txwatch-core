@@ -47,6 +47,11 @@ enum Command {
         /// Warning: this may generate many alerts for historical transactions.
         #[arg(long)]
         from_beginning: bool,
+
+        /// Run exactly one poll cycle across all contracts and exit.
+        /// Useful for CI, one-shot cron jobs, or debugging without a long-running process.
+        #[arg(long)]
+        poll_once: bool,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -153,14 +158,18 @@ async fn main() -> Result<()> {
             let client  = build_client().context("failed to build HTTP client")?;
 
             info!(url = %url, "sending test webhook");
-            send_webhook(&client, &url, &payload, secret.as_deref())
+            // test-webhook is a one-shot CLI command that never shuts down mid-delivery,
+            // so we pass a receiver that never fires.
+            let (_sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
+            std::mem::forget(_sd_tx);
+            send_webhook(&client, &url, &payload, secret.as_deref(), sd_rx)
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
             let signing = if secret.is_some() { "signed with HMAC-SHA256" } else { "unsigned" };
             println!("Test webhook delivered successfully to {} ({})", url, signing);
         }
 
-        Command::Watch { dry_run, from_beginning } => {
+        Command::Watch { dry_run, from_beginning, poll_once } => {
             let cfg = AppConfig::from_file(&cli.config)?;
 
             if poll_once {
@@ -217,11 +226,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Send a HEAD request to `url`. If HEAD returns 405 (Method Not Allowed) or
+/// 501 (Not Implemented), fall back to an OPTIONS request. Returns `Ok(true)` when
+/// the endpoint answers with a 2xx status, `Ok(false)` when it is reachable but
+/// answers with a non-2xx status, and `Err` only when the request itself fails
+/// (e.g. DNS failure or connection refused).
 async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
     let response = client.head(url).send().await;
     match response {
         Ok(resp) if resp.status().is_success() => return Ok(true),
-        Ok(resp) if resp.status() == StatusCode::METHOD_NOT_ALLOWED || resp.status() == StatusCode::NOT_IMPLEMENTED => {
+        Ok(resp)
+            if resp.status() == StatusCode::METHOD_NOT_ALLOWED
+                || resp.status() == StatusCode::NOT_IMPLEMENTED =>
+        {
+            // Fall back to OPTIONS when HEAD is rejected.
             let resp = client.request(reqwest::Method::OPTIONS, url).send().await?;
             return Ok(resp.status().is_success());
         }
@@ -234,6 +252,7 @@ async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
         }
     }
 }
+
 // ── Tracing initialisation ────────────────────────────────────────────────────
 
 #[cfg(not(feature = "opentelemetry"))]
@@ -300,5 +319,78 @@ mod otel_tests {
     #[tokio::test]
     async fn exporter_is_built_when_an_endpoint_is_configured() {
         assert!(otel_provider(Some("http://127.0.0.1:4317")).is_some());
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// #257: HEAD succeeds → returns Ok(true)
+    #[tokio::test]
+    async fn check_webhook_reachable_head_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let result = check_webhook_reachable(&client, &server.uri()).await;
+        assert!(result.unwrap());
+    }
+
+    /// #257: HEAD returns 405 → fall back to OPTIONS → OPTIONS returns 200 → Ok(true)
+    #[tokio::test]
+    async fn check_webhook_reachable_head_405_falls_back_to_options_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+        Mock::given(method("OPTIONS"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let result = check_webhook_reachable(&client, &server.uri()).await;
+        assert!(result.unwrap());
+    }
+
+    /// #257: HEAD returns 405 → OPTIONS returns 404 → Ok(false) (reachable but not OK)
+    #[tokio::test]
+    async fn check_webhook_reachable_head_405_options_404_returns_false() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+        Mock::given(method("OPTIONS"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let result = check_webhook_reachable(&client, &server.uri()).await;
+        assert!(!result.unwrap());
+    }
+
+    /// #257: HEAD returns 503 → Ok(false) (no fallback for non-405/501 errors)
+    #[tokio::test]
+    async fn check_webhook_reachable_head_503_returns_false() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let result = check_webhook_reachable(&client, &server.uri()).await;
+        assert!(!result.unwrap());
     }
 }

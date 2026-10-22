@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract, MAX_CONTRACTS};
 use txwatch_notifier::send_webhook;
@@ -76,6 +76,11 @@ pub async fn run_with_shutdown(
     let summary_every = Duration::from_secs(60);
     let counters      = Arc::new(Counters::default());
     let n_contracts   = cfg.contracts.len();
+
+    // #259: set the gauge once at startup so dashboards always have a
+    // baseline signal for how many contracts are being watched.
+    #[cfg(feature = "metrics")]
+    crate::metrics::set_contracts_active(n_contracts);
 
     // ── #256: warn when approaching the contract limit ────────────────────────
     let warn_threshold = (MAX_CONTRACTS * 80) / 100; // 80 % of 100 = 80
@@ -353,11 +358,18 @@ pub(crate) async fn poll_contract(
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
+                // #260: create a per-delivery oneshot channel. The sender is dropped
+                // immediately, which means the receiver observes a permanently-open
+                // channel — the delivery runs to completion. If the caller needs to
+                // abort in-flight retries, they can pass a live sender and drop it.
+                let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+                std::mem::forget(_shutdown_tx);
                 if let Err(e) = send_webhook(
                     client,
                     &contract.webhook_url,
                     &payload,
                     contract.webhook_secret.as_deref(),
+                    shutdown_rx,
                 ).await {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,
                         tx = %payload.transaction_hash, error = %e, "webhook delivery failed");

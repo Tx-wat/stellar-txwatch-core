@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json;
 use std::fs;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::{build_tls_client, send_webhook};
@@ -825,11 +825,14 @@ async fn poll_contract(
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
-                // The sender is kept alive for the duration of the call so the
-                // retry backoff is never interrupted by a dropped channel.
+                // #260: create a per-delivery oneshot. The sender is kept alive so the
+                // backoff is never interrupted. To abort in-flight retries on shutdown,
+                // drop the sender externally.
                 let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+                std::mem::forget(_shutdown_tx);
                 if let Err(e) = send_webhook(
                     webhook_client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
+                    shutdown_rx,
                 ).await {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,
                         tx = %payload.transaction_hash, error = %e, "webhook delivery failed");

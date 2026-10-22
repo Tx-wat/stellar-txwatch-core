@@ -1,16 +1,17 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes four counters:
+//! Exposes four counters and one gauge:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
 //! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
+//! - `txwatch_contracts_active`         — number of currently watched contracts (gauge)
 //!
 //! An optional HTTP `/metrics` endpoint can be started by calling [`serve_metrics`].
 //! It serves the Prometheus text exposition format on the configured bind address.
 
 use anyhow::{Context, Result};
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{register_int_counter, register_int_gauge, IntCounter, IntGauge};
 use std::{net::SocketAddr, sync::OnceLock};
 
 use http_body_util::Full;
@@ -62,6 +63,28 @@ fn webhook_failures_total() -> &'static IntCounter {
         )
         .expect("register txwatch_webhook_failures_total")
     })
+}
+
+// ── Gauge ─────────────────────────────────────────────────────────────────────
+
+fn contracts_active() -> &'static IntGauge {
+    static G: OnceLock<IntGauge> = OnceLock::new();
+    G.get_or_init(|| {
+        register_int_gauge!(
+            "txwatch_contracts_active",
+            "Number of currently watched (configured and active) contracts"
+        )
+        .expect("register txwatch_contracts_active")
+    })
+}
+
+/// Set the `txwatch_contracts_active` gauge to `n`.
+///
+/// Call this once at startup (inside `run_with_shutdown`) with the number of
+/// configured contracts. If per-contract enable/disable is later implemented,
+/// call it again whenever the active set changes.
+pub fn set_contracts_active(n: usize) {
+    contracts_active().set(n as i64);
 }
 
 /// Increment the `txwatch_transactions_total` counter by `n`.
