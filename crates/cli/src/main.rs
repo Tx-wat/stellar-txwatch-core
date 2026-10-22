@@ -73,6 +73,10 @@ enum Command {
         /// Sign the payload with HMAC-SHA256 using this secret (sent as X-TxWatch-Signature)
         #[arg(long)]
         secret: Option<String>,
+
+        /// HTTP request timeout in seconds
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
     },
 }
 
@@ -158,7 +162,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::TestWebhook { url, label, secret } => {
+        Command::TestWebhook { url, label, secret, timeout } => {
             let cfg = AppConfig::from_file(&cli.config)?;
             if cfg.contracts.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -168,9 +172,12 @@ async fn main() -> Result<()> {
             let first_contract = &cfg.contracts[0];
             let horizon_base_url = first_contract.network.horizon_base_url();
             let payload = test_payload_with_network(&label, &url, &first_contract.network, horizon_base_url);
-            let client  = build_client().context("failed to build HTTP client")?;
+            let client  = Client::builder()
+                .timeout(Duration::from_secs(timeout))
+                .build()
+                .context("failed to build HTTP client")?;
 
-            info!(url = %url, "sending test webhook");
+            info!(url = %url, timeout_secs = timeout, "sending test webhook");
             send_webhook(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;

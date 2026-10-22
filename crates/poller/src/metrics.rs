@@ -1,16 +1,17 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes four counters:
+//! Exposes five counters:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
 //! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
+//! - `txwatch_poll_cycles_total`        — total poll cycles per contract (labelled by `contract`)
 //!
 //! An optional HTTP `/metrics` endpoint can be started by calling [`serve_metrics`].
 //! It serves the Prometheus text exposition format on the configured bind address.
 
 use anyhow::{Context, Result};
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::{net::SocketAddr, sync::OnceLock};
 
 use http_body_util::Full;
@@ -64,6 +65,18 @@ fn webhook_failures_total() -> &'static IntCounter {
     })
 }
 
+fn poll_cycles_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_poll_cycles_total",
+            "Total poll cycles per contract (incremented after each poll attempt, success or failure)",
+            &["contract"]
+        )
+        .expect("register txwatch_poll_cycles_total")
+    })
+}
+
 /// Increment the `txwatch_transactions_total` counter by `n`.
 pub fn inc_transactions(n: u64) {
     transactions_total().inc_by(n);
@@ -82,6 +95,14 @@ pub fn inc_webhook_failures() {
 /// Increment the `txwatch_enrichment_errors_total` counter by 1.
 pub fn inc_enrichment_errors() {
     enrichment_errors_total().inc();
+}
+
+/// Increment the `txwatch_poll_cycles_total` counter for `contract` by 1.
+///
+/// Call this after each poll attempt, whether it succeeds or fails, so that a
+/// stalled contract can be detected by the counter no longer incrementing.
+pub fn inc_poll_cycle(contract: &str) {
+    poll_cycles_total().with_label_values(&[contract]).inc();
 }
 
 // ── /metrics HTTP endpoint ────────────────────────────────────────────────────
@@ -126,4 +147,36 @@ async fn handle_metrics(
         .header("Content-Type", encoder.format_type())
         .body(Full::new(Bytes::from(buf)))
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_cycles_increment_per_contract() {
+        let before_a = poll_cycles_total()
+            .with_label_values(&["contract-a"])
+            .get();
+        let before_b = poll_cycles_total()
+            .with_label_values(&["contract-b"])
+            .get();
+
+        inc_poll_cycle("contract-a");
+        inc_poll_cycle("contract-a");
+        inc_poll_cycle("contract-b");
+
+        assert_eq!(
+            poll_cycles_total()
+                .with_label_values(&["contract-a"])
+                .get(),
+            before_a + 2
+        );
+        assert_eq!(
+            poll_cycles_total()
+                .with_label_values(&["contract-b"])
+                .get(),
+            before_b + 1
+        );
+    }
 }
