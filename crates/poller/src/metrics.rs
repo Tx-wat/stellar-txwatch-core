@@ -1,10 +1,11 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes four counters:
+//! Exposes five counters:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
 //! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
+//! - `txwatch_poll_cycles_total`        — total poll cycles per contract (labelled by `contract`)
 //!
 //! And one histogram:
 //! - `txwatch_horizon_latency_seconds`  — Horizon API request duration, labelled by `endpoint`
@@ -13,7 +14,7 @@
 //! It serves the Prometheus text exposition format on the configured bind address.
 
 use anyhow::{Context, Result};
-use prometheus::{register_histogram_vec, register_int_counter, HistogramVec, IntCounter};
+use prometheus::{register_int_counter, register_int_counter_vec, IntCounter, IntCounterVec};
 use std::{net::SocketAddr, sync::OnceLock};
 
 use http_body_util::Full;
@@ -67,18 +68,15 @@ fn webhook_failures_total() -> &'static IntCounter {
     })
 }
 
-// ── Histograms ────────────────────────────────────────────────────────────────
-
-fn horizon_latency_seconds() -> &'static HistogramVec {
-    static H: OnceLock<HistogramVec> = OnceLock::new();
-    H.get_or_init(|| {
-        register_histogram_vec!(
-            "txwatch_horizon_latency_seconds",
-            "Horizon API request duration in seconds, labelled by endpoint",
-            &["endpoint"],
-            vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+fn poll_cycles_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_poll_cycles_total",
+            "Total poll cycles per contract (incremented after each poll attempt, success or failure)",
+            &["contract"]
         )
-        .expect("register txwatch_horizon_latency_seconds")
+        .expect("register txwatch_poll_cycles_total")
     })
 }
 
@@ -102,12 +100,12 @@ pub fn inc_enrichment_errors() {
     enrichment_errors_total().inc();
 }
 
-/// Record a Horizon request duration (in seconds) for the given `endpoint`
-/// label (e.g. `"transactions"` or `"operations"`).
-pub fn observe_horizon_latency(endpoint: &str, seconds: f64) {
-    horizon_latency_seconds()
-        .with_label_values(&[endpoint])
-        .observe(seconds);
+/// Increment the `txwatch_poll_cycles_total` counter for `contract` by 1.
+///
+/// Call this after each poll attempt, whether it succeeds or fails, so that a
+/// stalled contract can be detected by the counter no longer incrementing.
+pub fn inc_poll_cycle(contract: &str) {
+    poll_cycles_total().with_label_values(&[contract]).inc();
 }
 
 // ── /metrics HTTP endpoint ────────────────────────────────────────────────────
@@ -152,4 +150,36 @@ async fn handle_metrics(
         .header("Content-Type", encoder.format_type())
         .body(Full::new(Bytes::from(buf)))
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn poll_cycles_increment_per_contract() {
+        let before_a = poll_cycles_total()
+            .with_label_values(&["contract-a"])
+            .get();
+        let before_b = poll_cycles_total()
+            .with_label_values(&["contract-b"])
+            .get();
+
+        inc_poll_cycle("contract-a");
+        inc_poll_cycle("contract-a");
+        inc_poll_cycle("contract-b");
+
+        assert_eq!(
+            poll_cycles_total()
+                .with_label_values(&["contract-a"])
+                .get(),
+            before_a + 2
+        );
+        assert_eq!(
+            poll_cycles_total()
+                .with_label_values(&["contract-b"])
+                .get(),
+            before_b + 1
+        );
+    }
 }

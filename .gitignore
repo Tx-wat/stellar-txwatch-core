@@ -1,5 +1,14 @@
 # Cargo build output
 /target
+Cargo.lock
+
+# Test snapshots
+**/*.snap
+**/*.snap.new
+snapshots/
+
+# Editor and OS files
+.DS_Store
 debug/
 *.pdb
 
@@ -19,6 +28,13 @@ snapshots/
 *.swo
 *~
 
+# Environment and secrets
+.env
+.env.*
+
+# Temporary files
+*.tmp
+*.bak
 # OS-specific
 .DS_Store
 .AppleDouble

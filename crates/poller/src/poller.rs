@@ -203,7 +203,11 @@ pub async fn run_with_shutdown(
         }
 
         for contract in &cfg.contracts {
-            match poll_contract(&client, contract, &mut cursors, dry_run).await {
+            let result = poll_contract(&client, contract, &mut cursors, dry_run).await;
+            // #352: count every poll attempt (success or failure) per contract.
+            #[cfg(feature = "metrics")]
+            crate::metrics::inc_poll_cycles(&contract.label);
+            match result {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
@@ -251,6 +255,110 @@ pub async fn run_with_shutdown(
 #[tracing::instrument(skip(client, contract, cursors), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
-    network     = %contrac
+    network     = %contract.network.as_str(),
+))]
+pub(crate) async fn poll_contract(
+    client: &Client,
+    contract: &WatchedContract,
+    cursors: &mut CursorMap,
+    dry_run: bool,
+) -> Result<(u64, u64)> {
+    let cursor = cursors.get(&contract.label).map(|s| s.to_string());
+    let page = fetch_page(client, contract, cursor.as_deref()).await?;
 
-/* … truncated 4442 chars — edit only what you need near the top … */
+    let mut txs_processed: u64 = 0;
+    let mut alerts_fired: u64 = 0;
+
+    for record in &page.records {
+        let mut enriched = EnrichedTransaction::from_horizon(record);
+
+        // Fall back to a separate operations fetch when inline ops are missing.
+        if enriched.operations.is_empty() {
+            match fetch_soroban_details(client, contract, &record.hash).await {
+                Ok(details) => enriched.soroban = details,
+                Err(e) => debug!(error = %e, hash = %record.hash, "soroban details fetch failed"),
+            }
+        } else {
+            enriched.soroban = extract_soroban_details(&enriched.operations);
+        }
+
+        txs_processed += 1;
+
+        let matched = evaluate(&contract.rules, &enriched);
+        for rule in matched {
+            if dry_run {
+                info!(rule = %rule.name, hash = %record.hash, "[dry-run] alert would fire");
+            } else {
+                match send_webhook(&contract.webhook_url, &rule, &enriched).await {
+                    Ok(()) => alerts_fired += 1,
+                    Err(e) => error!(error = %e, rule = %rule.name, "webhook delivery failed"),
+                }
+            }
+        }
+    }
+
+    if let Some(last) = page.records.last() {
+        cursors.set(&contract.label, last.paging_token.clone());
+    }
+
+    Ok((txs_processed, alerts_fired))
+}
+
+async fn fetch_page(
+    client: &Client,
+    contract: &WatchedContract,
+    cursor: Option<&str>,
+) -> Result<HorizonPage> {
+    let base = contract.network.horizon_base_url();
+    let mut url = format!(
+        "{}/accounts/{}/transactions?order=asc&limit=200&join=operations",
+        base, contract.contract_id
+    );
+    if let Some(c) = cursor {
+        url.push_str(&format!("&cursor={}", c));
+    }
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("request to {} failed", url))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("Horizon returned {} for {}", status, url);
+    }
+
+    let page: HorizonPage = resp
+        .json()
+        .await
+        .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+
+    Ok(page)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_default_to_zero() {
+        let c = Counters::default();
+        assert_eq!(c.transactions.load(Ordering::Relaxed), 0);
+        assert_eq!(c.alerts.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn poll_cycles_counter_increments_per_contract() {
+        let before_a = crate::metrics::poll_cycles_total("test-contract-a");
+        let before_b = crate::metrics::poll_cycles_total("test-contract-b");
+
+        crate::metrics::inc_poll_cycles("test-contract-a");
+        crate::metrics::inc_poll_cycles("test-contract-a");
+        crate::metrics::inc_poll_cycles("test-contract-b");
+
+        assert_eq!(crate::metrics::poll_cycles_total("test-contract-a"), before_a + 2);
+        assert_eq!(crate::metrics::poll_cycles_total("test-contract-b"), before_b + 1);
+    }
+}

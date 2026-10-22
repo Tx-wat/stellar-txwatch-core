@@ -6,6 +6,7 @@ use std::{
     path::PathBuf,
     process::{Command, Output},
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use hmac::{Hmac, Mac};
@@ -66,6 +67,53 @@ fn spawn_receiver() -> (String, JoinHandle<(HashMap<String, String>, Vec<u8>)>) 
 
         let mut body = vec![0u8; content_length];
         reader.read_exact(&mut body).unwrap();
+        reader
+            .get_mut()
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+
+        (headers, body)
+    });
+
+    (url, handle)
+}
+
+/// Accepts one HTTP request on a loopback port, waits `delay` before replying
+/// 200, and returns the lowercased request headers together with the raw body.
+fn spawn_delayed_receiver(
+    delay: Duration,
+) -> (String, JoinHandle<(HashMap<String, String>, Vec<u8>)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+
+    let handle = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut headers = HashMap::new();
+        let mut content_length = 0usize;
+
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                let name = name.trim().to_ascii_lowercase();
+                let value = value.trim().to_string();
+                if name == "content-length" {
+                    content_length = value.parse().unwrap();
+                }
+                headers.insert(name, value);
+            }
+        }
+
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+
+        thread::sleep(delay);
+
         reader
             .get_mut()
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -158,4 +206,37 @@ fn test_webhook_without_secret_sends_no_signature() {
         "output should report the payload is unsigned, got: {}",
         stdout
     );
+}
+
+#[test]
+fn test_webhook_succeeds_when_receiver_is_slower_than_default_timeout() {
+    let cfg_path = write_valid_config("txwatch_test_webhook_slow_ok.toml");
+    // Delay well beyond the default 15s timeout, but within the configured 60s.
+    let (url, receiver) = spawn_delayed_receiver(Duration::from_secs(20));
+
+    let output = run_test_webhook(&cfg_path, &url, &["--timeout", "60"]);
+    assert!(
+        output.status.success(),
+        "expected success with --timeout 60, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (_headers, _body) = receiver.join().unwrap();
+}
+
+#[test]
+fn test_webhook_times_out_when_receiver_exceeds_configured_timeout() {
+    let cfg_path = write_valid_config("txwatch_test_webhook_slow_fail.toml");
+    // Delay longer than the configured 1s timeout so the request must fail.
+    let (url, receiver) = spawn_delayed_receiver(Duration::from_secs(5));
+
+    let output = run_test_webhook(&cfg_path, &url, &["--timeout", "1"]);
+    assert!(
+        !output.status.success(),
+        "expected failure when receiver exceeds --timeout 1, stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // The receiver thread will still complete once the client disconnects.
+    let _ = receiver.join();
 }

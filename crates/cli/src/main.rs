@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -73,7 +73,59 @@ enum Command {
         /// Sign the payload with HMAC-SHA256 using this secret (sent as X-TxWatch-Signature)
         #[arg(long)]
         secret: Option<String>,
+
+        /// HTTP request timeout in seconds
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
     },
+}
+
+// ── Validate summary formatter ────────────────────────────────────────────────
+
+/// Renders the human-readable summary printed by the `validate` subcommand.
+struct ValidateSummary<'a> {
+    config: &'a AppConfig,
+}
+
+impl fmt::Display for ValidateSummary<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cfg = self.config;
+        writeln!(f, "Config is valid.")?;
+        writeln!(f, "  poll_interval_seconds : {}", cfg.poll_interval_seconds)?;
+        writeln!(f, "  contracts             : {}", cfg.contracts.len())?;
+        writeln!(f)?;
+        for c in &cfg.contracts {
+            writeln!(
+                f,
+                "  [{network}] {label}",
+                network = c.network.display_name(),
+                label = c.label
+            )?;
+            writeln!(f, "    contract_id  : {}", c.contract_id)?;
+            writeln!(f, "    webhook_url  : {}", c.webhook_url)?;
+            writeln!(
+                f,
+                "    secret       : {}",
+                if c.webhook_secret.is_some() {
+                    "set"
+                } else {
+                    "none"
+                }
+            )?;
+            writeln!(f, "    rules        : {}", c.rules.len())?;
+            for rule in &c.rules {
+                writeln!(f, "      - {}", rule.label())?;
+            }
+            writeln!(f, "    horizon      : {}", c.network.horizon_base_url())?;
+            writeln!(
+                f,
+                "    explorer     : {}/contract/{}",
+                c.network.explorer_base_url(),
+                c.contract_id
+            )?;
+        }
+        Ok(())
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -91,37 +143,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Validate { check_webhooks } => {
             let cfg = AppConfig::from_file(&cli.config)?;
-            println!("Config is valid.");
-            println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
-            println!("  contracts             : {}", cfg.contracts.len());
-            println!();
-            for c in &cfg.contracts {
-                println!(
-                    "  [{network}] {label}",
-                    network = c.network.display_name(),
-                    label = c.label
-                );
-                println!("    contract_id  : {}", c.contract_id);
-                println!("    webhook_url  : {}", c.webhook_url);
-                println!(
-                    "    secret       : {}",
-                    if c.webhook_secret.is_some() {
-                        "set"
-                    } else {
-                        "none"
-                    }
-                );
-                println!("    rules        : {}", c.rules.len());
-                for rule in &c.rules {
-                    println!("      - {}", rule.label());
-                }
-                println!("    horizon      : {}", c.network.horizon_base_url());
-                println!(
-                    "    explorer     : {}/contract/{}",
-                    c.network.explorer_base_url(),
-                    c.contract_id
-                );
-            }
+            println!("{}", ValidateSummary { config: &cfg });
 
             if check_webhooks {
                 let client = Client::builder()
@@ -140,7 +162,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::TestWebhook { url, label, secret } => {
+        Command::TestWebhook { url, label, secret, timeout } => {
             let cfg = AppConfig::from_file(&cli.config)?;
             if cfg.contracts.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -150,9 +172,12 @@ async fn main() -> Result<()> {
             let first_contract = &cfg.contracts[0];
             let horizon_base_url = first_contract.network.horizon_base_url();
             let payload = test_payload_with_network(&label, &url, &first_contract.network, horizon_base_url);
-            let client  = build_client().context("failed to build HTTP client")?;
+            let client  = Client::builder()
+                .timeout(Duration::from_secs(timeout))
+                .build()
+                .context("failed to build HTTP client")?;
 
-            info!(url = %url, "sending test webhook");
+            info!(url = %url, timeout_secs = timeout, "sending test webhook");
             send_webhook(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
