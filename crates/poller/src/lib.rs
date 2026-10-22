@@ -687,6 +687,14 @@ async fn poll_contract(
             return Ok((0, 0, 0));
         }
 
+        // Issue #378: Horizon returns 410 Gone once a paging cursor has expired.
+        // Reset to "now" so the next poll resumes from the current ledger.
+        if response.status() == reqwest::StatusCode::GONE {
+            warn!(contract = %contract.label, cursor = %page_cursor, "Horizon returned 410 — cursor expired, resetting to \"now\"");
+            cursors.insert(contract.contract_id.clone(), "now".to_string());
+            return Ok((0, 0));
+        }
+
         if !response.status().is_success() {
             anyhow::bail!("Horizon returned HTTP {} from {}", response.status(), url);
         }
@@ -1253,6 +1261,36 @@ mod tests {
         let result = poll_contract(&client, &contract, &mut cursors, false).await;
         assert!(result.is_ok(), "429 should return Ok after back-off");
         assert_eq!(result.unwrap(), (0, 0, 0));
+    }
+
+    /// Issue #378: a 410 Gone (expired cursor) resets the cursor to "now".
+    #[tokio::test]
+    async fn horizon_410_resets_cursor_to_now() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(410))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        cursors.insert(contract_id.to_string(), "12345".to_string());
+
+        let contract = WatchedContract {
+            label: "test".into(),
+            contract_id: contract_id.into(),
+            network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: "https://hooks.example.com/test".into(),
+            webhook_secret: None,
+            test_horizon_base_url: Some(server.uri()),
+        };
+
+        let result = poll_contract(&client, &client, &contract, &mut cursors, false).await;
+        assert_eq!(result.unwrap(), (0, 0));
+        assert_eq!(cursors.get(contract_id).map(String::as_str), Some("now"));
     }
 
     /// Issue #271: a 429 makes poll_contract sleep for the Retry-After duration
