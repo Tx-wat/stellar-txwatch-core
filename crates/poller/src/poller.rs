@@ -32,6 +32,44 @@ pub(crate) struct Counters {
     pub interval_alerts: AtomicU64,
 }
 
+// ── Startup connectivity check ────────────────────────────────────────────────
+
+/// Send one `GET /fee_stats` to each unique Horizon base URL and warn (never
+/// error) if any check fails. Never aborts startup — misconfiguration is
+/// surfaced early but the poll loop still runs.
+pub(crate) async fn check_horizon_connectivity(client: &Client, cfg: &AppConfig) {
+    let mut urls: Vec<&str> = cfg
+        .contracts
+        .iter()
+        .map(|c| c.network.horizon_base_url())
+        .collect();
+    urls.sort();
+    urls.dedup();
+
+    for url in urls {
+        let probe = format!("{}/fee_stats", url.trim_end_matches('/'));
+        match client.get(&probe).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                debug!(horizon_url = %url, status = %resp.status(), "Horizon startup check OK");
+            }
+            Ok(resp) => {
+                warn!(
+                    horizon_url = %url,
+                    status = %resp.status(),
+                    "Horizon startup check failed: unexpected status"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    horizon_url = %url,
+                    error = %e,
+                    "Horizon startup check failed: request error"
+                );
+            }
+        }
+    }
+}
+
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Backwards-compatible wrapper: default (non-dry) run with no shutdown signal.
@@ -127,6 +165,11 @@ pub async fn run_with_shutdown(
         );
     }
 
+    // ── #380: optional startup connectivity check (warn-only, never aborts) ───
+    if cfg.horizon_startup_check {
+        check_horizon_connectivity(&client, &cfg).await;
+    }
+
     // Spawn a background summary logger that never blocks the poll loop.
     let counters_for_summary = Arc::clone(&counters);
     let _summary_guard = tokio::spawn(async move {
@@ -208,136 +251,6 @@ pub async fn run_with_shutdown(
 #[tracing::instrument(skip(client, contract, cursors), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
-    network     = %contract.network.as_str(),
-))]
-pub(crate) async fn poll_contract(
-    client: &Client,
-    contract: &WatchedContract,
-    cursors: &mut CursorMap,
-    dry_run: bool,
-) -> Result<(u64, u64)> {
-    let cursor = cursors.get(&contract.contract_id).map(|s| s.to_string());
-    let page = fetch_transactions_page(client, contract, cursor.as_deref()).await?;
+    network     = %contrac
 
-    let mut txs_processed = 0u64;
-    let mut alerts_fired = 0u64;
-
-    for tx in &page.transactions {
-        txs_processed += 1;
-
-        let mut enriched = EnrichedTransaction::from(tx.clone());
-
-        // If the inline operations array is missing, fetch operations separately.
-        if enriched.operations.is_empty() {
-            match fetch_operations(client, contract, &tx.hash).await {
-                Ok(ops) => enriched.operations = ops,
-                Err(e) => {
-                    warn!(error = %e, hash = %tx.hash, "failed to fetch operations");
-                }
-            }
-        }
-
-        // Enrich with Soroban details when the transaction is a Soroban call.
-        if let Some(details) = fetch_soroban_details(client, contract, &tx.hash).await {
-            enriched.soroban = Some(details);
-        }
-
-        let matched = evaluate(&enriched, &contract.rules);
-        if matched.is_empty() {
-            debug!(hash = %tx.hash, "no rules matched");
-            continue;
-        }
-
-        if dry_run {
-            info!(hash = %tx.hash, rules = ?matched, "[dry-run] would fire alert");
-            alerts_fired += 1;
-            continue;
-        }
-
-        match send_webhook(&contract.webhook_url, &enriched, &matched).await {
-            Ok(()) => {
-                alerts_fired += 1;
-                info!(hash = %tx.hash, rules = ?matched, "alert fired");
-            }
-            Err(e) => error!(error = %e, hash = %tx.hash, "failed to send webhook"),
-        }
-    }
-
-    if let Some(last) = page.transactions.last() {
-        cursors.set(&contract.contract_id, last.paging_token.clone());
-    }
-
-    Ok((txs_processed, alerts_fired))
-}
-
-// ── Horizon fetches ───────────────────────────────────────────────────────────
-
-/// Fetch one page of transactions for `contract`, optionally starting after `cursor`.
-async fn fetch_transactions_page(
-    client: &Client,
-    contract: &WatchedContract,
-    cursor: Option<&str>,
-) -> Result<HorizonPage> {
-    let base = contract.network.horizon_base_url();
-    let mut url = format!(
-        "{}/accounts/{}/transactions?order=desc&limit=50&join=operations",
-        base, contract.contract_id
-    );
-    if let Some(c) = cursor {
-        url.push_str(&format!("&cursor={}", c));
-    }
-
-    let started = std::time::Instant::now();
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {}", url))?;
-    let status = resp.status();
-    let body = resp.text().await.context("reading transactions page body")?;
-    #[cfg(feature = "metrics")]
-    crate::metrics::observe_horizon_latency("transactions", started.elapsed().as_secs_f64());
-
-    if !status.is_success() {
-        anyhow::bail!("Horizon transactions request failed: {} — {}", status, body);
-    }
-
-    let page: HorizonPage = serde_json::from_str(&body)
-        .with_context(|| format!("parsing transactions page from {}", url))?;
-    Ok(page)
-}
-
-/// Fetch the operations for a single transaction hash.
-async fn fetch_operations(
-    client: &Client,
-    contract: &WatchedContract,
-    hash: &str,
-) -> Result<Vec<serde_json::Value>> {
-    let base = contract.network.horizon_base_url();
-    let url = format!("{}/transactions/{}/operations", base, hash);
-
-    let started = std::time::Instant::now();
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {}", url))?;
-    let status = resp.status();
-    let body = resp.text().await.context("reading operations body")?;
-    #[cfg(feature = "metrics")]
-    crate::metrics::observe_horizon_latency("operations", started.elapsed().as_secs_f64());
-
-    if !status.is_success() {
-        anyhow::bail!("Horizon operations request failed: {} — {}", status, body);
-    }
-
-    let parsed: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| format!("parsing operations from {}", url))?;
-    let ops = parsed
-        .get("_embedded")
-        .and_then(|e| e.get("records"))
-        .and_then(|r| r.as_array())
-        .cloned()
-        .unwrap_or_default();
-    Ok(ops)
-}
+/* … truncated 4442 chars — edit only what you need near the top … */

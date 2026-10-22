@@ -130,3 +130,115 @@ pub(crate) async fn fetch_soroban_details(
     observe_horizon_latency("operations", started);
     result
 }
+
+// ── Startup connectivity check ────────────────────────────────────────────────
+
+/// Probe a single Horizon base URL with `GET /fee_stats`.
+///
+/// Returns `Ok(())` when the endpoint answers with a success status, and an
+/// error describing the failure otherwise. This is used by the startup
+/// connectivity check to surface misconfiguration early; callers log a warning
+/// on failure rather than aborting startup.
+pub(crate) async fn check_connectivity(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<(), reqwest::Error> {
+    let url = format!("{base_url}/fee_stats");
+    client.get(&url).send().await?.error_for_status()?;
+    Ok(())
+}
+
+/// Run the startup connectivity check against each unique Horizon base URL.
+///
+/// A single request is sent per unique URL. Failures are logged as warnings and
+/// never abort startup. When `enabled` is `false` the check is skipped entirely
+/// (controlled by the `horizon_startup_check` config flag).
+pub(crate) async fn startup_connectivity_check(
+    client: &reqwest::Client,
+    base_urls: &[String],
+    enabled: bool,
+) {
+    if !enabled {
+        return;
+    }
+
+    let mut seen: Vec<&str> = Vec::new();
+    for base_url in base_urls {
+        let base_url = base_url.as_str();
+        if seen.contains(&base_url) {
+            continue;
+        }
+        seen.push(base_url);
+
+        if let Err(err) = check_connectivity(client, base_url).await {
+            tracing::warn!(
+                horizon_url = base_url,
+                error = %err,
+                "Horizon startup connectivity check failed; continuing anyway"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal HTTP server that answers every request with a fixed status code.
+    async fn spawn_status_server(status: u16) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn connectivity_check_succeeds_on_200() {
+        let base_url = spawn_status_server(200).await;
+        let client = reqwest::Client::new();
+        assert!(check_connectivity(&client, &base_url).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn connectivity_check_fails_on_503() {
+        let base_url = spawn_status_server(503).await;
+        let client = reqwest::Client::new();
+        assert!(check_connectivity(&client, &base_url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_check_does_not_abort_on_failure() {
+        let base_url = spawn_status_server(503).await;
+        let client = reqwest::Client::new();
+        // Must return normally (warn only) even when the endpoint is unhealthy.
+        startup_connectivity_check(&client, &[base_url], true).await;
+    }
+
+    #[tokio::test]
+    async fn startup_check_skipped_when_disabled() {
+        let client = reqwest::Client::new();
+        // Unreachable URL is fine because the check is disabled.
+        startup_connectivity_check(&client, &["http://127.0.0.1:1".to_string()], false).await;
+    }
+}
