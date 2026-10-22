@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -80,6 +80,54 @@ enum Command {
     },
 }
 
+// ── Validate summary formatter ────────────────────────────────────────────────
+
+/// Renders the human-readable summary printed by the `validate` subcommand.
+struct ValidateSummary<'a> {
+    config: &'a AppConfig,
+}
+
+impl fmt::Display for ValidateSummary<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cfg = self.config;
+        writeln!(f, "Config is valid.")?;
+        writeln!(f, "  poll_interval_seconds : {}", cfg.poll_interval_seconds)?;
+        writeln!(f, "  contracts             : {}", cfg.contracts.len())?;
+        writeln!(f)?;
+        for c in &cfg.contracts {
+            writeln!(
+                f,
+                "  [{network}] {label}",
+                network = c.network.display_name(),
+                label = c.label
+            )?;
+            writeln!(f, "    contract_id  : {}", c.contract_id)?;
+            writeln!(f, "    webhook_url  : {}", c.webhook_url)?;
+            writeln!(
+                f,
+                "    secret       : {}",
+                if c.webhook_secret.is_some() {
+                    "set"
+                } else {
+                    "none"
+                }
+            )?;
+            writeln!(f, "    rules        : {}", c.rules.len())?;
+            for rule in &c.rules {
+                writeln!(f, "      - {}", rule.label())?;
+            }
+            writeln!(f, "    horizon      : {}", c.network.horizon_base_url())?;
+            writeln!(
+                f,
+                "    explorer     : {}/contract/{}",
+                c.network.explorer_base_url(),
+                c.contract_id
+            )?;
+        }
+        Ok(())
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -95,37 +143,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Validate { check_webhooks } => {
             let cfg = AppConfig::from_file(&cli.config)?;
-            println!("Config is valid.");
-            println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
-            println!("  contracts             : {}", cfg.contracts.len());
-            println!();
-            for c in &cfg.contracts {
-                println!(
-                    "  [{network}] {label}",
-                    network = c.network.display_name(),
-                    label = c.label
-                );
-                println!("    contract_id  : {}", c.contract_id);
-                println!("    webhook_url  : {}", c.webhook_url);
-                println!(
-                    "    secret       : {}",
-                    if c.webhook_secret.is_some() {
-                        "set"
-                    } else {
-                        "none"
-                    }
-                );
-                println!("    rules        : {}", c.rules.len());
-                for rule in &c.rules {
-                    println!("      - {}", rule.label());
-                }
-                println!("    horizon      : {}", c.network.horizon_base_url());
-                println!(
-                    "    explorer     : {}/contract/{}",
-                    c.network.explorer_base_url(),
-                    c.contract_id
-                );
-            }
+            println!("{}", ValidateSummary { config: &cfg });
 
             if check_webhooks {
                 let client = Client::builder()

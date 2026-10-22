@@ -198,6 +198,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "amount_xlm":       15000,
   "amount_stroops":   150000000000,
   "fee_charged_stroops": 50000,
+  "operation_count":  2,
   "memo_type":        "text",
   "memo":             "order-1234",
   "timestamp":        1705316096,
@@ -220,6 +221,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `rule_triggered` — human-readable rule description with parameters (e.g. `"LargeTransfer(>=10000XLM)"`); use this for display
 - `function_name` — the first invoked Soroban function name, or `null` for non-Soroban transactions.
 - `function_names` — all invoked Soroban function names in the transaction (may contain multiple entries for multi-op transactions).
+- `operation_count` — total number of operations in the transaction as reported by Horizon, or `null` if not available. Useful for gauging transaction complexity without fetching additional data.
 - `memo_type` — the transaction memo type from Horizon (`"text"`, `"hash"`, `"id"`, `"return"` or `"none"`), or `null` if Horizon did not return one.
 - `memo` — the transaction memo value (e.g. an order ID or payment reference), or `null` when the transaction has no memo.
 - `horizon_link` — direct Horizon REST API URL for the transaction (e.g. `https://horizon-testnet.stellar.org/transactions/<hash>`); useful for fetching raw XDR or operation details programmatically.
@@ -304,6 +306,7 @@ scrape_configs:
 1. Poller wakes up (every poll_interval_seconds)
 2. For each contract:
    a. GET /accounts/{contract_id}/transactions?cursor={last_seen}&order=asc
+      → on 410 Gone (cursor expired): log a warning, reset cursor to "now", skip this cycle
    b. For each new transaction:
       i.  Advance cursor (even if enrichment fails)
       ii. GET /transactions/{hash}/operations
@@ -347,5 +350,5 @@ MIT
 
 ## Handsoff notes
 
-<!-- handsoff-issue-379 -->
-- #379: observability: add structured error codes to webhook delivery failure logs
+<!-- handsoff-issue-336 -->
+- #336: bug: rejects_poll_interval_too_low test creates AppConfig without cursor_file field — compilation error

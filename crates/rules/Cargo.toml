@@ -1,23 +1,15 @@
 [package]
-name    = "txwatch-rules"
+name = "txwatch-rules"
 version = "0.1.0"
-license = "Apache-2.0"
 edition = "2021"
-license   = "Apache-2.0"
-publish   = false
 
 [dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 txwatch-config = { path = "../config" }
-serde          = { workspace = true }
-serde_json     = { workspace = true }
-anyhow         = { workspace = true }
-base64         = "0.22"
-chrono         = { workspace = true }
-tracing        = { workspace = true }
 
 [dev-dependencies]
-criterion = "0.5"
-
-[[bench]]
-name    = "eval_benchmark"
-harness = false
+proptest = "1"
