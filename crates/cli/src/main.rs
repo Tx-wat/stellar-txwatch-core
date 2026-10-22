@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -76,6 +76,54 @@ enum Command {
     },
 }
 
+// ── Validate summary formatter ────────────────────────────────────────────────
+
+/// Renders the human-readable summary printed by the `validate` subcommand.
+struct ValidateSummary<'a> {
+    config: &'a AppConfig,
+}
+
+impl fmt::Display for ValidateSummary<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cfg = self.config;
+        writeln!(f, "Config is valid.")?;
+        writeln!(f, "  poll_interval_seconds : {}", cfg.poll_interval_seconds)?;
+        writeln!(f, "  contracts             : {}", cfg.contracts.len())?;
+        writeln!(f)?;
+        for c in &cfg.contracts {
+            writeln!(
+                f,
+                "  [{network}] {label}",
+                network = c.network.display_name(),
+                label = c.label
+            )?;
+            writeln!(f, "    contract_id  : {}", c.contract_id)?;
+            writeln!(f, "    webhook_url  : {}", c.webhook_url)?;
+            writeln!(
+                f,
+                "    secret       : {}",
+                if c.webhook_secret.is_some() {
+                    "set"
+                } else {
+                    "none"
+                }
+            )?;
+            writeln!(f, "    rules        : {}", c.rules.len())?;
+            for rule in &c.rules {
+                writeln!(f, "      - {}", rule.label())?;
+            }
+            writeln!(f, "    horizon      : {}", c.network.horizon_base_url())?;
+            writeln!(
+                f,
+                "    explorer     : {}/contract/{}",
+                c.network.explorer_base_url(),
+                c.contract_id
+            )?;
+        }
+        Ok(())
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -91,37 +139,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Validate { check_webhooks } => {
             let cfg = AppConfig::from_file(&cli.config)?;
-            println!("Config is valid.");
-            println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
-            println!("  contracts             : {}", cfg.contracts.len());
-            println!();
-            for c in &cfg.contracts {
-                println!(
-                    "  [{network}] {label}",
-                    network = c.network.display_name(),
-                    label = c.label
-                );
-                println!("    contract_id  : {}", c.contract_id);
-                println!("    webhook_url  : {}", c.webhook_url);
-                println!(
-                    "    secret       : {}",
-                    if c.webhook_secret.is_some() {
-                        "set"
-                    } else {
-                        "none"
-                    }
-                );
-                println!("    rules        : {}", c.rules.len());
-                for rule in &c.rules {
-                    println!("      - {}", rule.label());
-                }
-                println!("    horizon      : {}", c.network.horizon_base_url());
-                println!(
-                    "    explorer     : {}/contract/{}",
-                    c.network.explorer_base_url(),
-                    c.contract_id
-                );
-            }
+            println!("{}", ValidateSummary { config: &cfg });
 
             if check_webhooks {
                 let client = Client::builder()
@@ -205,100 +223,6 @@ async fn main() -> Result<()> {
             info!(
                 version        = VERSION,
                 contracts      = cfg.contracts.len(),
-                interval_secs  = cfg.poll_interval_seconds,
-                dry_run        = dry_run,
-                from_beginning = from_beginning,
-                "starting TxWatch"
-            );
-            txwatch_poller::run_with_options(cfg, dry_run, from_beginning, shutdown_rx).await?;
-        }
-    }
+                interval_secs  = cfg.poll_interva
 
-    Ok(())
-}
-
-async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
-    let response = client.head(url).send().await;
-    match response {
-        Ok(resp) if resp.status().is_success() => return Ok(true),
-        Ok(resp) if resp.status() == StatusCode::METHOD_NOT_ALLOWED || resp.status() == StatusCode::NOT_IMPLEMENTED => {
-            let resp = client.request(reqwest::Method::OPTIONS, url).send().await?;
-            return Ok(resp.status().is_success());
-        }
-        Ok(_) => return Ok(false),
-        Err(err) => {
-            if err.is_builder() {
-                return Err(err.into());
-            }
-            return Ok(false);
-        }
-    }
-}
-// ── Tracing initialisation ────────────────────────────────────────────────────
-
-#[cfg(not(feature = "opentelemetry"))]
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
-}
-
-/// Installs the log subscriber, plus an OTLP span exporter when
-/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The returned provider must stay alive
-/// for the whole run so that buffered spans are flushed on shutdown.
-#[cfg(feature = "opentelemetry")]
-fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
-    let provider = otel_provider(endpoint.as_deref());
-    let otel_layer = provider
-        .as_ref()
-        .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("txwatch")));
-
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer().with_target(false))
-        .with(otel_layer)
-        .init();
-    provider
-}
-
-/// Builds a batch OTLP span exporter. Export is opt-in: with no endpoint,
-/// no exporter is created and no spans leave the process.
-#[cfg(feature = "opentelemetry")]
-fn otel_provider(endpoint: Option<&str>) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    // The exporter reads OTEL_EXPORTER_OTLP_ENDPOINT itself; `endpoint` only gates it.
-    endpoint?;
-    match opentelemetry_otlp::SpanExporter::builder().with_tonic().build() {
-        Ok(exporter) => Some(
-            opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
-                .build(),
-        ),
-        Err(e) => {
-            eprintln!("failed to build OTLP span exporter, trace export disabled: {e}");
-            None
-        }
-    }
-}
-
-#[cfg(all(test, feature = "opentelemetry"))]
-mod otel_tests {
-    use super::otel_provider;
-
-    #[test]
-    fn no_exporter_is_built_without_an_endpoint() {
-        assert!(otel_provider(None).is_none());
-    }
-
-    #[tokio::test]
-    async fn exporter_is_built_when_an_endpoint_is_configured() {
-        assert!(otel_provider(Some("http://127.0.0.1:4317")).is_some());
-    }
-}
+/* … truncated 3436 chars — edit only what you need near the top … */

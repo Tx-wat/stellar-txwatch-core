@@ -347,3 +347,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 MIT
+
+## Handsoff notes
+
+<!-- handsoff-issue-336 -->
+- #336: bug: rejects_poll_interval_too_low test creates AppConfig without cursor_file field — compilation error
