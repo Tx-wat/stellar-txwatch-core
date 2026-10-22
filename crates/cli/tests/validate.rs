@@ -19,6 +19,19 @@ webhook_url = "https://hooks.example.com/test"
   type = "AnyTransaction"
 "#;
 
+const INVALID_CONTRACT_ID_CONFIG: &str = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label       = "Test Contract"
+contract_id = "NOT_A_VALID_CONTRACT_ID"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/test"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+
 const MULTI_CONTRACT_CONFIG: &str = r#"
 poll_interval_seconds = 10
 
@@ -55,7 +68,11 @@ fn validate_exits_zero_for_valid_config() {
         .status()
         .expect("failed to run txwatch");
 
-    assert!(status.success(), "expected exit code 0 for valid config");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "expected exit code 0 for valid config"
+    );
 }
 
 #[test]
@@ -155,5 +172,23 @@ fn validate_exits_one_for_invalid_config() {
         status.code(),
         Some(1),
         "expected exit code 1 for invalid config"
+    );
+}
+
+#[test]
+fn validate_exits_one_for_invalid_contract_id() {
+    let dir = env::temp_dir();
+    let path = dir.join("txwatch_invalid_contract_id_test.toml");
+    fs::write(&path, INVALID_CONTRACT_ID_CONFIG).unwrap();
+
+    let status = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate"])
+        .status()
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "expected exit code 1 for config with invalid contract ID"
     );
 }

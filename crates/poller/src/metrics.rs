@@ -7,6 +7,9 @@
 //! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
 //! - `txwatch_poll_cycles_total`        — total poll cycles per contract (labelled by `contract`)
 //!
+//! And one histogram:
+//! - `txwatch_horizon_latency_seconds`  — Horizon API request duration, labelled by `endpoint`
+//!
 //! An optional HTTP `/metrics` endpoint can be started by calling [`serve_metrics`].
 //! It serves the Prometheus text exposition format on the configured bind address.
 
