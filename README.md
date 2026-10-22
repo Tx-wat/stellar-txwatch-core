@@ -344,3 +344,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 MIT
+
+## Handsoff notes
+
+<!-- handsoff-issue-379 -->
+- #379: observability: add structured error codes to webhook delivery failure logs
