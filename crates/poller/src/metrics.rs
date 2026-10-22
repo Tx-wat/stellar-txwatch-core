@@ -6,11 +6,14 @@
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
 //! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
 //!
+//! And one histogram:
+//! - `txwatch_horizon_latency_seconds`  — Horizon API request duration, labelled by `endpoint`
+//!
 //! An optional HTTP `/metrics` endpoint can be started by calling [`serve_metrics`].
 //! It serves the Prometheus text exposition format on the configured bind address.
 
 use anyhow::{Context, Result};
-use prometheus::{register_int_counter, IntCounter};
+use prometheus::{register_histogram_vec, register_int_counter, HistogramVec, IntCounter};
 use std::{net::SocketAddr, sync::OnceLock};
 
 use http_body_util::Full;
@@ -64,6 +67,21 @@ fn webhook_failures_total() -> &'static IntCounter {
     })
 }
 
+// ── Histograms ────────────────────────────────────────────────────────────────
+
+fn horizon_latency_seconds() -> &'static HistogramVec {
+    static H: OnceLock<HistogramVec> = OnceLock::new();
+    H.get_or_init(|| {
+        register_histogram_vec!(
+            "txwatch_horizon_latency_seconds",
+            "Horizon API request duration in seconds, labelled by endpoint",
+            &["endpoint"],
+            vec![0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+        )
+        .expect("register txwatch_horizon_latency_seconds")
+    })
+}
+
 /// Increment the `txwatch_transactions_total` counter by `n`.
 pub fn inc_transactions(n: u64) {
     transactions_total().inc_by(n);
@@ -82,6 +100,14 @@ pub fn inc_webhook_failures() {
 /// Increment the `txwatch_enrichment_errors_total` counter by 1.
 pub fn inc_enrichment_errors() {
     enrichment_errors_total().inc();
+}
+
+/// Record a Horizon request duration (in seconds) for the given `endpoint`
+/// label (e.g. `"transactions"` or `"operations"`).
+pub fn observe_horizon_latency(endpoint: &str, seconds: f64) {
+    horizon_latency_seconds()
+        .with_label_values(&[endpoint])
+        .observe(seconds);
 }
 
 // ── /metrics HTTP endpoint ────────────────────────────────────────────────────

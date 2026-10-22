@@ -5,7 +5,26 @@
 //! unknown fields are ignored so the code stays forward-compatible.
 
 use serde::Deserialize;
+use std::time::Instant;
 use txwatch_rules::{HorizonOperation, HorizonTransaction};
+
+// ── Latency metric ───────────────────────────────────────────────────────────
+
+/// Name of the histogram tracking Horizon request duration in seconds.
+pub(crate) const HORIZON_LATENCY_METRIC: &str = "txwatch_horizon_latency_seconds";
+
+/// `le` bucket bounds (seconds) suitable for HTTP API latency.
+pub(crate) const HORIZON_LATENCY_BUCKETS: &[f64] = &[0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
+
+/// Records the duration of a Horizon request against the
+/// `txwatch_horizon_latency_seconds` histogram, labelled by `endpoint`.
+///
+/// `endpoint` is one of `"transactions"` or `"operations"`.
+pub(crate) fn observe_horizon_latency(endpoint: &str, started: Instant) {
+    let elapsed = started.elapsed().as_secs_f64();
+    metrics::histogram!(HORIZON_LATENCY_METRIC, "endpoint" => endpoint.to_string())
+        .record(elapsed);
+}
 
 // ── Account kind ─────────────────────────────────────────────────────────────
 
@@ -80,4 +99,34 @@ pub(crate) struct OperationsPage {
 #[derive(Deserialize)]
 pub(crate) struct OpsEmbedded {
     pub records: Vec<HorizonOperation>,
+}
+
+// ── Instrumented fetches ──────────────────────────────────────────────────────
+
+/// Fetch a page of transactions for `account_id`, recording the request
+/// duration under the `transactions` endpoint label.
+pub(crate) async fn fetch_transactions_page(
+    client: &reqwest::Client,
+    base_url: &str,
+    account_id: &str,
+) -> Result<HorizonPage, reqwest::Error> {
+    let started = Instant::now();
+    let url = format!("{base_url}/accounts/{account_id}/transactions?join=operations");
+    let result = client.get(&url).send().await?.error_for_status()?.json().await;
+    observe_horizon_latency("transactions", started);
+    result
+}
+
+/// Fetch the Soroban operation details for a transaction, recording the request
+/// duration under the `operations` endpoint label.
+pub(crate) async fn fetch_soroban_details(
+    client: &reqwest::Client,
+    base_url: &str,
+    tx_hash: &str,
+) -> Result<OperationsPage, reqwest::Error> {
+    let started = Instant::now();
+    let url = format!("{base_url}/transactions/{tx_hash}/operations");
+    let result = client.get(&url).send().await?.error_for_status()?.json().await;
+    observe_horizon_latency("operations", started);
+    result
 }
