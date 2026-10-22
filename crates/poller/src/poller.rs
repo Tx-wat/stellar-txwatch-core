@@ -32,6 +32,44 @@ pub(crate) struct Counters {
     pub interval_alerts: AtomicU64,
 }
 
+// ── Startup connectivity check ────────────────────────────────────────────────
+
+/// Send one `GET /fee_stats` to each unique Horizon base URL and warn (never
+/// error) if any check fails. Never aborts startup — misconfiguration is
+/// surfaced early but the poll loop still runs.
+pub(crate) async fn check_horizon_connectivity(client: &Client, cfg: &AppConfig) {
+    let mut urls: Vec<&str> = cfg
+        .contracts
+        .iter()
+        .map(|c| c.network.horizon_base_url())
+        .collect();
+    urls.sort();
+    urls.dedup();
+
+    for url in urls {
+        let probe = format!("{}/fee_stats", url.trim_end_matches('/'));
+        match client.get(&probe).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                debug!(horizon_url = %url, status = %resp.status(), "Horizon startup check OK");
+            }
+            Ok(resp) => {
+                warn!(
+                    horizon_url = %url,
+                    status = %resp.status(),
+                    "Horizon startup check failed: unexpected status"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    horizon_url = %url,
+                    error = %e,
+                    "Horizon startup check failed: request error"
+                );
+            }
+        }
+    }
+}
+
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Backwards-compatible wrapper: default (non-dry) run with no shutdown signal.
@@ -132,6 +170,11 @@ pub async fn run_with_shutdown(
         );
     }
 
+    // ── #380: optional startup connectivity check (warn-only, never aborts) ───
+    if cfg.horizon_startup_check {
+        check_horizon_connectivity(&client, &cfg).await;
+    }
+
     // Spawn a background summary logger that never blocks the poll loop.
     let counters_for_summary = Arc::clone(&counters);
     let _summary_guard = tokio::spawn(async move {
@@ -165,7 +208,11 @@ pub async fn run_with_shutdown(
         }
 
         for contract in &cfg.contracts {
-            match poll_contract(&client, contract, &mut cursors, dry_run).await {
+            let result = poll_contract(&client, contract, &mut cursors, dry_run).await;
+            // #352: count every poll attempt (success or failure) per contract.
+            #[cfg(feature = "metrics")]
+            crate::metrics::inc_poll_cycles(&contract.label);
+            match result {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
@@ -213,201 +260,110 @@ pub async fn run_with_shutdown(
 #[tracing::instrument(skip(client, contract, cursors), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
-    network     = %contract.network.as_str()
+    network     = %contract.network.as_str(),
 ))]
 pub(crate) async fn poll_contract(
-    client:   &Client,
+    client: &Client,
     contract: &WatchedContract,
-    cursors:  &mut CursorMap,
-    dry_run:  bool,
+    cursors: &mut CursorMap,
+    dry_run: bool,
 ) -> Result<(u64, u64)> {
-    let cursor = cursors.get(&contract.contract_id).to_string();
+    let cursor = cursors.get(&contract.label).map(|s| s.to_string());
+    let page = fetch_page(client, contract, cursor.as_deref()).await?;
 
-    // `poll_base` is used for all Horizon HTTP requests (may be overridden in tests).
-    // `canonical_base` is always the production Horizon URL and is used only for
-    // building horizon_link in payloads, so links always point to the real network.
-    let poll_base = contract
-        .horizon_base_url_override
-        .as_deref()
-        .unwrap_or_else(|| contract.network.horizon_base_url());
-    let canonical_base = contract.network.horizon_base_url();
+    let mut txs_processed: u64 = 0;
+    let mut alerts_fired: u64 = 0;
 
-    // Collect all pages of transactions.
-    let mut all_records = Vec::new();
-    let mut page_cursor = cursor.clone();
+    for record in &page.records {
+        let mut enriched = EnrichedTransaction::from_horizon(record);
 
-    loop {
-        let url = format!(
-            "{}/accounts/{}/transactions?cursor={}&order=asc&limit=200&join=operations",
-            poll_base, contract.contract_id, page_cursor
-        );
-
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed", url))?;
-
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after = response
-                .headers()
-                .get("Retry-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(5);
-            warn!(contract = %contract.label, retry_after, "Horizon returned 429 — backing off");
-            tokio::time::sleep(Duration::from_secs(retry_after)).await;
-            return Ok((0, 0));
-        }
-
-        let page: HorizonPage = response
-            .json()
-            .await
-            .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
-        let records = page._embedded.records;
-        if records.is_empty() {
-            break;
-        }
-
-        let last_token = records.last().map(|r| r.tx.paging_token.clone());
-        let count = records.len();
-        for r in records {
-            all_records.push(r);
-        }
-
-        if count < 200 {
-            break;
-        }
-        if let Some(token) = last_token {
-            page_cursor = token;
-        } else {
-            break;
-        }
-    }
-
-    if !all_records.is_empty() {
-        info!(contract = %contract.label, count = all_records.len(), "fetched new transactions");
-    } else {
-        debug!(contract = %contract.label, cursor = %cursor, "no new transactions");
-    }
-
-    let mut tx_count    = 0u64;
-    let mut alert_count = 0u64;
-
-    for record in all_records {
-        let paging_token = record.tx.paging_token.clone();
-        let tx_hash      = record.tx.hash.clone();
-
-        // Advance cursor before enrichment so the tx is not re-processed even if
-        // op enrichment fails.
-        cursors.set(&contract.contract_id, &paging_token);
-
-        // If Horizon returned inline operations, use them directly.
-        // Otherwise fall back to a separate /operations fetch.
-        let (function_names, amount_stroops) = if !record.operations.is_empty() {
-            debug!(contract = %contract.label, tx = %tx_hash, "using inline operations (join=operations)");
-            extract_soroban_details(record.operations)
-        } else {
-            match fetch_soroban_details(client, poll_base, &tx_hash).await {
-                Ok(details) => details,
-                Err(e) => {
-                    warn!(
-                        contract = %contract.label, tx = %tx_hash, error = %e,
-                        "could not fetch operation details — evaluating rules without them"
-                    );
-                    (Vec::new(), None)
-                }
+        // Fall back to a separate operations fetch when inline ops are missing.
+        if enriched.operations.is_empty() {
+            match fetch_soroban_details(client, contract, &record.hash).await {
+                Ok(details) => enriched.soroban = details,
+                Err(e) => debug!(error = %e, hash = %record.hash, "soroban details fetch failed"),
             }
-        };
-
-        let enriched = match EnrichedTransaction::from_horizon(record.tx, function_names, amount_stroops, None) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(contract = %contract.label, tx = %tx_hash, error = %e,
-                    "skipping transaction due to enrichment error");
-                continue;
-            }
-        };
-
-        tx_count += 1;
-
-        let payloads = evaluate(
-            &contract.label,
-            &contract.contract_id,
-            contract.network.as_str(),
-            canonical_base,
-            contract.network.explorer_base_url(),
-            &contract.rules,
-            &enriched,
-        );
-
-        if payloads.is_empty() {
-            debug!(contract = %contract.label, tx = %tx_hash, rules = ?contract.rules,
-                "transaction evaluated but no rules matched");
+        } else {
+            enriched.soroban = extract_soroban_details(&enriched.operations);
         }
 
-        for payload in payloads {
-            alert_count += 1;
-            info!(contract = %contract.label, rule = %payload.rule_triggered,
-                tx = %payload.transaction_hash, "rule matched");
+        txs_processed += 1;
 
+        let matched = evaluate(&contract.rules, &enriched);
+        for rule in matched {
             if dry_run {
-                info!(contract = %contract.label, rule = %payload.rule_triggered,
-                    tx = %payload.transaction_hash, "dry-run enabled: not sending webhook");
+                info!(rule = %rule.name, hash = %record.hash, "[dry-run] alert would fire");
             } else {
-                info!(contract = %contract.label, rule = %payload.rule_triggered,
-                    tx = %payload.transaction_hash, "rule fired — sending webhook");
-                // #260: create a per-delivery oneshot channel. The sender is dropped
-                // immediately, which means the receiver observes a permanently-open
-                // channel — the delivery runs to completion. If the caller needs to
-                // abort in-flight retries, they can pass a live sender and drop it.
-                let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-                std::mem::forget(_shutdown_tx);
-                if let Err(e) = send_webhook(
-                    client,
-                    &contract.webhook_url,
-                    &payload,
-                    contract.webhook_secret.as_deref(),
-                    shutdown_rx,
-                ).await {
-                    error!(contract = %contract.label, rule = %payload.rule_triggered,
-                        tx = %payload.transaction_hash, error = %e, "webhook delivery failed");
-                    #[cfg(feature = "metrics")]
-                    crate::metrics::inc_webhook_failures();
+                match send_webhook(&contract.webhook_url, &rule, &enriched).await {
+                    Ok(()) => alerts_fired += 1,
+                    Err(e) => error!(error = %e, rule = %rule.name, "webhook delivery failed"),
                 }
             }
         }
     }
 
-    if tx_count > 0 {
-        info!(contract = %contract.label, transactions = tx_count, alerts = alert_count,
-            "poll cycle complete");
+    if let Some(last) = page.records.last() {
+        cursors.set(&contract.label, last.paging_token.clone());
     }
 
-    Ok((tx_count, alert_count))
+    Ok((txs_processed, alerts_fired))
 }
 
-// ── Startup log field helpers (for testing) ──────────────────────────────────
+async fn fetch_page(
+    client: &Client,
+    contract: &WatchedContract,
+    cursor: Option<&str>,
+) -> Result<HorizonPage> {
+    let base = contract.network.horizon_base_url();
+    let mut url = format!(
+        "{}/accounts/{}/transactions?order=asc&limit=200&join=operations",
+        base, contract.contract_id
+    );
+    if let Some(c) = cursor {
+        url.push_str(&format!("&cursor={}", c));
+    }
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("request to {} failed", url))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("Horizon returned {} for {}", status, url);
+    }
+
+    let page: HorizonPage = resp
+        .json()
+        .await
+        .with_context(|| format!("failed to parse Horizon response from {}", url))?;
+
+    Ok(page)
+}
 
 #[cfg(test)]
-pub(crate) fn startup_log_fields(cfg: &AppConfig) -> (String, String, String, String) {
-    let contracts_list = cfg.contracts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
-    let mut networks: Vec<&str> = cfg.contracts.iter().map(|c| c.network.as_str()).collect();
-    networks.sort();
-    networks.dedup();
-    let networks_str = networks.join(", ");
-    let mut horizon_urls: Vec<(&str, &str)> = cfg
-        .contracts
-        .iter()
-        .map(|c| (c.network.as_str(), c.network.horizon_base_url()))
-        .collect();
-    horizon_urls.sort();
-    horizon_urls.dedup();
-    let horizon_urls_str = horizon_urls
-        .iter()
-        .map(|(net, url)| format!("{}={}", net, url))
-        .collect::<Vec<_>>()
-        .join(", ");
-    (env!("CARGO_PKG_VERSION").to_string(), contracts_list, networks_str, horizon_urls_str)
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_default_to_zero() {
+        let c = Counters::default();
+        assert_eq!(c.transactions.load(Ordering::Relaxed), 0);
+        assert_eq!(c.alerts.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn poll_cycles_counter_increments_per_contract() {
+        let before_a = crate::metrics::poll_cycles_total("test-contract-a");
+        let before_b = crate::metrics::poll_cycles_total("test-contract-b");
+
+        crate::metrics::inc_poll_cycles("test-contract-a");
+        crate::metrics::inc_poll_cycles("test-contract-a");
+        crate::metrics::inc_poll_cycles("test-contract-b");
+
+        assert_eq!(crate::metrics::poll_cycles_total("test-contract-a"), before_a + 2);
+        assert_eq!(crate::metrics::poll_cycles_total("test-contract-b"), before_b + 1);
+    }
 }

@@ -39,6 +39,18 @@ Use `FunctionCalled` or `AdminFunctionCalled` when you only care about specific 
 type = "SorobanInvocation"
 ```
 
+### `ContractDeployed`
+Matches transactions that deploy a new Soroban contract, i.e. `invoke_host_function`
+operations whose `function` field is `"HostFunctionTypeCreateContract"`.
+
+**Use case:** alert when a new contract is created on a watched address, e.g. to track
+factory deployments or detect unexpected contract creation.
+
+```toml
+[[contracts.rules]]
+type = "ContractDeployed"
+```
+
 ### `InsufficientFunds`
 Matches transactions that failed because the source account could not cover the fee
 (Horizon result code `txINSUFFICIENT_BALANCE`, decoded from `result_xdr`). Other failures
@@ -182,21 +194,8 @@ The webhook payload includes two rule-related fields:
 | `TransactionFailed` | `"TransactionFailed"` |
 | `InsufficientFunds` | `"InsufficientFunds"` |
 | `SorobanInvocation` | `"SorobanInvocation"` |
+| `ContractDeployed` | `"ContractDeployed"` |
 | `LargeTransfer` | `"LargeTransfer"` |
 | `FunctionCalled` | `"FunctionCalled"` |
 | `AdminFunctionCalled` | `"AdminFunctionCalled"` |
 | `HighFee` | `"HighFee"` |
-| `SourceAccountMatch` | `"SourceAccountMatch"` |
-
-## Adding a new rule type
-
-1. Add a variant to `AlertRule` in `crates/config/src/lib.rs`
-2. Add field validation in `AlertRule::validate()` in the same file
-3. Add a match arm in `AlertRule::label()` in the same file (human-readable description)
-4. Add a match arm in `AlertRule::rule_type()` in the same file (stable machine-readable name)
-5. Add the match arm in `eval_rule()` in `crates/rules/src/lib.rs`
-6. Add unit tests in `crates/rules/src/lib.rs`
-7. Update the rule type table in this section
-8. Update the webhook payload example in README.md (if adding a new example)
-
-No other crates need changes.

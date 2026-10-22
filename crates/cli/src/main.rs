@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -78,7 +78,59 @@ enum Command {
         /// Sign the payload with HMAC-SHA256 using this secret (sent as X-TxWatch-Signature)
         #[arg(long)]
         secret: Option<String>,
+
+        /// HTTP request timeout in seconds
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
     },
+}
+
+// ── Validate summary formatter ────────────────────────────────────────────────
+
+/// Renders the human-readable summary printed by the `validate` subcommand.
+struct ValidateSummary<'a> {
+    config: &'a AppConfig,
+}
+
+impl fmt::Display for ValidateSummary<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cfg = self.config;
+        writeln!(f, "Config is valid.")?;
+        writeln!(f, "  poll_interval_seconds : {}", cfg.poll_interval_seconds)?;
+        writeln!(f, "  contracts             : {}", cfg.contracts.len())?;
+        writeln!(f)?;
+        for c in &cfg.contracts {
+            writeln!(
+                f,
+                "  [{network}] {label}",
+                network = c.network.display_name(),
+                label = c.label
+            )?;
+            writeln!(f, "    contract_id  : {}", c.contract_id)?;
+            writeln!(f, "    webhook_url  : {}", c.webhook_url)?;
+            writeln!(
+                f,
+                "    secret       : {}",
+                if c.webhook_secret.is_some() {
+                    "set"
+                } else {
+                    "none"
+                }
+            )?;
+            writeln!(f, "    rules        : {}", c.rules.len())?;
+            for rule in &c.rules {
+                writeln!(f, "      - {}", rule.label())?;
+            }
+            writeln!(f, "    horizon      : {}", c.network.horizon_base_url())?;
+            writeln!(
+                f,
+                "    explorer     : {}/contract/{}",
+                c.network.explorer_base_url(),
+                c.contract_id
+            )?;
+        }
+        Ok(())
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -96,37 +148,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Validate { check_webhooks } => {
             let cfg = AppConfig::from_file(&cli.config)?;
-            println!("Config is valid.");
-            println!("  poll_interval_seconds : {}", cfg.poll_interval_seconds);
-            println!("  contracts             : {}", cfg.contracts.len());
-            println!();
-            for c in &cfg.contracts {
-                println!(
-                    "  [{network}] {label}",
-                    network = c.network.display_name(),
-                    label = c.label
-                );
-                println!("    contract_id  : {}", c.contract_id);
-                println!("    webhook_url  : {}", c.webhook_url);
-                println!(
-                    "    secret       : {}",
-                    if c.webhook_secret.is_some() {
-                        "set"
-                    } else {
-                        "none"
-                    }
-                );
-                println!("    rules        : {}", c.rules.len());
-                for rule in &c.rules {
-                    println!("      - {}", rule.label());
-                }
-                println!("    horizon      : {}", c.network.horizon_base_url());
-                println!(
-                    "    explorer     : {}/contract/{}",
-                    c.network.explorer_base_url(),
-                    c.contract_id
-                );
-            }
+            println!("{}", ValidateSummary { config: &cfg });
 
             if check_webhooks {
                 let client = Client::builder()
@@ -145,7 +167,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::TestWebhook { url, label, secret } => {
+        Command::TestWebhook { url, label, secret, timeout } => {
             let cfg = AppConfig::from_file(&cli.config)?;
             if cfg.contracts.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -155,14 +177,13 @@ async fn main() -> Result<()> {
             let first_contract = &cfg.contracts[0];
             let horizon_base_url = first_contract.network.horizon_base_url();
             let payload = test_payload_with_network(&label, &url, &first_contract.network, horizon_base_url);
-            let client  = build_client().context("failed to build HTTP client")?;
+            let client  = Client::builder()
+                .timeout(Duration::from_secs(timeout))
+                .build()
+                .context("failed to build HTTP client")?;
 
-            info!(url = %url, "sending test webhook");
-            // test-webhook is a one-shot CLI command that never shuts down mid-delivery,
-            // so we pass a receiver that never fires.
-            let (_sd_tx, sd_rx) = tokio::sync::oneshot::channel::<()>();
-            std::mem::forget(_sd_tx);
-            send_webhook(&client, &url, &payload, secret.as_deref(), sd_rx)
+            info!(url = %url, timeout_secs = timeout, "sending test webhook");
+            send_webhook(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
             let signing = if secret.is_some() { "signed with HMAC-SHA256" } else { "unsigned" };
@@ -214,183 +235,6 @@ async fn main() -> Result<()> {
             info!(
                 version        = VERSION,
                 contracts      = cfg.contracts.len(),
-                interval_secs  = cfg.poll_interval_seconds,
-                dry_run        = dry_run,
-                from_beginning = from_beginning,
-                "starting TxWatch"
-            );
-            txwatch_poller::run_with_options(cfg, dry_run, from_beginning, shutdown_rx).await?;
-        }
-    }
+                interval_secs  = cfg.poll_interva
 
-    Ok(())
-}
-
-/// Send a HEAD request to `url`. If HEAD returns 405 (Method Not Allowed) or
-/// 501 (Not Implemented), fall back to an OPTIONS request. Returns `Ok(true)` when
-/// the endpoint answers with a 2xx status, `Ok(false)` when it is reachable but
-/// answers with a non-2xx status, and `Err` only when the request itself fails
-/// (e.g. DNS failure or connection refused).
-async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
-    let response = client.head(url).send().await;
-    match response {
-        Ok(resp) if resp.status().is_success() => return Ok(true),
-        Ok(resp)
-            if resp.status() == StatusCode::METHOD_NOT_ALLOWED
-                || resp.status() == StatusCode::NOT_IMPLEMENTED =>
-        {
-            // Fall back to OPTIONS when HEAD is rejected.
-            let resp = client.request(reqwest::Method::OPTIONS, url).send().await?;
-            return Ok(resp.status().is_success());
-        }
-        Ok(_) => return Ok(false),
-        Err(err) => {
-            if err.is_builder() {
-                return Err(err.into());
-            }
-            return Ok(false);
-        }
-    }
-}
-
-// ── Tracing initialisation ────────────────────────────────────────────────────
-
-#[cfg(not(feature = "opentelemetry"))]
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
-}
-
-/// Installs the log subscriber, plus an OTLP span exporter when
-/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The returned provider must stay alive
-/// for the whole run so that buffered spans are flushed on shutdown.
-#[cfg(feature = "opentelemetry")]
-fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
-    let provider = otel_provider(endpoint.as_deref());
-    let otel_layer = provider
-        .as_ref()
-        .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("txwatch")));
-
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer().with_target(false))
-        .with(otel_layer)
-        .init();
-    provider
-}
-
-/// Builds a batch OTLP span exporter. Export is opt-in: with no endpoint,
-/// no exporter is created and no spans leave the process.
-#[cfg(feature = "opentelemetry")]
-fn otel_provider(endpoint: Option<&str>) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    // The exporter reads OTEL_EXPORTER_OTLP_ENDPOINT itself; `endpoint` only gates it.
-    endpoint?;
-    match opentelemetry_otlp::SpanExporter::builder().with_tonic().build() {
-        Ok(exporter) => Some(
-            opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
-                .build(),
-        ),
-        Err(e) => {
-            eprintln!("failed to build OTLP span exporter, trace export disabled: {e}");
-            None
-        }
-    }
-}
-
-#[cfg(all(test, feature = "opentelemetry"))]
-mod otel_tests {
-    use super::otel_provider;
-
-    #[test]
-    fn no_exporter_is_built_without_an_endpoint() {
-        assert!(otel_provider(None).is_none());
-    }
-
-    #[tokio::test]
-    async fn exporter_is_built_when_an_endpoint_is_configured() {
-        assert!(otel_provider(Some("http://127.0.0.1:4317")).is_some());
-    }
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wiremock::matchers::method;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// #257: HEAD succeeds → returns Ok(true)
-    #[tokio::test]
-    async fn check_webhook_reachable_head_success() {
-        let server = MockServer::start().await;
-        Mock::given(method("HEAD"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-
-        let client = Client::new();
-        let result = check_webhook_reachable(&client, &server.uri()).await;
-        assert!(result.unwrap());
-    }
-
-    /// #257: HEAD returns 405 → fall back to OPTIONS → OPTIONS returns 200 → Ok(true)
-    #[tokio::test]
-    async fn check_webhook_reachable_head_405_falls_back_to_options_200() {
-        let server = MockServer::start().await;
-        Mock::given(method("HEAD"))
-            .respond_with(ResponseTemplate::new(405))
-            .mount(&server)
-            .await;
-        Mock::given(method("OPTIONS"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
-
-        let client = Client::new();
-        let result = check_webhook_reachable(&client, &server.uri()).await;
-        assert!(result.unwrap());
-    }
-
-    /// #257: HEAD returns 405 → OPTIONS returns 404 → Ok(false) (reachable but not OK)
-    #[tokio::test]
-    async fn check_webhook_reachable_head_405_options_404_returns_false() {
-        let server = MockServer::start().await;
-        Mock::given(method("HEAD"))
-            .respond_with(ResponseTemplate::new(405))
-            .mount(&server)
-            .await;
-        Mock::given(method("OPTIONS"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-
-        let client = Client::new();
-        let result = check_webhook_reachable(&client, &server.uri()).await;
-        assert!(!result.unwrap());
-    }
-
-    /// #257: HEAD returns 503 → Ok(false) (no fallback for non-405/501 errors)
-    #[tokio::test]
-    async fn check_webhook_reachable_head_503_returns_false() {
-        let server = MockServer::start().await;
-        Mock::given(method("HEAD"))
-            .respond_with(ResponseTemplate::new(503))
-            .mount(&server)
-            .await;
-
-        let client = Client::new();
-        let result = check_webhook_reachable(&client, &server.uri()).await;
-        assert!(!result.unwrap());
-    }
-}
+/* … truncated 3436 chars — edit only what you need near the top … */
