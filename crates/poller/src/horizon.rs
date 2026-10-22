@@ -7,6 +7,39 @@
 use serde::Deserialize;
 use txwatch_rules::{HorizonOperation, HorizonTransaction};
 
+// ── Account kind ─────────────────────────────────────────────────────────────
+
+/// The kind of Stellar address being watched.
+///
+/// Soroban contract addresses (C-addresses) and classic payment accounts
+/// (G-addresses) are both served by the same Horizon
+/// `/accounts/{id}/transactions` endpoint, so the polling URL is identical for
+/// both. This enum exists so callers can reason about the address type without
+/// re-parsing the string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccountKind {
+    /// A Soroban contract address (starts with `C`).
+    Contract,
+    /// A classic Stellar account (starts with `G`).
+    Classic,
+}
+
+impl AccountKind {
+    /// Classify a 56-character Stellar address by its leading character.
+    ///
+    /// Returns `None` for anything that is not a well-formed C- or G-address.
+    pub(crate) fn from_address(address: &str) -> Option<Self> {
+        if address.len() != 56 {
+            return None;
+        }
+        match address.as_bytes().first() {
+            Some(b'C') => Some(AccountKind::Contract),
+            Some(b'G') => Some(AccountKind::Classic),
+            _ => None,
+        }
+    }
+}
+
 // ── Transactions endpoint ─────────────────────────────────────────────────────
 
 /// A Horizon transaction record that may include inline operations returned
@@ -21,6 +54,9 @@ pub(crate) struct HorizonTransactionWithOps {
 }
 
 /// Top-level response envelope for `GET /accounts/{id}/transactions`.
+///
+/// This shape is returned for both C-addresses (contracts) and G-addresses
+/// (classic accounts), so the same polling path works for both.
 #[derive(Deserialize)]
 pub(crate) struct HorizonPage {
     pub _embedded: Embedded,
