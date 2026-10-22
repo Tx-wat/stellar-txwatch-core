@@ -33,6 +33,20 @@ pub fn large_transfer_label(threshold_xlm: Option<u64>, threshold_stroops: Optio
     }
 }
 
+// ── Account ID helpers ────────────────────────────────────────────────────────
+
+/// Returns `true` when `s` is a structurally valid Stellar account (G-address):
+/// exactly 56 characters, starts with `'G'`, and uses only the uppercase
+/// base-32 alphabet (`A-Z` and `2-7`).
+///
+/// This mirrors the contract-address check used for `C-addresses`, and can be
+/// reused by any rule that references a Stellar account ID.
+pub fn is_valid_stellar_account_id(s: &str) -> bool {
+    s.len() == 56
+        && s.starts_with('G')
+        && s.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'))
+}
+
 // ── Network ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -231,8 +245,7 @@ impl AlertRule {
                 }
             }
             AlertRule::SourceAccountMatch { source_account } => {
-                // Stellar account (G-) addresses are 56 base32 characters.
-                if source_account.len() != 56 || !source_account.starts_with('G') {
+                if !is_valid_stellar_account_id(source_account) {
                     bail!(
                         "contract '{}': SourceAccountMatch source_account '{}' is not a valid \
                          Stellar account address (must start with 'G' and be 56 characters)",

@@ -47,6 +47,11 @@ enum Command {
         /// Warning: this may generate many alerts for historical transactions.
         #[arg(long)]
         from_beginning: bool,
+
+        /// Run exactly one poll cycle across all contracts and exit.
+        /// Useful for CI, one-shot cron jobs, or debugging without a long-running process.
+        #[arg(long)]
+        poll_once: bool,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -185,7 +190,7 @@ async fn main() -> Result<()> {
             println!("Test webhook delivered successfully to {} ({})", url, signing);
         }
 
-        Command::Watch { dry_run, from_beginning } => {
+        Command::Watch { dry_run, from_beginning, poll_once } => {
             let cfg = AppConfig::from_file(&cli.config)?;
 
             if poll_once {

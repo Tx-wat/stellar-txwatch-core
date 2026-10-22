@@ -12,7 +12,7 @@ use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
-use txwatch_config::TlsConfig;
+use txwatch_config::{Network, TlsConfig};
 use txwatch_rules::AlertPayload;
 
 const MAX_RETRIES: u32 = 3;
@@ -80,12 +80,30 @@ pub fn build_tls_client(tls: &TlsConfig) -> Result<Client> {
 /// debug level but is otherwise ignored — a 200 OK with an error body is
 /// still treated as a successful delivery (#24).
 ///
+/// Graceful shutdown (#260): If `shutdown` fires during a retry backoff wait,
+/// the delivery is aborted and returns an error. In-flight HTTP requests
+/// (already sent) are allowed to complete.
+///
 /// Returns a [`DeliveryResult`] describing how many attempts were needed.
 pub async fn send_webhook(
-    client:  &Client,
-    url:     &str,
-    payload: &AlertPayload,
-    secret:  Option<&str>,
+    client:   &Client,
+    url:      &str,
+    payload:  &AlertPayload,
+    secret:   Option<&str>,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    send_webhook_with_backoff(client, url, payload, secret, RETRY_BASE_DELAY, shutdown).await
+}
+
+/// Internal variant of [`send_webhook`] that accepts a custom backoff base duration.
+/// Used by tests to speed up retry testing without changing retry count semantics.
+async fn send_webhook_with_backoff(
+    client:        &Client,
+    url:           &str,
+    payload:       &AlertPayload,
+    secret:        Option<&str>,
+    backoff_base:  Duration,
+    mut shutdown:  oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
     let span = span!(
         Level::INFO,
@@ -167,7 +185,26 @@ pub async fn send_webhook(
         }
 
         if attempt < MAX_RETRIES {
-            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+            // #260: check for shutdown during backoff. If shutdown fires, abort
+            // the delivery instead of waiting for the full backoff period.
+            let backoff_duration = if backoff_base.is_zero() {
+                Duration::ZERO
+            } else {
+                backoff_base * 2u32.pow(attempt)
+            };
+
+            tokio::select! {
+                _ = tokio::time::sleep(backoff_duration) => {}
+                _ = &mut shutdown => {
+                    warn!(
+                        url  = %url,
+                        rule = %payload.rule_triggered,
+                        tx   = %payload.transaction_hash,
+                        "webhook delivery aborted due to shutdown signal"
+                    );
+                    return Err(anyhow!("shutdown during retry backoff"));
+                }
+            }
         }
     }
 
@@ -191,13 +228,13 @@ pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
 pub fn test_payload_with_network(
     label:            &str,
     webhook_url:      &str,
-    network:          &str,
+    network:          &txwatch_config::Network,
     horizon_base_url: &str,
 ) -> AlertPayload {
     let now     = Utc::now();
     let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
     // Stellar Expert names the mainnet explorer path "public".
-    let explorer_network = if network == "mainnet" { "public" } else { network };
+    let explorer_network = if network.as_str() == "mainnet" { "public" } else { network.as_str() };
     AlertPayload {
         label:               label.to_string(),
         contract_id:         "CTEST000000000000000000000000000000000000000000000000000".into(),
@@ -217,11 +254,42 @@ pub fn test_payload_with_network(
         timestamp_iso:       now.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         horizon_link:        format!("{}/transactions/{}", horizon_base_url, tx_hash),
         explorer_link:       format!("https://stellar.expert/explorer/{}/tx/{}", explorer_network, tx_hash),
+        ledger_sequence:     None,
+        source_account:      None,
     }
     .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Create a dummy shutdown receiver that never fires, for use in tests.
+///
+/// The returned sender is intentionally unused — it will be dropped at end of
+/// scope, which means the receiver will observe a "disconnected" state, but
+/// `tokio::select!` on a dropped oneshot never resolves the `recv` branch
+/// unless the sender was sent to first. We hold the sender in the returned
+/// tuple so tests can explicitly trigger shutdown if needed.
+#[cfg(test)]
+pub(crate) fn dummy_shutdown() -> oneshot::Receiver<()> {
+    let (_tx, rx) = oneshot::channel();
+    std::mem::forget(_tx); // keep sender alive so receiver never fires
+    rx
+}
+
+/// Test-only: call `send_webhook_with_backoff` with a custom backoff base,
+/// bypassing the public `send_webhook` wrapper.
+#[cfg(test)]
+pub(crate) async fn send_webhook_with_backoff_test(
+    client:       &Client,
+    url:          &str,
+    payload:      &AlertPayload,
+    secret:       Option<&str>,
+    backoff_base: Duration,
+) -> Result<DeliveryResult> {
+    let (_tx, rx) = oneshot::channel();
+    std::mem::forget(_tx);
+    send_webhook_with_backoff(client, url, payload, secret, backoff_base, rx).await
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -361,7 +429,7 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        send_webhook(&client, &url, &payload, Some(secret)).await.unwrap();
+        send_webhook(&client, &url, &payload, Some(secret), dummy_shutdown()).await.unwrap();
 
         // The raw secret is never sent; only the HMAC signature header is.
         let requests = server.received_requests().await.unwrap();
@@ -401,10 +469,36 @@ mod tests {
 
         let client = build_client().unwrap();
         let url    = format!("{}/hook", server.uri());
-        let result = send_webhook_with_backoff(
+        let result = send_webhook_with_backoff_test(
             &client, &url, &sample_payload(), None, Duration::ZERO,
         ).await;
         assert!(result.is_err());
+    }
+
+    /// Issue #260: shutdown during backoff aborts delivery.
+    #[tokio::test]
+    async fn shutdown_during_backoff_aborts_delivery() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let url    = format!("{}/hook", server.uri());
+
+        let (tx, rx) = oneshot::channel::<()>();
+        // Trigger shutdown immediately.
+        let _ = tx.send(());
+
+        let result = send_webhook_with_backoff(
+            &client, &url, &sample_payload(), None, Duration::from_secs(60), rx,
+        ).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("shutdown") || msg.contains("aborted") || msg.contains("retry"),
+            "expected shutdown-related error, got: {}", msg);
     }
 
     /// Issue #13: test_payload produces a structurally valid AlertPayload.
@@ -422,9 +516,11 @@ mod tests {
     /// Issue #13: test_payload_with_network derives links from the supplied network config.
     #[test]
     fn test_payload_with_network_derives_links_from_config() {
+        use txwatch_config::Network;
+
         let p = test_payload_with_network(
             "Label", "https://example.com/hook",
-            "mainnet", "https://horizon.stellar.org",
+            &Network::Mainnet, "https://horizon.stellar.org",
         );
         assert!(p.horizon_link.starts_with("https://horizon.stellar.org/transactions/"));
         assert!(p.explorer_link.contains("/explorer/public/"));
@@ -434,7 +530,7 @@ mod tests {
         let t = test_payload_with_network(
             "Label",
             "https://example.com/hook",
-            "testnet",
+            &Network::Testnet,
             "https://horizon-testnet.stellar.org",
         );
         assert!(t.explorer_link.contains("/explorer/testnet/"));
