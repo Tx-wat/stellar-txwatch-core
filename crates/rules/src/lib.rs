@@ -89,6 +89,8 @@ pub struct HorizonTransaction {
     pub paging_token: String,
     /// Fee charged in stroops (Horizon returns this as a string).
     pub fee_charged: Option<String>,
+    /// Total number of operations in this transaction as reported by Horizon.
+    pub operation_count: Option<u32>,
     /// Base64-encoded XDR transaction envelope.
     pub envelope_xdr: Option<String>,
     /// Base64-encoded XDR transaction result.
@@ -120,6 +122,8 @@ pub struct EnrichedTransaction {
     pub amount_stroops: Option<u64>,
     /// Fee charged for this transaction in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// Total number of operations in this transaction as reported by Horizon.
+    pub operation_count: Option<u32>,
     /// Memo type from Horizon (`"text"`, `"hash"`, `"id"`, `"return"`, `"none"`).
     pub memo_type: Option<String>,
     /// Memo value from Horizon, if the transaction carries one.
@@ -161,6 +165,7 @@ impl EnrichedTransaction {
                     .as_deref()
                     .and_then(|s| s.parse::<u64>().ok())
             }),
+            operation_count: tx.operation_count,
             memo_type:     tx.memo_type,
             memo:          tx.memo,
         })
@@ -210,6 +215,8 @@ pub struct AlertPayload {
     pub amount_stroops: Option<u64>,
     /// Fee charged in stroops.
     pub fee_charged_stroops: Option<u64>,
+    /// Total number of operations in the transaction.
+    pub operation_count: Option<u32>,
     /// Memo type of the transaction (`"text"`, `"hash"`, `"id"`, `"return"`, `"none"`).
     pub memo_type: Option<String>,
     /// Memo value of the transaction, if any.
@@ -264,6 +271,7 @@ pub fn evaluate(
                 amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
                 amount_stroops: tx.amount_stroops,
                 fee_charged_stroops: tx.fee_charged_stroops,
+                operation_count: tx.operation_count,
                 memo_type: tx.memo_type.clone(),
                 memo: tx.memo.clone(),
                 timestamp,
@@ -391,6 +399,7 @@ mod tests {
             function_names: function_names.iter().map(|s| s.to_string()).collect(),
             amount_stroops,
             fee_charged_stroops: None,
+            operation_count: None,
             memo_type: None,
             memo: None,
         }
@@ -839,6 +848,7 @@ mod tests {
                 function_names: vec![],
                 amount_stroops: None,
                 fee_charged_stroops: None,
+                operation_count: None,
                 memo_type: None,
                 memo: None,
             };
@@ -993,6 +1003,7 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: Some("100".into()),
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
             memo_type: None,
@@ -1046,6 +1057,7 @@ mod tests {
             successful:   true,
             paging_token: "1".into(),
             fee_charged:  None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr:   None,
             ledger: None,
@@ -1111,6 +1123,49 @@ mod tests {
         assert_eq!(payloads[0].function_name.as_deref(), Some("foo"));
     }
 
+    /// Issue #265: operation_count is populated from the Horizon transaction record
+    /// and propagated through EnrichedTransaction into AlertPayload.
+    #[test]
+    fn operation_count_is_populated_from_horizon_response() {
+        let raw = HorizonTransaction {
+            hash: "op_count_tx".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: Some("100".into()),
+            operation_count: Some(5),
+            envelope_xdr: None,
+            result_xdr: None,
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.operation_count, Some(5));
+
+        let payloads = run(&[AlertRule::AnyTransaction], &enriched);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].operation_count, Some(5));
+    }
+
+    /// Issue #265: operation_count is None when Horizon omits the field.
+    #[test]
+    fn operation_count_is_none_when_absent_from_horizon() {
+        let raw = HorizonTransaction {
+            hash: "no_op_count_tx".into(),
+            created_at: "2024-06-01T00:00:00Z".into(),
+            successful: true,
+            paging_token: "1".into(),
+            fee_charged: None,
+            operation_count: None,
+            envelope_xdr: None,
+            result_xdr: None,
+        };
+        let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
+        assert_eq!(enriched.operation_count, None);
+
+        let payloads = run(&[AlertRule::AnyTransaction], &enriched);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].operation_count, None);
+    }
+
     #[test]
     fn alert_payload_network_keeps_lowercase_wire_format() {
         for (network, wire) in [
@@ -1155,6 +1210,7 @@ mod tests {
             amount_xlm: Some(15000),
             amount_stroops: Some(150_000_000_000),
             fee_charged_stroops: Some(50000),
+            operation_count: Some(3),
             memo_type: Some("text".into()),
             memo: Some("order-1234".into()),
             timestamp: 1705316096,
@@ -1179,6 +1235,7 @@ mod tests {
         assert_eq!(obj["amount_xlm"].as_u64(), Some(15000));
         assert_eq!(obj["amount_stroops"].as_u64(), Some(150_000_000_000));
         assert_eq!(obj["fee_charged_stroops"].as_u64(), Some(50000));
+        assert_eq!(obj["operation_count"].as_u64(), Some(3));
         assert_eq!(obj["timestamp"].as_i64(), Some(1705316096));
         assert_eq!(obj["timestamp_iso"].as_str(), Some("2024-01-15T12:00:00Z"));
         assert_eq!(obj["horizon_link"].as_str(), Some("https://horizon-testnet.stellar.org/transactions/abc123"));
