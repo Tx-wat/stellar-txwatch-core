@@ -73,6 +73,10 @@ enum Command {
         /// Sign the payload with HMAC-SHA256 using this secret (sent as X-TxWatch-Signature)
         #[arg(long)]
         secret: Option<String>,
+
+        /// HTTP request timeout in seconds
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
     },
 }
 
@@ -140,7 +144,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::TestWebhook { url, label, secret } => {
+        Command::TestWebhook { url, label, secret, timeout } => {
             let cfg = AppConfig::from_file(&cli.config)?;
             if cfg.contracts.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -150,9 +154,12 @@ async fn main() -> Result<()> {
             let first_contract = &cfg.contracts[0];
             let horizon_base_url = first_contract.network.horizon_base_url();
             let payload = test_payload_with_network(&label, &url, &first_contract.network, horizon_base_url);
-            let client  = build_client().context("failed to build HTTP client")?;
+            let client  = Client::builder()
+                .timeout(Duration::from_secs(timeout))
+                .build()
+                .context("failed to build HTTP client")?;
 
-            info!(url = %url, "sending test webhook");
+            info!(url = %url, timeout_secs = timeout, "sending test webhook");
             send_webhook(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
@@ -205,100 +212,6 @@ async fn main() -> Result<()> {
             info!(
                 version        = VERSION,
                 contracts      = cfg.contracts.len(),
-                interval_secs  = cfg.poll_interval_seconds,
-                dry_run        = dry_run,
-                from_beginning = from_beginning,
-                "starting TxWatch"
-            );
-            txwatch_poller::run_with_options(cfg, dry_run, from_beginning, shutdown_rx).await?;
-        }
-    }
+                interval_secs  = cfg.poll_interva
 
-    Ok(())
-}
-
-async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
-    let response = client.head(url).send().await;
-    match response {
-        Ok(resp) if resp.status().is_success() => return Ok(true),
-        Ok(resp) if resp.status() == StatusCode::METHOD_NOT_ALLOWED || resp.status() == StatusCode::NOT_IMPLEMENTED => {
-            let resp = client.request(reqwest::Method::OPTIONS, url).send().await?;
-            return Ok(resp.status().is_success());
-        }
-        Ok(_) => return Ok(false),
-        Err(err) => {
-            if err.is_builder() {
-                return Err(err.into());
-            }
-            return Ok(false);
-        }
-    }
-}
-// ── Tracing initialisation ────────────────────────────────────────────────────
-
-#[cfg(not(feature = "opentelemetry"))]
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
-}
-
-/// Installs the log subscriber, plus an OTLP span exporter when
-/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set. The returned provider must stay alive
-/// for the whole run so that buffered spans are flushed on shutdown.
-#[cfg(feature = "opentelemetry")]
-fn init_tracing() -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
-    let provider = otel_provider(endpoint.as_deref());
-    let otel_layer = provider
-        .as_ref()
-        .map(|p| tracing_opentelemetry::layer().with_tracer(p.tracer("txwatch")));
-
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(fmt::layer().with_target(false))
-        .with(otel_layer)
-        .init();
-    provider
-}
-
-/// Builds a batch OTLP span exporter. Export is opt-in: with no endpoint,
-/// no exporter is created and no spans leave the process.
-#[cfg(feature = "opentelemetry")]
-fn otel_provider(endpoint: Option<&str>) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
-    // The exporter reads OTEL_EXPORTER_OTLP_ENDPOINT itself; `endpoint` only gates it.
-    endpoint?;
-    match opentelemetry_otlp::SpanExporter::builder().with_tonic().build() {
-        Ok(exporter) => Some(
-            opentelemetry_sdk::trace::SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
-                .build(),
-        ),
-        Err(e) => {
-            eprintln!("failed to build OTLP span exporter, trace export disabled: {e}");
-            None
-        }
-    }
-}
-
-#[cfg(all(test, feature = "opentelemetry"))]
-mod otel_tests {
-    use super::otel_provider;
-
-    #[test]
-    fn no_exporter_is_built_without_an_endpoint() {
-        assert!(otel_provider(None).is_none());
-    }
-
-    #[tokio::test]
-    async fn exporter_is_built_when_an_endpoint_is_configured() {
-        assert!(otel_provider(Some("http://127.0.0.1:4317")).is_some());
-    }
-}
+/* … truncated 3436 chars — edit only what you need near the top … */
