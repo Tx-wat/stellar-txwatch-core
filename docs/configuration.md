@@ -9,6 +9,7 @@ most common configuration errors.
 | Key | Type | Description |
 | --- | --- | --- |
 | `poll_interval_seconds` | integer | How often the poller checks for new transactions. |
+| `allow_internal_webhook_urls` | boolean (optional) | Set to `true` to allow webhook URLs that resolve to localhost or private IP ranges (SSRF protection, default `false`). |
 
 ## `[[contracts]]`
 
@@ -22,6 +23,7 @@ independent: `rules`, `webhook_url`, and `network` apply only to that contract.
 | `network` | yes | One of `mainnet`, `testnet`, `futurenet`. |
 | `webhook_url` | yes | Endpoint that receives alert payloads. |
 | `webhook_secret` | no | HMAC-SHA256 secret sent as `X-TxWatch-Signature`. |
+| `allow_internal_webhook_urls` | no | Per-contract opt-out of SSRF protection for local webhook development. |
 
 ## `[[contracts.rules]]`
 
