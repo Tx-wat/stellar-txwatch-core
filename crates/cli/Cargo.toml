@@ -10,6 +10,10 @@ publish   = false
 name = "txwatch"
 path = "src/main.rs"
 
+[[example]]
+name = "minimal"
+path = "../../examples/minimal.rs"
+
 [dependencies]
 txwatch-config   = { path = "../config" }
 txwatch-poller   = { path = "../poller" }

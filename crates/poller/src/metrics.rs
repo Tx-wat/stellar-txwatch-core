@@ -68,6 +68,27 @@ fn webhook_failures_total() -> &'static IntCounter {
     })
 }
 
+fn build_info_gauge() -> &'static prometheus::GaugeVec {
+    static G: OnceLock<prometheus::GaugeVec> = OnceLock::new();
+    G.get_or_init(|| {
+        let opts = prometheus::opts!(
+            "txwatch_build_info",
+            "Build information for the running TxWatch binary"
+        );
+        let g = prometheus::register_gauge_vec!(opts, &["version", "git_sha"])
+            .expect("register txwatch_build_info");
+        let version = env!("CARGO_PKG_VERSION");
+        let git_sha = option_env!("TXWATCH_GIT_SHA").unwrap_or("unknown");
+        g.with_label_values(&[version, git_sha]).set(1.0);
+        g
+    })
+}
+
+/// Initialize the `txwatch_build_info` gauge metric (Issue #373).
+pub fn init_build_info() {
+    let _ = build_info_gauge();
+}
+
 fn poll_cycles_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
@@ -139,6 +160,7 @@ pub async fn serve_metrics(addr: SocketAddr) -> Result<()> {
 async fn handle_metrics(
     _req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    init_build_info();
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
     let mut buf = Vec::new();
@@ -155,6 +177,16 @@ async fn handle_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_info_metric_is_registered_and_set() {
+        init_build_info();
+        let families = prometheus::gather();
+        let build_info = families.iter().find(|f| f.get_name() == "txwatch_build_info").expect("txwatch_build_info metric");
+        assert_eq!(build_info.get_metric().len(), 1);
+        let metric = &build_info.get_metric()[0];
+        assert_eq!(metric.get_gauge().get_value(), 1.0);
+    }
 
     #[test]
     fn poll_cycles_increment_per_contract() {

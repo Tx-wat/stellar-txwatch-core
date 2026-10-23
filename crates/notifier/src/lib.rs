@@ -122,10 +122,16 @@ async fn send_webhook_with_backoff(
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_secs();
 
+        let idempotency_key = format!(
+            "{}:{}:{}",
+            payload.contract_id, payload.transaction_hash, payload.rule_type
+        );
+
         let mut req = client
             .post(url)
             .header("Content-Type", "application/json")
             .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
+            .header("X-TxWatch-Idempotency-Key", idempotency_key)
             .body(body.clone());
 
         if let Some(s) = secret {
@@ -570,6 +576,26 @@ mod tests {
         let client = Client::new();
         let url    = format!("{}/hook", server.uri());
         let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_header_is_present_and_formatted() {
+        let server = MockServer::start().await;
+        let payload = sample_payload();
+        let expected_key = format!("{}:{}:{}", payload.contract_id, payload.transaction_hash, payload.rule_type);
+
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header("x-txwatch-idempotency-key", expected_key.as_str()))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        let result = send_webhook(&client, &url, &payload, None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
 }
