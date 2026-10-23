@@ -17,6 +17,25 @@ use txwatch_rules::AlertPayload;
 
 const MAX_RETRIES: u32 = 3;
 
+/// Maximum response body size to read for debug logging (4096 bytes / 4 KB).
+/// Prevents OOM when malicious or broken receivers stream endless response bodies (Issue #358).
+pub const MAX_RESPONSE_BODY_BYTES: usize = 4096;
+
+/// Reads at most `MAX_RESPONSE_BODY_BYTES` bytes from a response stream to protect against OOM (Issue #358).
+pub async fn read_response_body_capped(mut resp: reqwest::Response) -> String {
+    let mut buf = Vec::new();
+    while let Ok(Some(chunk)) = resp.chunk().await {
+        if buf.len() + chunk.len() > MAX_RESPONSE_BODY_BYTES {
+            let needed = MAX_RESPONSE_BODY_BYTES.saturating_sub(buf.len());
+            buf.extend_from_slice(&chunk[..needed]);
+            let s = String::from_utf8_lossy(&buf);
+            return format!("{} [truncated]", s);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// Backoff base for webhook retries: attempt `n` waits `RETRY_BASE_DELAY * 2^n`.
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
@@ -142,7 +161,7 @@ async fn send_webhook_with_backoff(
                 span.record("status", final_status);
                 // Issue #24: log response body at debug level.
                 // HTTP 2xx = delivery success regardless of body content.
-                let body_text = resp.text().await.unwrap_or_default();
+                let body_text = read_response_body_capped(resp).await;
                 debug!(
                     timestamp     = %ts,
                     url           = %url,
@@ -569,6 +588,23 @@ mod tests {
 
         let client = Client::new();
         let url    = format!("{}/hook", server.uri());
+        let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn large_response_body_is_truncated_safely() {
+        let server = MockServer::start().await;
+        let large_body = "x".repeat(1_000_000); // 1 MB
+
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(large_body))
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
         let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
     }
