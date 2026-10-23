@@ -96,9 +96,12 @@ pub async fn run_with_shutdown(
 ) -> Result<()> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+    let connect_secs   = cfg.http_connect_timeout_secs.unwrap_or(5);
+    let request_secs   = cfg.http_request_timeout_secs.unwrap_or(15);
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(connect_secs))
+        .timeout(Duration::from_secs(request_secs))
         .pool_max_idle_per_host(max_idle)
         .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
         .build()

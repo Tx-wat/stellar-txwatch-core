@@ -94,6 +94,12 @@ contract label and current cursor when a poll finds nothing new.
 
 ---
 
+## Minimum Supported Rust Version (MSRV)
+
+TxWatch requires **Rust 1.75** or higher (`rust-version = "1.75"`).
+
+---
+
 ## Docker
 
 Build the image:
@@ -316,6 +322,9 @@ scrape_configs:
       iv.  Evaluate all AlertRules → Vec<AlertPayload>
       v.   POST each AlertPayload to webhook_url (retry up to 3×)
 ```
+
+### Log Sampling for Idle Poll Cycles
+To prevent noisy log output during extended idle periods, TxWatch samples `debug!` log emissions for contracts with no new transactions: the first idle cycle logs immediately, and subsequent consecutive idle cycles log once every 60 cycles (or upon new transactions).
 
 ---
 

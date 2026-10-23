@@ -512,6 +512,20 @@ pub struct AppConfig {
     /// A contract's own `max_alerts_per_cycle` takes precedence over this value.
     #[serde(default)]
     pub max_alerts_per_cycle: Option<u64>,
+    /// Connection timeout in seconds for outbound HTTP requests (default: 5 seconds; Issue #366).
+    #[serde(default = "default_http_connect_timeout_secs")]
+    pub http_connect_timeout_secs: Option<u64>,
+    /// Request timeout in seconds for outbound HTTP requests (default: 15 seconds; Issue #366).
+    #[serde(default = "default_http_request_timeout_secs")]
+    pub http_request_timeout_secs: Option<u64>,
+}
+
+fn default_http_connect_timeout_secs() -> Option<u64> {
+    Some(5)
+}
+
+fn default_http_request_timeout_secs() -> Option<u64> {
+    Some(15)
 }
 
 fn default_http_pool_max_idle_per_host() -> Option<usize> {
@@ -663,7 +677,7 @@ impl AppConfig {
         if let Some(path) = &self.cursor_file {
             validate_cursor_file(path)?;
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen_labels = std::collections::HashSet::new();
         for contract in &self.contracts {
             if !seen_labels.insert(&contract.label) {
                 bail!("duplicate contract label '{}'", contract.label);

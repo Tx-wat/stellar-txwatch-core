@@ -573,9 +573,12 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<usize> {
 fn build_http_client(cfg: &AppConfig) -> Result<Client> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+    let connect_secs   = cfg.http_connect_timeout_secs.unwrap_or(5);
+    let request_secs   = cfg.http_request_timeout_secs.unwrap_or(15);
 
     Client::builder()
-        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(connect_secs))
+        .timeout(Duration::from_secs(request_secs))
         .pool_max_idle_per_host(max_idle)
         .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
         .build()
@@ -749,9 +752,30 @@ async fn poll_contract(
         }
     }
 
+static IDLE_CYCLE_COUNTERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> = std::sync::OnceLock::new();
+
+fn should_log_idle(contract_id: &str) -> bool {
+    let mut map = IDLE_CYCLE_COUNTERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let count = map.entry(contract_id.to_string()).or_insert(0);
+    *count += 1;
+    *count == 1 || (*count % 60 == 0)
+}
+
+fn reset_idle_counter(contract_id: &str) {
+    let mut map = IDLE_CYCLE_COUNTERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    map.insert(contract_id.to_string(), 0);
+}
+
     if !all_records.is_empty() {
+        reset_idle_counter(&contract.contract_id);
         info!(contract = %contract.label, count = all_records.len(), "fetched new transactions");
-    } else {
+    } else if should_log_idle(&contract.contract_id) {
         debug!(contract = %contract.label, cursor = %cursor, "no new transactions");
     }
 
@@ -1812,5 +1836,83 @@ mod tests {
         let updated = replace_cursor_param(url, "99");
         assert!(updated.contains("cursor=99"), "got: {}", updated);
         assert!(updated.contains("order=asc"), "got: {}", updated);
+    }
+
+    #[tokio::test]
+    async fn all_rules_fire_independently_on_single_transaction() {
+        let server = MockServer::start().await;
+        let receiver = MockServer::start().await;
+
+        let tx_hash = "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678";
+        let page_json = serde_json::json!({
+            "_embedded": {
+                "records": [
+                    {
+                        "id": tx_hash,
+                        "hash": tx_hash,
+                        "paging_token": "1001",
+                        "successful": false,
+                        "created_at": "2024-01-15T12:00:00Z",
+                        "fee_charged": "1000",
+                        "_embedded": {
+                            "operations": [
+                                {
+                                    "type": "invoke_host_function",
+                                    "function": "set_admin"
+                                },
+                                {
+                                    "type": "payment",
+                                    "amount": "1000.0000000"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path_regex("^/accounts/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page_json))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/hooks"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(4)
+            .mount(&receiver)
+            .await;
+
+        let contract = WatchedContract {
+            label: "TestContract".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: Network::Testnet,
+            rules: vec![
+                AlertRule::AnyTransaction,
+                AlertRule::TransactionFailed,
+                AlertRule::LargeTransfer { threshold_xlm: 100 },
+                AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into()] },
+            ],
+            webhook_url: format!("{}/hooks", receiver.uri()),
+            webhook_secret: None,
+            test_horizon_base_url: Some(server.uri()),
+        };
+
+        let client = Client::new();
+        let mut cursors = HashMap::new();
+        cursors.insert(contract.contract_id.clone(), "now".to_string());
+
+        let (_txs, alerts) = poll_contract(&client, &client, &contract, &mut cursors, false).await.unwrap();
+        assert_eq!(alerts, 4, "all 4 rules should fire independently");
+
+        let requests = receiver.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        let mut rule_types: Vec<String> = requests.iter().map(|req| {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            body["rule_type"].as_str().unwrap().to_string()
+        }).collect();
+        rule_types.sort();
+        assert_eq!(rule_types, vec!["AdminFunctionCalled", "AnyTransaction", "LargeTransfer", "TransactionFailed"]);
     }
 }

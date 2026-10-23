@@ -9,6 +9,8 @@ most common configuration errors.
 | Key | Type | Description |
 | --- | --- | --- |
 | `poll_interval_seconds` | integer | How often the poller checks for new transactions. |
+| `http_connect_timeout_secs` | integer (optional) | Connection establishment timeout in seconds for Horizon HTTP client (default: 5). |
+| `http_request_timeout_secs` | integer (optional) | Total request timeout in seconds for Horizon HTTP client (default: 15). |
 
 ## `[[contracts]]`
 
