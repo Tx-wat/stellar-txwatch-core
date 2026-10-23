@@ -22,6 +22,7 @@ independent: `rules`, `webhook_url`, and `network` apply only to that contract.
 | `network` | yes | One of `mainnet`, `testnet`, `futurenet`. |
 | `webhook_url` | yes | Endpoint that receives alert payloads. |
 | `webhook_secret` | no | HMAC-SHA256 secret sent as `X-TxWatch-Signature`. |
+| `webhook_tls_cert_pem` | no | PEM-encoded certificate string for TLS certificate pinning (Issue #362). |
 
 ## `[[contracts.rules]]`
 

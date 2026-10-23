@@ -68,6 +68,19 @@ fn webhook_failures_total() -> &'static IntCounter {
     })
 }
 
+fn config_reload_total() -> &'static IntCounter {
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    C.get_or_init(|| {
+        let counter = register_int_counter!(
+            "txwatch_config_reload_total",
+            "Total configuration loads and reloads (starts at 1 for initial startup; see issue #227)"
+        )
+        .expect("register txwatch_config_reload_total");
+        counter.inc(); // Starts at 1 for initial load
+        counter
+    })
+}
+
 fn poll_cycles_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
@@ -98,6 +111,12 @@ pub fn inc_webhook_failures() {
 /// Increment the `txwatch_enrichment_errors_total` counter by 1.
 pub fn inc_enrichment_errors() {
     enrichment_errors_total().inc();
+}
+
+/// Increment the `txwatch_config_reload_total` counter by 1.
+/// Reference: Hot-reload on SIGHUP support (issue #227).
+pub fn inc_config_reload() {
+    config_reload_total().inc();
 }
 
 /// Increment the `txwatch_poll_cycles_total` counter for `contract` by 1.

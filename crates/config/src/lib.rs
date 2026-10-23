@@ -359,6 +359,9 @@ pub struct WatchedContract {
     /// set programmatically in tests. Production code must leave this `None`.
     #[serde(skip, default)]
     pub test_horizon_base_url: Option<String>,
+    /// Optional PEM-encoded X.509 certificate for TLS pinning on webhook delivery (Issue #362).
+    #[serde(default)]
+    pub webhook_tls_cert_pem: Option<String>,
 }
 
 /// Maximum length, in characters, of a tag key or value.
@@ -468,6 +471,15 @@ impl WatchedContract {
 
         if let Some(tls) = &self.tls {
             tls.validate(&self.label)?;
+        }
+
+        if let Some(pem) = &self.webhook_tls_cert_pem {
+            if pem.trim().is_empty() {
+                bail!("contract '{}': webhook_tls_cert_pem must not be empty", self.label);
+            }
+            if !pem.contains("-----BEGIN CERTIFICATE-----") || !pem.contains("-----END CERTIFICATE-----") {
+                bail!("contract '{}': webhook_tls_cert_pem is not a valid PEM-encoded certificate", self.label);
+            }
         }
 
         Ok(())
@@ -663,7 +675,7 @@ impl AppConfig {
         if let Some(path) = &self.cursor_file {
             validate_cursor_file(path)?;
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen_labels = std::collections::HashSet::new();
         for contract in &self.contracts {
             if !seen_labels.insert(&contract.label) {
                 bail!("duplicate contract label '{}'", contract.label);
@@ -726,7 +738,19 @@ mod tests {
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
             test_horizon_base_url: None,
+            webhook_tls_cert_pem: None,
         }
+    }
+
+    #[test]
+    fn webhook_tls_cert_pem_validation() {
+        let mut c = valid_contract();
+        c.webhook_tls_cert_pem = Some("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----".into());
+        assert!(c.validate().is_ok());
+
+        let mut invalid_c = valid_contract();
+        invalid_c.webhook_tls_cert_pem = Some("not a pem".into());
+        assert!(invalid_c.validate().is_err());
     }
 
     #[test]

@@ -70,6 +70,17 @@ pub fn build_tls_client(tls: &TlsConfig) -> Result<Client> {
         .map_err(|e| anyhow!("failed to build mTLS HTTP client: {}", e))
 }
 
+/// Build an HTTP client configured with a pinned TLS root certificate (Issue #362).
+pub fn build_pinned_cert_client(cert_pem: &str) -> Result<Client> {
+    let cert = reqwest::Certificate::from_pem(cert_pem.as_bytes())
+        .map_err(|e| anyhow!("invalid webhook_tls_cert_pem: {}", e))?;
+    Client::builder()
+        .timeout(Duration::from_secs(15))
+        .add_root_certificate(cert)
+        .build()
+        .map_err(|e| anyhow!("failed to build TLS pinned client: {}", e))
+}
+
 /// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
 /// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
 ///

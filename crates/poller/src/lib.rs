@@ -288,6 +288,9 @@ pub async fn run_with_shutdown(
         "TxWatch polling engine started"
     );
 
+    #[cfg(feature = "metrics")]
+    metrics::inc_config_reload();
+
     if let Some(requests_per_minute) = rate_limit_warning(cfg.poll_interval_seconds, cfg.contracts.len()) {
         warn!(
             poll_interval_seconds = cfg.poll_interval_seconds,
@@ -1812,5 +1815,63 @@ mod tests {
         let updated = replace_cursor_param(url, "99");
         assert!(updated.contains("cursor=99"), "got: {}", updated);
         assert!(updated.contains("order=asc"), "got: {}", updated);
+    }
+
+    #[tokio::test]
+    async fn concurrent_poll_contract_calls_isolate_cursor_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/accounts/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .mount(&server)
+            .await;
+
+        let client = Client::new();
+
+        let contract_a = WatchedContract {
+            label: "Contract A".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: "https://hooks.example.com/a".into(),
+            webhook_secret: None,
+            test_horizon_base_url: Some(server.uri()),
+            webhook_tls_cert_pem: None,
+        };
+
+        let contract_b = WatchedContract {
+            label: "Contract B".into(),
+            contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+            network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: "https://hooks.example.com/b".into(),
+            webhook_secret: None,
+            test_horizon_base_url: Some(server.uri()),
+            webhook_tls_cert_pem: None,
+        };
+
+        let client_a = client.clone();
+        let client_b = client.clone();
+
+        let handle_a = tokio::spawn(async move {
+            let mut cursors_a = HashMap::new();
+            cursors_a.insert(contract_a.contract_id.clone(), "cursor_a_0".to_string());
+            let _ = poll_contract(&client_a, &client_a, &contract_a, &mut cursors_a, false).await;
+            cursors_a
+        });
+
+        let handle_b = tokio::spawn(async move {
+            let mut cursors_b = HashMap::new();
+            cursors_b.insert(contract_b.contract_id.clone(), "cursor_b_0".to_string());
+            let _ = poll_contract(&client_b, &client_b, &contract_b, &mut cursors_b, false).await;
+            cursors_b
+        });
+
+        let (res_a, res_b) = tokio::join!(handle_a, handle_b);
+        let cursors_a = res_a.unwrap();
+        let cursors_b = res_b.unwrap();
+
+        assert!(!cursors_a.contains_key(&contract_b.contract_id));
+        assert!(!cursors_b.contains_key(&contract_a.contract_id));
     }
 }
