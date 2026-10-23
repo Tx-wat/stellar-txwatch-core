@@ -8,6 +8,8 @@ use tracing::{info, warn};
 use txwatch_config::AppConfig;
 use txwatch_notifier::{build_client, send_webhook, test_payload_with_network};
 
+mod stream;
+
 // ── CLI definition ────────────────────────────────────────────────────────────
 
 const VERSION: &str = concat!(
@@ -52,6 +54,14 @@ enum Command {
         /// Useful for CI, one-shot cron jobs, or debugging without a long-running process.
         #[arg(long)]
         poll_once: bool,
+
+        /// Optional address to bind the SSE /stream alert server (e.g. 127.0.0.1:8088)
+        #[arg(long)]
+        stream_addr: Option<std::net::SocketAddr>,
+
+        /// Optional bearer token for SSE /stream endpoint authentication
+        #[arg(long, env = "TXWATCH_STREAM_TOKEN")]
+        stream_token: Option<String>,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -190,8 +200,19 @@ async fn main() -> Result<()> {
             println!("Test webhook delivered successfully to {} ({})", url, signing);
         }
 
-        Command::Watch { dry_run, from_beginning, poll_once } => {
+        Command::Watch {
+            dry_run,
+            from_beginning,
+            poll_once,
+            stream_addr,
+            stream_token,
+        } => {
             let cfg = AppConfig::from_file(&cli.config)?;
+
+            if let Some(addr) = stream_addr {
+                let (_broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
+                crate::stream::run_sse_server(addr, stream_token, broadcast_rx).await?;
+            }
 
             if poll_once {
                 let failed = txwatch_poller::run_once(cfg, dry_run).await?;

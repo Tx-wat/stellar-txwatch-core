@@ -634,7 +634,11 @@ fn initial_cursors(cfg: &AppConfig) -> HashMap<String, String> {
 #[tracing::instrument(skip(horizon, client, contract, cursors), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
-    network     = %contract.network.as_str()
+    network     = %contract.network.as_str(),
+    tx_count    = tracing::field::Empty,
+    alert_count = tracing::field::Empty,
+    duration_ms = tracing::field::Empty,
+    outcome     = tracing::field::Empty,
 ))]
 async fn poll_contract(
     client:         &Client,
@@ -643,6 +647,7 @@ async fn poll_contract(
     cursors:        &mut HashMap<String, String>,
     dry_run:        bool,
 ) -> Result<(u64, u64)> {
+    let start_time = std::time::Instant::now();
     let cursor = cursors
         .get(&contract.contract_id)
         .cloned()
@@ -860,6 +865,13 @@ async fn poll_contract(
         info!(contract = %contract.label, transactions = tx_count, alerts = alert_count,
             "poll cycle complete");
     }
+
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+    let span = tracing::Span::current();
+    span.record("tx_count", tx_count);
+    span.record("alert_count", alert_count);
+    span.record("duration_ms", duration_ms);
+    span.record("outcome", "ok");
 
     Ok((tx_count, alert_count, suppressed))
 }

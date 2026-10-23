@@ -15,6 +15,12 @@ most common configuration errors.
 Each `[[contracts]]` block describes one contract to watch. Blocks are
 independent: `rules`, `webhook_url`, and `network` apply only to that contract.
 
+> **Contract Limit (`MAX_CONTRACTS`):**
+> TxWatch enforces a maximum limit of 100 contracts per configuration (`MAX_CONTRACTS = 100`).
+> Each contract spawns concurrent Horizon polling routines; exceeding this limit risks high memory usage
+> and socket / file-descriptor exhaustion. If you need to monitor more than 100 contracts, deploy multiple
+> TxWatch instances partitioned by contract group or network.
+
 | Key | Required | Description |
 | --- | --- | --- |
 | `label` | yes | Unique human-readable name for the contract. |
@@ -22,6 +28,31 @@ independent: `rules`, `webhook_url`, and `network` apply only to that contract.
 | `network` | yes | One of `mainnet`, `testnet`, `futurenet`. |
 | `webhook_url` | yes | Endpoint that receives alert payloads. |
 | `webhook_secret` | no | HMAC-SHA256 secret sent as `X-TxWatch-Signature`. |
+
+### Webhook Signature Verification Security Notice
+When verifying the `X-TxWatch-Signature` header, receivers **must** use constant-time comparison (e.g. `hmac.compare_digest` in Python or `crypto.timingSafeEqual` in Node.js) rather than naive string comparison (`==`). Standard equality operators leak timing information through byte-by-byte short-circuiting, exposing endpoints to timing attacks.
+
+**Python example:**
+```python
+import hmac, hashlib
+
+def verify_signature(secret: str, body: bytes, signature_header: str) -> bool:
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+```
+
+**Node.js example:**
+```javascript
+const crypto = require('crypto');
+
+function verifySignature(secret, body, signatureHeader) {
+  const hmac = crypto.createHmac('sha256', secret);
+  hmac.update(body);
+  const expected = Buffer.from('sha256=' + hmac.digest('hex'));
+  const actual = Buffer.from(signatureHeader);
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+```
 
 ## `[[contracts.rules]]`
 
