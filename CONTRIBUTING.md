@@ -238,6 +238,11 @@ test in `crates/poller/tests/integration.rs`.
 
 Add an entry to `docs/alert-rules.md`.
 
+## Architecture Decision Records (ADRs)
+
+Key architectural decisions are documented in `docs/adr/`:
+- [ADR 001: Advance Cursor Before Transaction Enrichment](docs/adr/001-cursor-advance-before-enrichment.md)
+
 ---
 
 ## Code style

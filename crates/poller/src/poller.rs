@@ -96,8 +96,13 @@ pub async fn run_with_shutdown(
 ) -> Result<()> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+    let user_agent     = cfg
+        .http_user_agent
+        .as_deref()
+        .unwrap_or(concat!("txwatch/", env!("CARGO_PKG_VERSION")));
 
     let client = Client::builder()
+        .user_agent(user_agent)
         .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(max_idle)
         .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))

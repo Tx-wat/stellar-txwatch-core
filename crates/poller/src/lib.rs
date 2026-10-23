@@ -573,8 +573,13 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<usize> {
 fn build_http_client(cfg: &AppConfig) -> Result<Client> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+    let user_agent     = cfg
+        .http_user_agent
+        .as_deref()
+        .unwrap_or(concat!("txwatch/", env!("CARGO_PKG_VERSION")));
 
     Client::builder()
+        .user_agent(user_agent)
         .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(max_idle)
         .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
@@ -765,6 +770,7 @@ async fn poll_contract(
 
         // Advance cursor before enrichment so the tx is not re-processed even if
         // op enrichment fails.
+        // See ADR: docs/adr/001-cursor-advance-before-enrichment.md
         cursors.insert(contract.contract_id.clone(), paging_token.clone());
 
         // Issue #23: if Horizon returned inline operations, use them directly.
@@ -1812,5 +1818,34 @@ mod tests {
         let updated = replace_cursor_param(url, "99");
         assert!(updated.contains("cursor=99"), "got: {}", updated);
         assert!(updated.contains("order=asc"), "got: {}", updated);
+    }
+
+    #[tokio::test]
+    async fn horizon_requests_include_user_agent_header() {
+        use wiremock::matchers::{header, method, path_regex};
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex("^/accounts/.*"))
+            .and(header("user-agent", "custom-txwatch-agent/1.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cfg = AppConfig {
+            poll_interval_seconds: 10,
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: None,
+            http_user_agent: Some("custom-txwatch-agent/1.0".to_string()),
+            contracts: vec![],
+        };
+
+        let client = build_http_client(&cfg).unwrap();
+        let resp = client.get(format!("{}/accounts/test", server.uri())).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
     }
 }

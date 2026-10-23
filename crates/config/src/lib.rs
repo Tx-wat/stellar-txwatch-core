@@ -481,6 +481,18 @@ impl WatchedContract {
 /// potentially exhausting memory or file descriptors.
 pub const MAX_CONTRACTS: usize = 100;
 
+// Typestate pattern evaluation for AppConfig (Issue #339):
+// A typestate design (`AppConfig<Unvalidated>` -> `AppConfig<Validated>`) was evaluated
+// and rejected (wontfix) for the following reasons:
+// 1. Ergonomics: AppConfig is a plain configuration struct passed across threads, async
+//    tasks, and CLI command boundaries. Adding a type-level state parameter complicates function
+//    signatures (e.g. run, run_with, run_with_shutdown) without practical safety gains, as
+//    `AppConfig::from_file` already guarantees that validation occurs before execution.
+// 2. Test maintenance: Many integration tests construct mock `AppConfig` instances directly
+//    with minimal fields. Mandating a typestate transition or validated wrapper would add
+//    needless ceremony and break test ergonomics across the workspace.
+// 3. Deserialization: Serde deserialization directly into the struct remains idiomatic and clean;
+//    runtime validation via `validate()` provides richer error reporting with field contexts.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -512,6 +524,10 @@ pub struct AppConfig {
     /// A contract's own `max_alerts_per_cycle` takes precedence over this value.
     #[serde(default)]
     pub max_alerts_per_cycle: Option<u64>,
+    /// Configurable HTTP User-Agent header for Horizon requests (Issue #340).
+    /// Defaults to `txwatch/<version>` when unset.
+    #[serde(default)]
+    pub http_user_agent: Option<String>,
 }
 
 fn default_http_pool_max_idle_per_host() -> Option<usize> {
@@ -663,7 +679,7 @@ impl AppConfig {
         if let Some(path) = &self.cursor_file {
             validate_cursor_file(path)?;
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen_labels = std::collections::HashSet::new();
         for contract in &self.contracts {
             if !seen_labels.insert(&contract.label) {
                 bail!("duplicate contract label '{}'", contract.label);
