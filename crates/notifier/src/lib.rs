@@ -219,6 +219,30 @@ async fn send_webhook_with_backoff(
     Err(err)
 }
 
+/// Constant-time verification helper for webhook receivers to verify `X-TxWatch-Signature`
+/// without vulnerability to timing attacks (Issue #354).
+pub fn verify_signature_constant_time(secret: &[u8], body: &[u8], signature_header: &str) -> bool {
+    let expected_hex = signature_header.strip_prefix("sha256=").unwrap_or(signature_header);
+    let expected_bytes = match hex::decode(expected_hex.trim()) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let mut mac = match Hmac::<Sha256>::new_from_slice(secret) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    let computed_bytes = mac.finalize().into_bytes();
+    if computed_bytes.len() != expected_bytes.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in computed_bytes.iter().zip(expected_bytes.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 /// Build a synthetic `AlertPayload` suitable for `test-webhook`.
 pub fn test_payload(label: &str, webhook_url: &str) -> AlertPayload {
     test_payload_with_network(label, webhook_url, &Network::Testnet, "https://horizon-testnet.stellar.org")
@@ -435,6 +459,12 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         let sig = requests[0].headers.get("x-txwatch-signature").unwrap();
         assert_eq!(sig, &expected);
+
+        // Constant time verification succeeds
+        assert!(verify_signature_constant_time(secret.as_bytes(), body.as_bytes(), sig.as_str()));
+        // Rejects mismatched signature
+        assert!(!verify_signature_constant_time(secret.as_bytes(), b"tampered body", sig.as_str()));
+        assert!(!verify_signature_constant_time(b"wrong-secret", body.as_bytes(), sig.as_str()));
     }
 
     #[tokio::test]
