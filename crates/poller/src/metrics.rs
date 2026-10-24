@@ -166,7 +166,7 @@ async fn handle_metrics(
         .unwrap_or_default();
     Ok(Response::builder()
         .status(200)
-        .header("Content-Type", encoder.format_type())
+        .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
         .body(Full::new(Bytes::from(buf)))
         .unwrap())
 }
@@ -174,6 +174,21 @@ async fn handle_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metrics_endpoint_content_type_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        serve_metrics(addr).await.unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client.get(format!("http://{}/metrics", addr)).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert_eq!(ct, "text/plain; version=0.0.4; charset=utf-8");
+    }
 
     #[test]
     fn poll_cycles_increment_per_contract() {

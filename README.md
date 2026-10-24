@@ -94,6 +94,12 @@ contract label and current cursor when a poll finds nothing new.
 
 ---
 
+## Minimum Supported Rust Version (MSRV)
+
+TxWatch requires **Rust 1.75** or higher (`rust-version = "1.75"`).
+
+---
+
 ## Docker
 
 Build the image:
@@ -138,12 +144,14 @@ Optional OpenTelemetry trace export: build with `--features opentelemetry` and s
 **watch flags:**
 - `--dry-run` — evaluate rules and log matches, but do not send any webhooks
 - `--from-beginning` — start polling from the earliest available transaction (cursor `0`) instead of `now`. Overrides any persisted `cursor_file` values for this run (does not modify the file). Warning: may generate many alerts for historical transactions.
+- `--stream-addr <ADDR>` — enable Server-Sent Events (SSE) streaming on `GET /stream` (e.g. `127.0.0.1:8088`) for local development without public webhooks.
+- `--stream-token <TOKEN>` — optional bearer authentication token required to connect to the SSE `/stream` endpoint.
 
 ---
 
 ## Config
 
-See [docs/configuration.md](docs/configuration.md) for the full reference.
+See [docs/configuration.md](docs/configuration.md) for the full reference. For monitoring contracts on Stellar Futurenet, see [docs/futurenet-guide.md](docs/futurenet-guide.md).
 
 ```toml
 poll_interval_seconds = 10
@@ -215,6 +223,8 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `Content-Length: <length of JSON body in bytes>`
 - `X-TxWatch-Version: <package version>`
 - `X-TxWatch-Signature: sha256=<hmac>` (optional, only when `webhook_secret` is configured — HMAC-SHA256 of the request body)
+
+> **Security Note:** Webhook receivers must use constant-time comparison (e.g. `hmac.compare_digest` in Python or `crypto.timingSafeEqual` in Node.js) when validating `X-TxWatch-Signature` to protect against timing attacks. Naive equality (`==`) leaks timing information.
 
 **Fields:**
 - `rule_type` — stable machine-readable rule variant (e.g. `"LargeTransfer"`, `"HighFee"`); use this for programmatic routing
@@ -317,6 +327,9 @@ scrape_configs:
       iv.  Evaluate all AlertRules → Vec<AlertPayload>
       v.   POST each AlertPayload to webhook_url (retry up to 3×)
 ```
+
+### Log Sampling for Idle Poll Cycles
+To prevent noisy log output during extended idle periods, TxWatch samples `debug!` log emissions for contracts with no new transactions: the first idle cycle logs immediately, and subsequent consecutive idle cycles log once every 60 cycles (or upon new transactions).
 
 ---
 

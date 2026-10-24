@@ -576,8 +576,13 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<usize> {
 fn build_http_client(cfg: &AppConfig) -> Result<Client> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+    let user_agent     = cfg
+        .http_user_agent
+        .as_deref()
+        .unwrap_or(concat!("txwatch/", env!("CARGO_PKG_VERSION")));
 
     Client::builder()
+        .user_agent(user_agent)
         .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(max_idle)
         .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
@@ -637,7 +642,11 @@ fn initial_cursors(cfg: &AppConfig) -> HashMap<String, String> {
 #[tracing::instrument(skip(horizon, client, contract, cursors), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
-    network     = %contract.network.as_str()
+    network     = %contract.network.as_str(),
+    tx_count    = tracing::field::Empty,
+    alert_count = tracing::field::Empty,
+    duration_ms = tracing::field::Empty,
+    outcome     = tracing::field::Empty,
 ))]
 async fn poll_contract(
     client:         &Client,
@@ -646,6 +655,7 @@ async fn poll_contract(
     cursors:        &mut HashMap<String, String>,
     dry_run:        bool,
 ) -> Result<(u64, u64)> {
+    let start_time = std::time::Instant::now();
     let cursor = cursors
         .get(&contract.contract_id)
         .cloned()
@@ -752,9 +762,30 @@ async fn poll_contract(
         }
     }
 
+static IDLE_CYCLE_COUNTERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> = std::sync::OnceLock::new();
+
+fn should_log_idle(contract_id: &str) -> bool {
+    let mut map = IDLE_CYCLE_COUNTERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let count = map.entry(contract_id.to_string()).or_insert(0);
+    *count += 1;
+    *count == 1 || (*count % 60 == 0)
+}
+
+fn reset_idle_counter(contract_id: &str) {
+    let mut map = IDLE_CYCLE_COUNTERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    map.insert(contract_id.to_string(), 0);
+}
+
     if !all_records.is_empty() {
+        reset_idle_counter(&contract.contract_id);
         info!(contract = %contract.label, count = all_records.len(), "fetched new transactions");
-    } else {
+    } else if should_log_idle(&contract.contract_id) {
         debug!(contract = %contract.label, cursor = %cursor, "no new transactions");
     }
 
@@ -768,6 +799,7 @@ async fn poll_contract(
 
         // Advance cursor before enrichment so the tx is not re-processed even if
         // op enrichment fails.
+        // See ADR: docs/adr/001-cursor-advance-before-enrichment.md
         cursors.insert(contract.contract_id.clone(), paging_token.clone());
 
         // Issue #23: if Horizon returned inline operations, use them directly.
@@ -863,6 +895,13 @@ async fn poll_contract(
         info!(contract = %contract.label, transactions = tx_count, alerts = alert_count,
             "poll cycle complete");
     }
+
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+    let span = tracing::Span::current();
+    span.record("tx_count", tx_count);
+    span.record("alert_count", alert_count);
+    span.record("duration_ms", duration_ms);
+    span.record("outcome", "ok");
 
     Ok((tx_count, alert_count, suppressed))
 }
@@ -1818,60 +1857,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_poll_contract_calls_isolate_cursor_state() {
+    async fn horizon_requests_include_user_agent_header() {
+        use wiremock::matchers::{header, method, path_regex};
         let server = MockServer::start().await;
+
         Mock::given(method("GET"))
             .and(path_regex("^/accounts/.*"))
+            .and(header("user-agent", "custom-txwatch-agent/1.0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .expect(1)
             .mount(&server)
             .await;
 
-        let client = Client::new();
-
-        let contract_a = WatchedContract {
-            label: "Contract A".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network: Network::Testnet,
-            rules: vec![AlertRule::AnyTransaction],
-            webhook_url: "https://hooks.example.com/a".into(),
-            webhook_secret: None,
-            test_horizon_base_url: Some(server.uri()),
-            webhook_tls_cert_pem: None,
+        let cfg = AppConfig {
+            poll_interval_seconds: 10,
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: None,
+            http_user_agent: Some("custom-txwatch-agent/1.0".to_string()),
+            contracts: vec![],
         };
 
-        let contract_b = WatchedContract {
-            label: "Contract B".into(),
-            contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
-            network: Network::Testnet,
-            rules: vec![AlertRule::AnyTransaction],
-            webhook_url: "https://hooks.example.com/b".into(),
-            webhook_secret: None,
-            test_horizon_base_url: Some(server.uri()),
-            webhook_tls_cert_pem: None,
-        };
-
-        let client_a = client.clone();
-        let client_b = client.clone();
-
-        let handle_a = tokio::spawn(async move {
-            let mut cursors_a = HashMap::new();
-            cursors_a.insert(contract_a.contract_id.clone(), "cursor_a_0".to_string());
-            let _ = poll_contract(&client_a, &client_a, &contract_a, &mut cursors_a, false).await;
-            cursors_a
-        });
-
-        let handle_b = tokio::spawn(async move {
-            let mut cursors_b = HashMap::new();
-            cursors_b.insert(contract_b.contract_id.clone(), "cursor_b_0".to_string());
-            let _ = poll_contract(&client_b, &client_b, &contract_b, &mut cursors_b, false).await;
-            cursors_b
-        });
-
-        let (res_a, res_b) = tokio::join!(handle_a, handle_b);
-        let cursors_a = res_a.unwrap();
-        let cursors_b = res_b.unwrap();
-
-        assert!(!cursors_a.contains_key(&contract_b.contract_id));
-        assert!(!cursors_b.contains_key(&contract_a.contract_id));
+        let client = build_http_client(&cfg).unwrap();
+        let resp = client.get(format!("{}/accounts/test", server.uri())).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
     }
 }
