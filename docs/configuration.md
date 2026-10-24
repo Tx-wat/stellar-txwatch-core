@@ -9,7 +9,7 @@ most common configuration errors.
 | Key | Type | Description |
 | --- | --- | --- |
 | `poll_interval_seconds` | integer | How often the poller checks for new transactions. |
-| `allow_internal_webhook_urls` | boolean (optional) | Set to `true` to allow webhook URLs that resolve to localhost or private IP ranges (SSRF protection, default `false`). |
+| `http_user_agent` | string (optional) | Custom HTTP User-Agent header for Horizon requests (default: `txwatch/<version>`). |
 
 ## `[[contracts]]`
 

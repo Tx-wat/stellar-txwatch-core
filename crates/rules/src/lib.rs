@@ -415,6 +415,8 @@ pub fn eval_time_window(
 impl AlertPayload {
     /// Build the webhook payload for `rule` matching `tx` on the contract described by `ctx`.
     pub fn new(ctx: &PayloadContext<'_>, tx: &EnrichedTransaction, rule: &AlertRule) -> Self {
+        let horizon_base = ctx.horizon_base.trim_end_matches('/');
+        let explorer_base = ctx.explorer_base.trim_end_matches('/');
         Self {
             label: ctx.label.to_string(),
             contract_id: ctx.contract_id.to_string(),
@@ -428,8 +430,8 @@ impl AlertPayload {
             fee_charged_stroops: tx.fee_charged_stroops,
             timestamp: tx.timestamp.timestamp(),
             timestamp_iso: tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            horizon_link: format!("{}/transactions/{}", ctx.horizon_base, tx.hash),
-            explorer_link: format!("{}/tx/{}", ctx.explorer_base, tx.hash),
+            horizon_link: format!("{}/transactions/{}", horizon_base, tx.hash),
+            explorer_link: format!("{}/tx/{}", explorer_base, tx.hash),
             tags: ctx.tags.cloned(),
         }
     }
@@ -980,6 +982,22 @@ mod tests {
         );
         assert_eq!(p.horizon_link,  p2.horizon_link);
         assert_eq!(p.explorer_link, p2.explorer_link);
+    }
+
+    #[test]
+    fn alert_payload_new_normalises_trailing_slashes() {
+        let tx = make_tx(true, &[], None);
+        let ctx = PayloadContext {
+            label: "TestContract",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org/",
+            explorer_base: "https://stellar.expert/explorer/testnet/",
+            tags: None,
+        };
+        let p = AlertPayload::new(&ctx, &tx, &AlertRule::AnyTransaction);
+        assert_eq!(p.horizon_link, format!("https://horizon-testnet.stellar.org/transactions/{}", tx.hash));
+        assert_eq!(p.explorer_link, format!("https://stellar.expert/explorer/testnet/tx/{}", tx.hash));
     }
 
     #[test]
