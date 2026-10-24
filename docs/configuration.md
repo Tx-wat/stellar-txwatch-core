@@ -9,13 +9,18 @@ most common configuration errors.
 | Key | Type | Description |
 | --- | --- | --- |
 | `poll_interval_seconds` | integer | How often the poller checks for new transactions. |
-| `http_connect_timeout_secs` | integer (optional) | Connection establishment timeout in seconds for Horizon HTTP client (default: 5). |
-| `http_request_timeout_secs` | integer (optional) | Total request timeout in seconds for Horizon HTTP client (default: 15). |
+| `http_user_agent` | string (optional) | Custom HTTP User-Agent header for Horizon requests (default: `txwatch/<version>`). |
 
 ## `[[contracts]]`
 
 Each `[[contracts]]` block describes one contract to watch. Blocks are
 independent: `rules`, `webhook_url`, and `network` apply only to that contract.
+
+> **Contract Limit (`MAX_CONTRACTS`):**
+> TxWatch enforces a maximum limit of 100 contracts per configuration (`MAX_CONTRACTS = 100`).
+> Each contract spawns concurrent Horizon polling routines; exceeding this limit risks high memory usage
+> and socket / file-descriptor exhaustion. If you need to monitor more than 100 contracts, deploy multiple
+> TxWatch instances partitioned by contract group or network.
 
 | Key | Required | Description |
 | --- | --- | --- |
@@ -24,6 +29,32 @@ independent: `rules`, `webhook_url`, and `network` apply only to that contract.
 | `network` | yes | One of `mainnet`, `testnet`, `futurenet`. |
 | `webhook_url` | yes | Endpoint that receives alert payloads. |
 | `webhook_secret` | no | HMAC-SHA256 secret sent as `X-TxWatch-Signature`. |
+| `allow_internal_webhook_urls` | no | Per-contract opt-out of SSRF protection for local webhook development. |
+
+### Webhook Signature Verification Security Notice
+When verifying the `X-TxWatch-Signature` header, receivers **must** use constant-time comparison (e.g. `hmac.compare_digest` in Python or `crypto.timingSafeEqual` in Node.js) rather than naive string comparison (`==`). Standard equality operators leak timing information through byte-by-byte short-circuiting, exposing endpoints to timing attacks.
+
+**Python example:**
+```python
+import hmac, hashlib
+
+def verify_signature(secret: str, body: bytes, signature_header: str) -> bool:
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
+```
+
+**Node.js example:**
+```javascript
+const crypto = require('crypto');
+
+function verifySignature(secret, body, signatureHeader) {
+  const hmac = crypto.createHmac('sha256', secret);
+  hmac.update(body);
+  const expected = Buffer.from('sha256=' + hmac.digest('hex'));
+  const actual = Buffer.from(signatureHeader);
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+```
 
 ## `[[contracts.rules]]`
 

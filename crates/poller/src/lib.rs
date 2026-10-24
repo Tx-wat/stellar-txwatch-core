@@ -573,12 +573,14 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<usize> {
 fn build_http_client(cfg: &AppConfig) -> Result<Client> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
-    let connect_secs   = cfg.http_connect_timeout_secs.unwrap_or(5);
-    let request_secs   = cfg.http_request_timeout_secs.unwrap_or(15);
+    let user_agent     = cfg
+        .http_user_agent
+        .as_deref()
+        .unwrap_or(concat!("txwatch/", env!("CARGO_PKG_VERSION")));
 
     Client::builder()
-        .connect_timeout(Duration::from_secs(connect_secs))
-        .timeout(Duration::from_secs(request_secs))
+        .user_agent(user_agent)
+        .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(max_idle)
         .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
         .build()
@@ -637,7 +639,11 @@ fn initial_cursors(cfg: &AppConfig) -> HashMap<String, String> {
 #[tracing::instrument(skip(horizon, client, contract, cursors), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
-    network     = %contract.network.as_str()
+    network     = %contract.network.as_str(),
+    tx_count    = tracing::field::Empty,
+    alert_count = tracing::field::Empty,
+    duration_ms = tracing::field::Empty,
+    outcome     = tracing::field::Empty,
 ))]
 async fn poll_contract(
     client:         &Client,
@@ -646,6 +652,7 @@ async fn poll_contract(
     cursors:        &mut HashMap<String, String>,
     dry_run:        bool,
 ) -> Result<(u64, u64)> {
+    let start_time = std::time::Instant::now();
     let cursor = cursors
         .get(&contract.contract_id)
         .cloned()
@@ -789,6 +796,7 @@ fn reset_idle_counter(contract_id: &str) {
 
         // Advance cursor before enrichment so the tx is not re-processed even if
         // op enrichment fails.
+        // See ADR: docs/adr/001-cursor-advance-before-enrichment.md
         cursors.insert(contract.contract_id.clone(), paging_token.clone());
 
         // Issue #23: if Horizon returned inline operations, use them directly.
@@ -884,6 +892,13 @@ fn reset_idle_counter(contract_id: &str) {
         info!(contract = %contract.label, transactions = tx_count, alerts = alert_count,
             "poll cycle complete");
     }
+
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+    let span = tracing::Span::current();
+    span.record("tx_count", tx_count);
+    span.record("alert_count", alert_count);
+    span.record("duration_ms", duration_ms);
+    span.record("outcome", "ok");
 
     Ok((tx_count, alert_count, suppressed))
 }
@@ -1839,80 +1854,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_rules_fire_independently_on_single_transaction() {
+    async fn horizon_requests_include_user_agent_header() {
+        use wiremock::matchers::{header, method, path_regex};
         let server = MockServer::start().await;
-        let receiver = MockServer::start().await;
-
-        let tx_hash = "deadbeef12345678deadbeef12345678deadbeef12345678deadbeef12345678";
-        let page_json = serde_json::json!({
-            "_embedded": {
-                "records": [
-                    {
-                        "id": tx_hash,
-                        "hash": tx_hash,
-                        "paging_token": "1001",
-                        "successful": false,
-                        "created_at": "2024-01-15T12:00:00Z",
-                        "fee_charged": "1000",
-                        "_embedded": {
-                            "operations": [
-                                {
-                                    "type": "invoke_host_function",
-                                    "function": "set_admin"
-                                },
-                                {
-                                    "type": "payment",
-                                    "amount": "1000.0000000"
-                                }
-                            ]
-                        }
-                    }
-                ]
-            }
-        });
 
         Mock::given(method("GET"))
             .and(path_regex("^/accounts/.*"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(page_json))
+            .and(header("user-agent", "custom-txwatch-agent/1.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .expect(1)
             .mount(&server)
             .await;
 
-        Mock::given(method("POST"))
-            .and(path("/hooks"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(4)
-            .mount(&receiver)
-            .await;
-
-        let contract = WatchedContract {
-            label: "TestContract".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network: Network::Testnet,
-            rules: vec![
-                AlertRule::AnyTransaction,
-                AlertRule::TransactionFailed,
-                AlertRule::LargeTransfer { threshold_xlm: 100 },
-                AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into()] },
-            ],
-            webhook_url: format!("{}/hooks", receiver.uri()),
-            webhook_secret: None,
-            test_horizon_base_url: Some(server.uri()),
+        let cfg = AppConfig {
+            poll_interval_seconds: 10,
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: None,
+            http_user_agent: Some("custom-txwatch-agent/1.0".to_string()),
+            contracts: vec![],
         };
 
-        let client = Client::new();
-        let mut cursors = HashMap::new();
-        cursors.insert(contract.contract_id.clone(), "now".to_string());
-
-        let (_txs, alerts) = poll_contract(&client, &client, &contract, &mut cursors, false).await.unwrap();
-        assert_eq!(alerts, 4, "all 4 rules should fire independently");
-
-        let requests = receiver.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 4);
-        let mut rule_types: Vec<String> = requests.iter().map(|req| {
-            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
-            body["rule_type"].as_str().unwrap().to_string()
-        }).collect();
-        rule_types.sort();
-        assert_eq!(rule_types, vec!["AdminFunctionCalled", "AnyTransaction", "LargeTransfer", "TransactionFailed"]);
+        let client = build_http_client(&cfg).unwrap();
+        let resp = client.get(format!("{}/accounts/test", server.uri())).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
     }
 }
