@@ -86,11 +86,18 @@ cargo run -p txwatch -- --config config/my-config.toml \
 
 # 5. Start watching
 cargo run -p txwatch -- --config config/my-config.toml watch
+
+# Or run the self-contained minimal quickstart example:
+cargo run --example minimal
 ```
 
 Set `RUST_LOG=debug` for verbose output. This also enables per-contract idle
 poll logs — the poller emits `"no new transactions"` debug messages with the
 contract label and current cursor when a poll finds nothing new.
+
+### Supported Targets
+- `x86_64-unknown-linux-gnu` (default Linux server target)
+- `aarch64-unknown-linux-musl` (ARM64 servers, AWS Graviton, Raspberry Pi)
 
 ---
 
@@ -222,6 +229,7 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 - `Content-Type: application/json`
 - `Content-Length: <length of JSON body in bytes>`
 - `X-TxWatch-Version: <package version>`
+- `X-TxWatch-Idempotency-Key: {contract_id}:{transaction_hash}:{rule_type}` (unique key per contract, transaction, and rule)
 - `X-TxWatch-Signature: sha256=<hmac>` (optional, only when `webhook_secret` is configured — HMAC-SHA256 of the request body)
 
 > **Security Note:** Webhook receivers must use constant-time comparison (e.g. `hmac.compare_digest` in Python or `crypto.timingSafeEqual` in Node.js) when validating `X-TxWatch-Signature` to protect against timing attacks. Naive equality (`==`) leaks timing information.
@@ -286,7 +294,7 @@ Build with the `metrics` feature to expose Prometheus counters and an HTTP `/met
 cargo build -p txwatch-poller --features metrics
 ```
 
-Four counters are registered:
+Metrics registered:
 
 | Counter | Description |
 |---|---|

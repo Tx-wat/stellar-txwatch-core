@@ -152,10 +152,16 @@ async fn send_webhook_with_backoff(
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_secs();
 
+        let idempotency_key = format!(
+            "{}:{}:{}",
+            payload.contract_id, payload.transaction_hash, payload.rule_type
+        );
+
         let mut req = client
             .post(url)
             .header("Content-Type", "application/json")
             .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
+            .header("X-TxWatch-Idempotency-Key", idempotency_key)
             .body(body.clone());
 
         if let Some(s) = secret {

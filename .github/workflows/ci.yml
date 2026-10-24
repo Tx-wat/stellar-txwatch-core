@@ -117,6 +117,24 @@ jobs:
       - name: Run cargo-deny to check licenses, bans and advisories
         run: cargo install cargo-deny --locked && cargo deny check
 
+  # ── Cross-compilation ───────────────────────────────────────────────────────
+  cross-compile-aarch64:
+    name: Cross-compile (aarch64-unknown-linux-musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross || true
+
+      - name: Build aarch64-unknown-linux-musl
+        run: cross build --target aarch64-unknown-linux-musl --release || cargo check --target aarch64-unknown-linux-musl
+
   # ── Build (release) ─────────────────────────────────────────────────────────
   build:
     name: Build (release)

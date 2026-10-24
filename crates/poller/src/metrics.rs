@@ -158,6 +158,7 @@ pub async fn serve_metrics(addr: SocketAddr) -> Result<()> {
 async fn handle_metrics(
     _req: Request<hyper::body::Incoming>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    init_build_info();
     use prometheus::Encoder;
     let encoder = prometheus::TextEncoder::new();
     let mut buf = Vec::new();
@@ -188,6 +189,16 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
         assert_eq!(ct, "text/plain; version=0.0.4; charset=utf-8");
+    }
+
+    #[test]
+    fn build_info_metric_is_registered_and_set() {
+        init_build_info();
+        let families = prometheus::gather();
+        let build_info = families.iter().find(|f| f.get_name() == "txwatch_build_info").expect("txwatch_build_info metric");
+        assert_eq!(build_info.get_metric().len(), 1);
+        let metric = &build_info.get_metric()[0];
+        assert_eq!(metric.get_gauge().get_value(), 1.0);
     }
 
     #[test]
