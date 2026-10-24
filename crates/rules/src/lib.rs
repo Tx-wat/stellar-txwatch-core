@@ -443,6 +443,160 @@ impl AlertPayload {
     }
 }
 
+#[cfg(test)]
+impl AlertPayload {
+    pub fn builder(
+        label: impl Into<String>,
+        contract_id: impl Into<String>,
+        network: Network,
+        rule_type: impl Into<String>,
+        rule_triggered: impl Into<String>,
+        transaction_hash: impl Into<String>,
+    ) -> AlertPayloadBuilder {
+        AlertPayloadBuilder {
+            label: label.into(),
+            contract_id: contract_id.into(),
+            network,
+            rule_type: rule_type.into(),
+            rule_triggered: rule_triggered.into(),
+            transaction_hash: transaction_hash.into(),
+            function_name: None,
+            function_names: Vec::new(),
+            amount_xlm: None,
+            amount_stroops: None,
+            fee_charged_stroops: None,
+            operation_count: None,
+            memo_type: None,
+            memo: None,
+            timestamp: 0,
+            timestamp_iso: "1970-01-01T00:00:00Z".into(),
+            horizon_link: String::new(),
+            explorer_link: String::new(),
+            ledger_sequence: None,
+            source_account: None,
+        }
+    }
+}
+
+#[cfg(test)]
+#[must_use]
+pub struct AlertPayloadBuilder {
+    label: String,
+    contract_id: String,
+    network: Network,
+    rule_type: String,
+    rule_triggered: String,
+    transaction_hash: String,
+    function_name: Option<String>,
+    function_names: Vec<String>,
+    amount_xlm: Option<u64>,
+    amount_stroops: Option<u64>,
+    fee_charged_stroops: Option<u64>,
+    operation_count: Option<u32>,
+    memo_type: Option<String>,
+    memo: Option<String>,
+    timestamp: i64,
+    timestamp_iso: String,
+    horizon_link: String,
+    explorer_link: String,
+    ledger_sequence: Option<u32>,
+    source_account: Option<String>,
+}
+
+#[cfg(test)]
+impl AlertPayloadBuilder {
+    pub fn function_name(mut self, name: impl Into<String>) -> Self {
+        let n = name.into();
+        self.function_name = Some(n.clone());
+        if self.function_names.is_empty() {
+            self.function_names.push(n);
+        }
+        self
+    }
+
+    pub fn function_names(mut self, names: Vec<String>) -> Self {
+        self.function_names = names;
+        self
+    }
+
+    pub fn amount_xlm(mut self, xlm: u64) -> Self {
+        self.amount_xlm = Some(xlm);
+        self
+    }
+
+    pub fn amount_stroops(mut self, stroops: u64) -> Self {
+        self.amount_stroops = Some(stroops);
+        self
+    }
+
+    pub fn fee_charged_stroops(mut self, fee: u64) -> Self {
+        self.fee_charged_stroops = Some(fee);
+        self
+    }
+
+    pub fn operation_count(mut self, count: u32) -> Self {
+        self.operation_count = Some(count);
+        self
+    }
+
+    pub fn memo(mut self, memo_type: impl Into<String>, memo: impl Into<String>) -> Self {
+        self.memo_type = Some(memo_type.into());
+        self.memo = Some(memo.into());
+        self
+    }
+
+    pub fn timestamp(mut self, ts: i64, iso: impl Into<String>) -> Self {
+        self.timestamp = ts;
+        self.timestamp_iso = iso.into();
+        self
+    }
+
+    pub fn horizon_link(mut self, link: impl Into<String>) -> Self {
+        self.horizon_link = link.into();
+        self
+    }
+
+    pub fn explorer_link(mut self, link: impl Into<String>) -> Self {
+        self.explorer_link = link.into();
+        self
+    }
+
+    pub fn ledger_sequence(mut self, seq: u32) -> Self {
+        self.ledger_sequence = Some(seq);
+        self
+    }
+
+    pub fn source_account(mut self, account: impl Into<String>) -> Self {
+        self.source_account = Some(account.into());
+        self
+    }
+
+    pub fn build(self) -> AlertPayload {
+        AlertPayload {
+            label: self.label,
+            contract_id: self.contract_id,
+            network: self.network,
+            rule_type: self.rule_type,
+            rule_triggered: self.rule_triggered,
+            transaction_hash: self.transaction_hash,
+            function_name: self.function_name,
+            function_names: self.function_names,
+            amount_xlm: self.amount_xlm,
+            amount_stroops: self.amount_stroops,
+            fee_charged_stroops: self.fee_charged_stroops,
+            operation_count: self.operation_count,
+            memo_type: self.memo_type,
+            memo: self.memo,
+            timestamp: self.timestamp,
+            timestamp_iso: self.timestamp_iso,
+            horizon_link: self.horizon_link,
+            explorer_link: self.explorer_link,
+            ledger_sequence: self.ledger_sequence,
+            source_account: self.source_account,
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1290,28 +1444,38 @@ mod tests {
     }
 
     #[test]
+    fn alert_payload_builder_constructs_expected_payload() {
+        let p = AlertPayload::builder(
+            "Contract",
+            "C123",
+            Network::Testnet,
+            "AnyTransaction",
+            "AnyTransaction",
+            "hash123",
+        )
+        .amount_xlm(100)
+        .build();
+
+        assert_eq!(p.label, "Contract");
+        assert_eq!(p.amount_xlm, Some(100));
+        assert_eq!(p.transaction_hash, "hash123");
+    }
+
+    #[test]
     fn alert_payload_network_keeps_lowercase_wire_format() {
         for (network, wire) in [
             (Network::Mainnet, "mainnet"),
             (Network::Testnet, "testnet"),
             (Network::Futurenet, "futurenet"),
         ] {
-            let payload = AlertPayload {
-                label: "x".into(),
-                contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            let payload = AlertPayload::builder(
+                "x",
+                "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 network,
-                rule_type: "AnyTransaction".into(),
-                rule_triggered: "AnyTransaction".into(),
-                transaction_hash: "abc".into(),
-                function_name: None,
-                function_names: vec![],
-                amount_xlm: None,
-                fee_charged_stroops: None,
-                timestamp: 0,
-                timestamp_iso: "1970-01-01T00:00:00Z".into(),
-                horizon_link: String::new(),
-                explorer_link: String::new(),
-            };
+                "AnyTransaction",
+                "AnyTransaction",
+                "abc",
+            ).build();
             let json: serde_json::Value = serde_json::to_value(&payload).unwrap();
             assert_eq!(json["network"], wire);
             let round_tripped: AlertPayload = serde_json::from_value(json).unwrap();
@@ -1321,28 +1485,26 @@ mod tests {
 
     #[test]
     fn alert_payload_serialises_to_valid_json_with_all_fields_present() {
-        let payload = AlertPayload {
-            label: "My Contract".into(),
-            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
-            network: Network::Testnet,
-            rule_type: "LargeTransfer".into(),
-            rule_triggered: "LargeTransfer(>=10000XLM)".into(),
-            transaction_hash: "abc123".into(),
-            function_name: Some("transfer".into()),
-            function_names: vec!["transfer".into()],
-            amount_xlm: Some(15000),
-            amount_stroops: Some(150_000_000_000),
-            fee_charged_stroops: Some(50000),
-            operation_count: Some(3),
-            memo_type: Some("text".into()),
-            memo: Some("order-1234".into()),
-            timestamp: 1705316096,
-            timestamp_iso: "2024-01-15T12:00:00Z".into(),
-            horizon_link: "https://horizon-testnet.stellar.org/transactions/abc123".into(),
-            explorer_link: "https://stellar.expert/explorer/testnet/tx/abc123".into(),
-            ledger_sequence: Some(12345678),
-            source_account: Some("GABC123".into()),
-        };
+        let payload = AlertPayload::builder(
+            "My Contract",
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            Network::Testnet,
+            "LargeTransfer",
+            "LargeTransfer(>=10000XLM)",
+            "abc123",
+        )
+        .function_name("transfer")
+        .amount_xlm(15000)
+        .amount_stroops(150_000_000_000)
+        .fee_charged_stroops(50000)
+        .operation_count(3)
+        .memo("text", "order-1234")
+        .timestamp(1705316096, "2024-01-15T12:00:00Z")
+        .horizon_link("https://horizon-testnet.stellar.org/transactions/abc123")
+        .explorer_link("https://stellar.expert/explorer/testnet/tx/abc123")
+        .ledger_sequence(12345678)
+        .source_account("GABC123")
+        .build();
 
         let json = serde_json::to_value(payload).expect("serialize AlertPayload to JSON");
         let obj = json.as_object().expect("AlertPayload should serialize to a JSON object");
