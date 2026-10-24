@@ -141,6 +141,14 @@ pub enum AlertRule {
     },
     /// Fires when the transaction's source account equals `source_account`.
     SourceAccountMatch { source_account: String },
+    /// Restricts alert firing to a specific time window and days of week (Issue #343).
+    TimeWindow {
+        hours_utc: String,
+        #[serde(default)]
+        weekdays: Vec<String>,
+        #[serde(default)]
+        wrap_rule: Option<String>,
+    },
 }
 
 impl AlertRule {
@@ -254,6 +262,36 @@ impl AlertRule {
                     );
                 }
             }
+            AlertRule::TimeWindow { hours_utc, weekdays, .. } => {
+                let parts: Vec<&str> = hours_utc.split('-').collect();
+                if parts.len() != 2 {
+                    bail!(
+                        "contract '{}': TimeWindow hours_utc must be formatted as 'HH:MM-HH:MM'",
+                        contract_label
+                    );
+                }
+                for part in parts {
+                    let hm: Vec<&str> = part.split(':').collect();
+                    if hm.len() != 2 {
+                        bail!("contract '{}': TimeWindow invalid time format '{}'", contract_label, part);
+                    }
+                    let h: u32 = hm[0].parse().map_err(|_| anyhow!("contract '{}': TimeWindow invalid hour in '{}'", contract_label, part))?;
+                    let m: u32 = hm[1].parse().map_err(|_| anyhow!("contract '{}': TimeWindow invalid minute in '{}'", contract_label, part))?;
+                    if h > 23 || m > 59 {
+                        bail!("contract '{}': TimeWindow time '{}:{:02}' out of 24-hour range", contract_label, h, m);
+                    }
+                }
+                let valid_days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+                for day in weekdays {
+                    if !valid_days.contains(&day.to_lowercase().as_str()) {
+                        bail!(
+                            "contract '{}': TimeWindow invalid weekday '{}' (expected Mon, Tue, Wed, Thu, Fri, Sat, Sun)",
+                            contract_label,
+                            day
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -284,6 +322,13 @@ impl AlertRule {
             AlertRule::SourceAccountMatch { source_account } => {
                 format!("SourceAccountMatch({})", source_account)
             }
+            AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
+                if let Some(wrapped) = wrap_rule {
+                    format!("TimeWindow({}, [{}], wrap={})", hours_utc, weekdays.join(", "), wrapped)
+                } else {
+                    format!("TimeWindow({}, [{}])", hours_utc, weekdays.join(", "))
+                }
+            }
         }
     }
 
@@ -294,10 +339,14 @@ impl AlertRule {
         match self {
             AlertRule::AnyTransaction => "AnyTransaction".into(),
             AlertRule::TransactionFailed => "TransactionFailed".into(),
+            AlertRule::InsufficientFunds => "InsufficientFunds".into(),
+            AlertRule::SorobanInvocation => "SorobanInvocation".into(),
             AlertRule::LargeTransfer { .. } => "LargeTransfer".into(),
             AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
             AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
             AlertRule::HighFee { .. } => "HighFee".into(),
+            AlertRule::SourceAccountMatch { .. } => "SourceAccountMatch".into(),
+            AlertRule::TimeWindow { .. } => "TimeWindow".into(),
         }
     }
 }
@@ -359,6 +408,9 @@ pub struct WatchedContract {
     /// set programmatically in tests. Production code must leave this `None`.
     #[serde(skip, default)]
     pub test_horizon_base_url: Option<String>,
+    /// Allow webhook URLs resolving to localhost or private IP ranges (Issue #346).
+    #[serde(default)]
+    pub allow_internal_webhook_urls: Option<bool>,
 }
 
 /// Maximum length, in characters, of a tag key or value.
@@ -425,6 +477,44 @@ impl WatchedContract {
             );
         }
 
+        let allow_internal = self.allow_internal_webhook_urls.unwrap_or(false);
+        if !allow_internal {
+            if let Some(host_str) = parsed_url.host_str() {
+                let is_internal = if host_str == "localhost"
+                    || host_str.ends_with(".localhost")
+                    || host_str.ends_with(".local")
+                {
+                    true
+                } else if let Ok(ip) = host_str.parse::<std::net::IpAddr>() {
+                    match ip {
+                        std::net::IpAddr::V4(ipv4) => {
+                            ipv4.is_loopback()
+                                || ipv4.is_private()
+                                || ipv4.is_link_local()
+                                || ipv4.is_broadcast()
+                                || ipv4.is_unspecified()
+                        }
+                        std::net::IpAddr::V6(ipv6) => {
+                            ipv6.is_loopback()
+                                || ipv6.is_unspecified()
+                                || (ipv6.segments()[0] & 0xfe00) == 0xfc00
+                                || (ipv6.segments()[0] & 0xffc0) == 0xfe80
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                if is_internal {
+                    bail!(
+                        "contract '{}': webhook_url '{}' resolves to localhost or private IP range (SSRF prevention). Set allow_internal_webhook_urls = true to allow.",
+                        self.label,
+                        self.webhook_url
+                    );
+                }
+            }
+        }
+
         if self.max_alerts_per_cycle == Some(0) {
             bail!(
                 "contract '{}': max_alerts_per_cycle must be >= 1 when set",
@@ -470,6 +560,15 @@ impl WatchedContract {
             tls.validate(&self.label)?;
         }
 
+        if let Some(pem) = &self.webhook_tls_cert_pem {
+            if pem.trim().is_empty() {
+                bail!("contract '{}': webhook_tls_cert_pem must not be empty", self.label);
+            }
+            if !pem.contains("-----BEGIN CERTIFICATE-----") || !pem.contains("-----END CERTIFICATE-----") {
+                bail!("contract '{}': webhook_tls_cert_pem is not a valid PEM-encoded certificate", self.label);
+            }
+        }
+
         Ok(())
     }
 }
@@ -481,6 +580,18 @@ impl WatchedContract {
 /// potentially exhausting memory or file descriptors.
 pub const MAX_CONTRACTS: usize = 100;
 
+// Typestate pattern evaluation for AppConfig (Issue #339):
+// A typestate design (`AppConfig<Unvalidated>` -> `AppConfig<Validated>`) was evaluated
+// and rejected (wontfix) for the following reasons:
+// 1. Ergonomics: AppConfig is a plain configuration struct passed across threads, async
+//    tasks, and CLI command boundaries. Adding a type-level state parameter complicates function
+//    signatures (e.g. run, run_with, run_with_shutdown) without practical safety gains, as
+//    `AppConfig::from_file` already guarantees that validation occurs before execution.
+// 2. Test maintenance: Many integration tests construct mock `AppConfig` instances directly
+//    with minimal fields. Mandating a typestate transition or validated wrapper would add
+//    needless ceremony and break test ergonomics across the workspace.
+// 3. Deserialization: Serde deserialization directly into the struct remains idiomatic and clean;
+//    runtime validation via `validate()` provides richer error reporting with field contexts.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
@@ -512,6 +623,10 @@ pub struct AppConfig {
     /// A contract's own `max_alerts_per_cycle` takes precedence over this value.
     #[serde(default)]
     pub max_alerts_per_cycle: Option<u64>,
+    /// Configurable HTTP User-Agent header for Horizon requests (Issue #340).
+    /// Defaults to `txwatch/<version>` when unset.
+    #[serde(default)]
+    pub http_user_agent: Option<String>,
 }
 
 fn default_http_pool_max_idle_per_host() -> Option<usize> {
@@ -657,6 +772,13 @@ impl AppConfig {
                 MAX_CONTRACTS
             );
         }
+        if let Some(true) = self.allow_internal_webhook_urls {
+            for contract in &mut self.contracts {
+                if contract.allow_internal_webhook_urls.is_none() {
+                    contract.allow_internal_webhook_urls = Some(true);
+                }
+            }
+        }
         for contract in &mut self.contracts {
             contract.validate()?;
         }
@@ -726,13 +848,84 @@ mod tests {
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
             test_horizon_base_url: None,
+            allow_internal_webhook_urls: None,
         }
+    }
+
+    #[test]
+    fn webhook_tls_cert_pem_validation() {
+        let mut c = valid_contract();
+        c.webhook_tls_cert_pem = Some("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----".into());
+        assert!(c.validate().is_ok());
+
+        let mut invalid_c = valid_contract();
+        invalid_c.webhook_tls_cert_pem = Some("not a pem".into());
+        assert!(invalid_c.validate().is_err());
     }
 
     #[test]
     fn valid_config_passes() {
         let mut c = valid_contract();
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn webhook_url_rejects_internal_and_loopback_ips_by_default() {
+        for url in [
+            "http://127.0.0.1/hook",
+            "http://localhost:8080/hook",
+            "https://192.168.0.1/hook",
+            "https://10.0.0.1/webhook",
+            "http://[::1]:9000/alert",
+        ] {
+            let mut c = valid_contract();
+            c.webhook_url = url.into();
+            let err = c.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("resolves to localhost or private IP range"),
+                "expected rejection for {url}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_url_accepts_internal_ips_when_opted_in() {
+        for url in [
+            "http://127.0.0.1/hook",
+            "http://localhost:8080/hook",
+            "https://192.168.0.1/hook",
+            "https://10.0.0.1/webhook",
+            "http://[::1]:9000/alert",
+        ] {
+            let mut c = valid_contract();
+            c.webhook_url = url.into();
+            c.allow_internal_webhook_urls = Some(true);
+            assert!(c.validate().is_ok(), "expected acceptance for {url}");
+        }
+    }
+
+    #[test]
+    fn time_window_rule_validation() {
+        let mut valid_rule = AlertRule::TimeWindow {
+            hours_utc: "09:00-17:00".into(),
+            weekdays: vec!["Mon".into(), "Tue".into(), "Fri".into()],
+            wrap_rule: Some("LargeTransfer".into()),
+        };
+        assert!(valid_rule.validate("test").is_ok());
+
+        let mut bad_hours = AlertRule::TimeWindow {
+            hours_utc: "25:00-17:00".into(),
+            weekdays: vec!["Mon".into()],
+            wrap_rule: None,
+        };
+        assert!(bad_hours.validate("test").is_err());
+
+        let mut bad_weekday = AlertRule::TimeWindow {
+            hours_utc: "09:00-17:00".into(),
+            weekdays: vec!["Funday".into()],
+            wrap_rule: None,
+        };
+        assert!(bad_weekday.validate("test").is_err());
     }
 
     /// #268: horizon_url is optional and absent by default.

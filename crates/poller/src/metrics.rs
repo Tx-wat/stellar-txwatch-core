@@ -68,25 +68,17 @@ fn webhook_failures_total() -> &'static IntCounter {
     })
 }
 
-fn build_info_gauge() -> &'static prometheus::GaugeVec {
-    static G: OnceLock<prometheus::GaugeVec> = OnceLock::new();
-    G.get_or_init(|| {
-        let opts = prometheus::opts!(
-            "txwatch_build_info",
-            "Build information for the running TxWatch binary"
-        );
-        let g = prometheus::register_gauge_vec!(opts, &["version", "git_sha"])
-            .expect("register txwatch_build_info");
-        let version = env!("CARGO_PKG_VERSION");
-        let git_sha = option_env!("TXWATCH_GIT_SHA").unwrap_or("unknown");
-        g.with_label_values(&[version, git_sha]).set(1.0);
-        g
+fn config_reload_total() -> &'static IntCounter {
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    C.get_or_init(|| {
+        let counter = register_int_counter!(
+            "txwatch_config_reload_total",
+            "Total configuration loads and reloads (starts at 1 for initial startup; see issue #227)"
+        )
+        .expect("register txwatch_config_reload_total");
+        counter.inc(); // Starts at 1 for initial load
+        counter
     })
-}
-
-/// Initialize the `txwatch_build_info` gauge metric (Issue #373).
-pub fn init_build_info() {
-    let _ = build_info_gauge();
 }
 
 fn poll_cycles_total() -> &'static IntCounterVec {
@@ -119,6 +111,12 @@ pub fn inc_webhook_failures() {
 /// Increment the `txwatch_enrichment_errors_total` counter by 1.
 pub fn inc_enrichment_errors() {
     enrichment_errors_total().inc();
+}
+
+/// Increment the `txwatch_config_reload_total` counter by 1.
+/// Reference: Hot-reload on SIGHUP support (issue #227).
+pub fn inc_config_reload() {
+    config_reload_total().inc();
 }
 
 /// Increment the `txwatch_poll_cycles_total` counter for `contract` by 1.
@@ -169,7 +167,7 @@ async fn handle_metrics(
         .unwrap_or_default();
     Ok(Response::builder()
         .status(200)
-        .header("Content-Type", encoder.format_type())
+        .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
         .body(Full::new(Bytes::from(buf)))
         .unwrap())
 }
@@ -177,6 +175,21 @@ async fn handle_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metrics_endpoint_content_type_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        serve_metrics(addr).await.unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client.get(format!("http://{}/metrics", addr)).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert_eq!(ct, "text/plain; version=0.0.4; charset=utf-8");
+    }
 
     #[test]
     fn build_info_metric_is_registered_and_set() {

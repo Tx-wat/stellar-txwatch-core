@@ -151,6 +151,17 @@ type           = "HighFee"
 threshold_xlm  = 1
 ```
 
+### `TimeWindow`
+Restricts alert firing to specific UTC hours and weekdays to prevent alert fatigue outside business hours. Can optionally wrap another rule via `wrap_rule`.
+
+```toml
+[[contracts.rules]]
+type       = "TimeWindow"
+hours_utc  = "09:00-17:00"
+weekdays   = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+wrap_rule  = "LargeTransfer"
+```
+
 ## Evaluation order
 
 Rules are evaluated in the order they appear in the config file.
@@ -199,3 +210,4 @@ The webhook payload includes two rule-related fields:
 | `FunctionCalled` | `"FunctionCalled"` |
 | `AdminFunctionCalled` | `"AdminFunctionCalled"` |
 | `HighFee` | `"HighFee"` |
+| `TimeWindow` | `"TimeWindow"` |

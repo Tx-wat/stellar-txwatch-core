@@ -96,8 +96,13 @@ pub async fn run_with_shutdown(
 ) -> Result<()> {
     let max_idle       = cfg.http_pool_max_idle_per_host.unwrap_or(10);
     let keepalive_secs = cfg.http_tcp_keepalive_secs.unwrap_or(30);
+    let user_agent     = cfg
+        .http_user_agent
+        .as_deref()
+        .unwrap_or(concat!("txwatch/", env!("CARGO_PKG_VERSION")));
 
     let client = Client::builder()
+        .user_agent(user_agent)
         .timeout(Duration::from_secs(15))
         .pool_max_idle_per_host(max_idle)
         .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
@@ -261,6 +266,10 @@ pub async fn run_with_shutdown(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
     network     = %contract.network.as_str(),
+    tx_count    = tracing::field::Empty,
+    alert_count = tracing::field::Empty,
+    duration_ms = tracing::field::Empty,
+    outcome     = tracing::field::Empty,
 ))]
 pub(crate) async fn poll_contract(
     client: &Client,
@@ -268,6 +277,7 @@ pub(crate) async fn poll_contract(
     cursors: &mut CursorMap,
     dry_run: bool,
 ) -> Result<(u64, u64)> {
+    let start_time = std::time::Instant::now();
     let cursor = cursors.get(&contract.label).map(|s| s.to_string());
     let page = fetch_page(client, contract, cursor.as_deref()).await?;
 
@@ -305,6 +315,13 @@ pub(crate) async fn poll_contract(
     if let Some(last) = page.records.last() {
         cursors.set(&contract.label, last.paging_token.clone());
     }
+
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+    let span = tracing::Span::current();
+    span.record("tx_count", txs_processed);
+    span.record("alert_count", alerts_fired);
+    span.record("duration_ms", duration_ms);
+    span.record("outcome", "ok");
 
     Ok((txs_processed, alerts_fired))
 }
