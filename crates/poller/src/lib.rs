@@ -759,9 +759,30 @@ async fn poll_contract(
         }
     }
 
+static IDLE_CYCLE_COUNTERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> = std::sync::OnceLock::new();
+
+fn should_log_idle(contract_id: &str) -> bool {
+    let mut map = IDLE_CYCLE_COUNTERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let count = map.entry(contract_id.to_string()).or_insert(0);
+    *count += 1;
+    *count == 1 || (*count % 60 == 0)
+}
+
+fn reset_idle_counter(contract_id: &str) {
+    let mut map = IDLE_CYCLE_COUNTERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    map.insert(contract_id.to_string(), 0);
+}
+
     if !all_records.is_empty() {
+        reset_idle_counter(&contract.contract_id);
         info!(contract = %contract.label, count = all_records.len(), "fetched new transactions");
-    } else {
+    } else if should_log_idle(&contract.contract_id) {
         debug!(contract = %contract.label, cursor = %cursor, "no new transactions");
     }
 
