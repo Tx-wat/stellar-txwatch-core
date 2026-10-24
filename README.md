@@ -143,7 +143,7 @@ Optional OpenTelemetry trace export: build with `--features opentelemetry` and s
 
 ## Config
 
-See [docs/configuration.md](docs/configuration.md) for the full reference.
+See [docs/configuration.md](docs/configuration.md) for the full reference. For monitoring contracts on Stellar Futurenet, see [docs/futurenet-guide.md](docs/futurenet-guide.md).
 
 ```toml
 poll_interval_seconds = 10

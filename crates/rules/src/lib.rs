@@ -343,7 +343,73 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
         AlertRule::SourceAccountMatch { source_account } => {
             tx.source_account.as_deref() == Some(source_account.as_str())
         }
+
+        AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
+            eval_time_window(hours_utc, weekdays, wrap_rule.as_deref(), tx, chrono::Utc::now())?
+        }
     })
+}
+
+pub fn eval_time_window(
+    hours_utc: &str,
+    weekdays: &[String],
+    wrap_rule: Option<&str>,
+    tx: &EnrichedTransaction,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    use chrono::{Datelike, Timelike};
+    if !weekdays.is_empty() {
+        let day_str = match now.weekday() {
+            chrono::Weekday::Mon => "mon",
+            chrono::Weekday::Tue => "tue",
+            chrono::Weekday::Wed => "wed",
+            chrono::Weekday::Thu => "thu",
+            chrono::Weekday::Fri => "fri",
+            chrono::Weekday::Sat => "sat",
+            chrono::Weekday::Sun => "sun",
+        };
+        if !weekdays.iter().any(|d| d.to_lowercase() == day_str) {
+            return Ok(false);
+        }
+    }
+
+    let parts: Vec<&str> = hours_utc.split('-').collect();
+    if parts.len() == 2 {
+        let parse_hm = |s: &str| -> Result<(u32, u32)> {
+            let hm: Vec<&str> = s.split(':').collect();
+            if hm.len() != 2 {
+                bail!("invalid time component '{}'", s);
+            }
+            Ok((hm[0].parse()?, hm[1].parse()?))
+        };
+        let (sh, sm) = parse_hm(parts[0])?;
+        let (eh, em) = parse_hm(parts[1])?;
+        let now_minutes = now.hour() * 60 + now.minute();
+        let start_minutes = sh * 60 + sm;
+        let end_minutes = eh * 60 + em;
+
+        let in_window = if start_minutes <= end_minutes {
+            now_minutes >= start_minutes && now_minutes <= end_minutes
+        } else {
+            now_minutes >= start_minutes || now_minutes <= end_minutes
+        };
+        if !in_window {
+            return Ok(false);
+        }
+    }
+
+    if let Some(wrapped) = wrap_rule {
+        match wrapped {
+            "TransactionFailed" => Ok(!tx.successful),
+            "InsufficientFunds" => Ok(!tx.successful && tx.result_code == Some(TX_INSUFFICIENT_BALANCE)),
+            "SorobanInvocation" => Ok(!tx.function_names.is_empty()),
+            "LargeTransfer" => Ok(tx.amount_stroops.map(|s| s > 0).unwrap_or(false)),
+            "AnyTransaction" => Ok(true),
+            _ => Ok(true),
+        }
+    } else {
+        Ok(true)
+    }
 }
 
 impl AlertPayload {
@@ -384,6 +450,45 @@ impl AlertPayload {
 mod tests {
     use super::*;
     use chrono::Datelike;
+
+    #[test]
+    fn time_window_evaluates_correctly_with_mocked_time() {
+        use chrono::TimeZone;
+        let tx = make_tx(true, &[], None);
+
+        // Monday 10:30 UTC - should be inside "09:00-17:00" and ["Mon", "Tue"]
+        let monday_morning = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let res = eval_time_window(
+            "09:00-17:00",
+            &["Mon".into(), "Tue".into()],
+            None,
+            &tx,
+            monday_morning,
+        ).unwrap();
+        assert!(res, "Monday 10:30 UTC should match business hours");
+
+        // Monday 18:30 UTC - outside hours
+        let monday_evening = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 18, 30, 0).unwrap();
+        let res_evening = eval_time_window(
+            "09:00-17:00",
+            &["Mon".into(), "Tue".into()],
+            None,
+            &tx,
+            monday_evening,
+        ).unwrap();
+        assert!(!res_evening, "Monday 18:30 UTC should be outside business hours");
+
+        // Sunday 10:30 UTC - wrong weekday
+        let sunday = chrono::Utc.with_ymd_and_hms(2024, 1, 14, 10, 30, 0).unwrap();
+        let res_sunday = eval_time_window(
+            "09:00-17:00",
+            &["Mon".into(), "Tue".into()],
+            None,
+            &tx,
+            sunday,
+        ).unwrap();
+        assert!(!res_sunday, "Sunday should be suppressed");
+    }
     use txwatch_config::{AlertRule, Network};
 
     fn make_tx(

@@ -23,6 +23,7 @@ independent: `rules`, `webhook_url`, and `network` apply only to that contract.
 | `network` | yes | One of `mainnet`, `testnet`, `futurenet`. |
 | `webhook_url` | yes | Endpoint that receives alert payloads. |
 | `webhook_secret` | no | HMAC-SHA256 secret sent as `X-TxWatch-Signature`. |
+| `allow_internal_webhook_urls` | no | Per-contract opt-out of SSRF protection for local webhook development. |
 
 ## `[[contracts.rules]]`
 
