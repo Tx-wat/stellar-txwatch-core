@@ -560,6 +560,15 @@ impl WatchedContract {
             tls.validate(&self.label)?;
         }
 
+        if let Some(pem) = &self.webhook_tls_cert_pem {
+            if pem.trim().is_empty() {
+                bail!("contract '{}': webhook_tls_cert_pem must not be empty", self.label);
+            }
+            if !pem.contains("-----BEGIN CERTIFICATE-----") || !pem.contains("-----END CERTIFICATE-----") {
+                bail!("contract '{}': webhook_tls_cert_pem is not a valid PEM-encoded certificate", self.label);
+            }
+        }
+
         Ok(())
     }
 }
@@ -841,6 +850,17 @@ mod tests {
             test_horizon_base_url: None,
             allow_internal_webhook_urls: None,
         }
+    }
+
+    #[test]
+    fn webhook_tls_cert_pem_validation() {
+        let mut c = valid_contract();
+        c.webhook_tls_cert_pem = Some("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----".into());
+        assert!(c.validate().is_ok());
+
+        let mut invalid_c = valid_contract();
+        invalid_c.webhook_tls_cert_pem = Some("not a pem".into());
+        assert!(invalid_c.validate().is_err());
     }
 
     #[test]

@@ -294,6 +294,7 @@ Four counters are registered:
 | `txwatch_alerts_total` | Total alert payloads sent (rules matched) |
 | `txwatch_webhook_failures_total` | Total permanent webhook delivery failures (after all retries) |
 | `txwatch_enrichment_errors_total` | Transactions skipped because enrichment failed (e.g. an unparseable `created_at`). The cursor still advances past them, so they are not retried. |
+| `txwatch_config_reload_total` | Total config loads and reloads (starts at 1 at startup; hot-reload support #227) |
 
 To start the `/metrics` endpoint, call `txwatch_poller::serve_metrics(addr)` before `run_with`.
 The endpoint serves the standard Prometheus text exposition format and can be scraped by any

@@ -288,6 +288,9 @@ pub async fn run_with_shutdown(
         "TxWatch polling engine started"
     );
 
+    #[cfg(feature = "metrics")]
+    metrics::inc_config_reload();
+
     if let Some(requests_per_minute) = rate_limit_warning(cfg.poll_interval_seconds, cfg.contracts.len()) {
         warn!(
             poll_interval_seconds = cfg.poll_interval_seconds,
