@@ -78,6 +78,50 @@ fn spawn_receiver() -> (String, JoinHandle<(HashMap<String, String>, Vec<u8>)>) 
     (url, handle)
 }
 
+/// Accepts one HTTP request on a loopback port, replies with the given status
+/// line, and returns the lowercased request headers together with the raw body.
+fn spawn_status_receiver(
+    status_line: &'static str,
+) -> (String, JoinHandle<(HashMap<String, String>, Vec<u8>)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+
+    let handle = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut headers = HashMap::new();
+        let mut content_length = 0usize;
+
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                let name = name.trim().to_ascii_lowercase();
+                let value = value.trim().to_string();
+                if name == "content-length" {
+                    content_length = value.parse().unwrap();
+                }
+                headers.insert(name, value);
+            }
+        }
+
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+        let response = format!(
+            "{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        reader.get_mut().write_all(response.as_bytes()).unwrap();
+
+        (headers, body)
+    });
+
+    (url, handle)
+}
+
 /// Accepts one HTTP request on a loopback port, waits `delay` before replying
 /// 200, and returns the lowercased request headers together with the raw body.
 fn spawn_delayed_receiver(
@@ -153,6 +197,24 @@ fn test_webhook_exits_one_when_url_is_unreachable() {
         Some(1),
         "expected exit code 1 when webhook URL is unreachable"
     );
+}
+
+#[test]
+fn test_webhook_exits_one_when_target_returns_http_error() {
+    let cfg_path = write_valid_config("txwatch_test_webhook_http_error.toml");
+    let (url, receiver) = spawn_status_receiver("HTTP/1.1 500 Internal Server Error");
+
+    let output = run_test_webhook(&cfg_path, &url, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1 when webhook target returns HTTP 500, stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = receiver.join();
 }
 
 #[test]

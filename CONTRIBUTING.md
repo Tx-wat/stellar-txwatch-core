@@ -236,7 +236,36 @@ test in `crates/poller/tests/integration.rs`.
 
 ### Step 7 — Document it
 
-Add an entry to `docs/alert-rules.md`.
+`docs/alert-rules.md` has two distinct places that must be updated for every
+new rule. Do both:
+
+1. **Add a `### RuleName` section to `docs/alert-rules.md`** describing the
+   rule, its fields, and a TOML example:
+
+   ````markdown
+   ### MyNewRule
+
+   Fires when ... .
+
+   | Field | Type | Required | Description |
+   |-------|------|----------|-------------|
+   | `my_field` | string | yes | ... |
+
+   ```toml
+   [[contracts.rules]]
+   type     = "MyNewRule"
+   my_field = "some_value"
+   ```
+   ````
+
+2. **Add a row to the "Stable rule_type values" → Rule type table in
+   `docs/alert-rules.md`** mapping the rule name to its `rule_type` string
+   (the value returned by `AlertRule::rule_type()`):
+
+   ```markdown
+   | `MyNewRule` | `MyNewRule` |
+   ```
+=======
 
 ## Architecture Decision Records (ADRs)
 
@@ -268,7 +297,7 @@ docs: document MyNewRule in alert-rules.md
 - [ ] `cargo test` passes
 - [ ] `cargo clippy -- -D warnings` passes
 - [ ] `cargo fmt` applied
-- [ ] New rule documented in `docs/alert-rules.md`
+- [ ] New rule documented in `docs/alert-rules.md`: a `### RuleName` prose section **and** a row in the "Stable rule_type values" → Rule type table
 - [ ] CONTRIBUTING.md updated if the contribution process changed
 - [ ] CHANGELOG.md entry added under `## [Unreleased]` in the matching section: `### Added`, `### Changed`, `### Fixed` or `### Removed` (see [Keep a Changelog](https://keepachangelog.com/en/1.0.0/))
 
