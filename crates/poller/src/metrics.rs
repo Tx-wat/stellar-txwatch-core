@@ -1,11 +1,12 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes five counters:
+//! Exposes six counters:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
 //! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
 //! - `txwatch_poll_cycles_total`        — total poll cycles per contract (labelled by `contract`)
+//! - `txwatch_cursor_save_failures_total` — total failed cursor-file persistence attempts
 //!
 //! And one histogram:
 //! - `txwatch_horizon_latency_seconds`  — Horizon API request duration, labelled by `endpoint`
@@ -81,6 +82,17 @@ fn config_reload_total() -> &'static IntCounter {
     })
 }
 
+fn cursor_save_failures_total() -> &'static IntCounter {
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter!(
+            "txwatch_cursor_save_failures_total",
+            "Total failed attempts to persist the cursor file (see issue #460)"
+        )
+        .expect("register txwatch_cursor_save_failures_total")
+    })
+}
+
 fn poll_cycles_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
@@ -117,6 +129,14 @@ pub fn inc_enrichment_errors() {
 /// Reference: Hot-reload on SIGHUP support (issue #227).
 pub fn inc_config_reload() {
     config_reload_total().inc();
+}
+
+/// Increment the `txwatch_cursor_save_failures_total` counter by 1.
+///
+/// Call this whenever persisting the cursor file fails, so that persistent
+/// cursor-persistence breakage is visible to operators (issue #460).
+pub fn inc_cursor_save_failures() {
+    cursor_save_failures_total().inc();
 }
 
 /// Increment the `txwatch_poll_cycles_total` counter for `contract` by 1.

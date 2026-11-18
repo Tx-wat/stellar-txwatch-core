@@ -101,6 +101,8 @@ pub async fn run_with_shutdown(
         .as_deref()
         .unwrap_or(concat!("txwatch/", env!("CARGO_PKG_VERSION")));
 
+    let webhook_timeout_secs = cfg.webhook_timeout_seconds.unwrap_or(15);
+
     let client = Client::builder()
         .user_agent(user_agent)
         .timeout(Duration::from_secs(15))
@@ -108,6 +110,16 @@ pub async fn run_with_shutdown(
         .tcp_keepalive(Some(Duration::from_secs(keepalive_secs)))
         .build()
         .context("failed to build HTTP client")?;
+
+    // #461/#462: shared HTTP settings threaded into the notifier's webhook
+    // client builders so TLS / pinned-cert clients behave like the main client.
+    let webhook_http = txwatch_notifier::WebhookHttpConfig {
+        user_agent: user_agent.to_string(),
+        pool_max_idle_per_host: max_idle,
+        tcp_keepalive_secs: keepalive_secs,
+        timeout_secs: webhook_timeout_secs,
+    };
+======
 
     let mut cursors = if let Some(path) = &cfg.cursor_file {
         CursorMap::load_from_file(std::path::Path::new(path), &cfg.contracts)
@@ -206,6 +218,11 @@ pub async fn run_with_shutdown(
         }
     });
 
+    // #460: track consecutive cursor-save failures so persistent persistence
+    // breakage is escalated to error level rather than a single warn line.
+    let mut cursor_save_failures: u32 = 0;
+    const CURSOR_SAVE_FAILURE_THRESHOLD: u32 = 3;
+
     loop {
         // Check for shutdown signal before starting the next poll cycle.
         if *shutdown_rx.borrow() {
@@ -213,7 +230,9 @@ pub async fn run_with_shutdown(
         }
 
         for contract in &cfg.contracts {
-            let result = poll_contract(&client, contract, &mut cursors, dry_run).await;
+            let result =
+                poll_contract_with_http(&client, contract, &mut cursors, dry_run, &webhook_http)
+                    .await;
             // #352: count every poll attempt (success or failure) per contract.
             #[cfg(feature = "metrics")]
             crate::metrics::inc_poll_cycles(&contract.label);
@@ -235,8 +254,35 @@ pub async fn run_with_shutdown(
 
         // Persist cursors after every full cycle (if a cursor_file is configured).
         if let Some(path) = &cfg.cursor_file {
-            if let Err(e) = cursors.save_to_file(std::path::Path::new(path)) {
-                warn!(error = %e, "failed to save cursor file");
+            match cursors.save_to_file(std::path::Path::new(path)) {
+                Ok(()) => {
+                    if cursor_save_failures > 0 {
+                        info!(
+                            consecutive_failures = cursor_save_failures,
+                            "cursor file persistence recovered"
+                        );
+                    }
+                    cursor_save_failures = 0;
+                }
+                Err(e) => {
+                    cursor_save_failures = cursor_save_failures.saturating_add(1);
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::inc_cursor_save_failures();
+                    if cursor_save_failures >= CURSOR_SAVE_FAILURE_THRESHOLD {
+                        error!(
+                            error = %e,
+                            consecutive_failures = cursor_save_failures,
+                            cursor_file = %path,
+                            "failed to save cursor file repeatedly — cursor persistence is broken"
+                        );
+                    } else {
+                        warn!(
+                            error = %e,
+                            consecutive_failures = cursor_save_failures,
+                            "failed to save cursor file"
+                        );
+                    }
+                }
             }
         }
 
@@ -277,6 +323,19 @@ pub(crate) async fn poll_contract(
     cursors: &mut CursorMap,
     dry_run: bool,
 ) -> Result<(u64, u64)> {
+    poll_contract_with_http(client, contract, cursors, dry_run, &txwatch_notifier::WebhookHttpConfig::default()).await
+}
+
+/// Like [`poll_contract`] but threads the shared webhook HTTP settings into
+/// webhook delivery so TLS / pinned-cert clients honor the configured timeout,
+/// user agent, pool and keepalive settings (#461/#462).
+pub(crate) async fn poll_contract_with_http(
+    client: &Client,
+    contract: &WatchedContract,
+    cursors: &mut CursorMap,
+    dry_run: bool,
+    webhook_http: &txwatch_notifier::WebhookHttpConfig,
+) -> Result<(u64, u64)> {
     let start_time = std::time::Instant::now();
     let cursor = cursors.get(&contract.label).map(|s| s.to_string());
     let page = fetch_page(client, contract, cursor.as_deref()).await?;
@@ -304,7 +363,7 @@ pub(crate) async fn poll_contract(
             if dry_run {
                 info!(rule = %rule.name, hash = %record.hash, "[dry-run] alert would fire");
             } else {
-                match send_webhook(&contract.webhook_url, &rule, &enriched).await {
+                match send_webhook(&contract.webhook_url, &rule, &enriched, &webhook_http).await {
                     Ok(()) => alerts_fired += 1,
                     Err(e) => error!(error = %e, rule = %rule.name, "webhook delivery failed"),
                 }

@@ -527,6 +527,13 @@ impl WatchedContract {
             );
         }
 
+        if self.webhook_timeout_seconds == Some(0) {
+            bail!(
+                "contract '{}': webhook_timeout_seconds must be >= 1 when set",
+                self.label
+            );
+        }
+
         if let Some(horizon_url) = &self.horizon_url {
             let parsed_horizon = Url::parse(horizon_url).map_err(|e| {
                 anyhow!(
@@ -639,6 +646,18 @@ pub struct AppConfig {
     /// Defaults to `txwatch/<version>` when unset.
     #[serde(default)]
     pub http_user_agent: Option<String>,
+    /// Webhook delivery timeout in seconds (Issue #462). Applies to every contract
+    /// unless overridden by a contract's own `webhook_timeout_seconds`.
+    /// Defaults to 15 seconds for backward compatibility.
+    #[serde(default = "default_webhook_timeout_seconds")]
+    pub webhook_timeout_seconds: Option<u64>,
+}
+
+/// Default webhook delivery timeout in seconds (Issue #462).
+pub const DEFAULT_WEBHOOK_TIMEOUT_SECONDS: u64 = 15;
+
+fn default_webhook_timeout_seconds() -> Option<u64> {
+    Some(DEFAULT_WEBHOOK_TIMEOUT_SECONDS)
 }
 
 fn default_http_pool_max_idle_per_host() -> Option<usize> {
@@ -772,6 +791,9 @@ impl AppConfig {
         if self.poll_interval_seconds > 3600 {
             bail!("poll_interval_seconds must be <= 3600 (1 hour)");
         }
+        if self.webhook_timeout_seconds == Some(0) {
+            bail!("webhook_timeout_seconds must be >= 1 when set");
+        }
         if self.contracts.is_empty() {
             bail!("at least one [[contracts]] entry is required");
         }
@@ -861,6 +883,7 @@ mod tests {
             webhook_secret: None,
             test_horizon_base_url: None,
             allow_internal_webhook_urls: None,
+            webhook_timeout_seconds: None,
         }
     }
 
@@ -987,9 +1010,72 @@ mod tests {
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
             max_alerts_per_cycle: Some(0),
+            webhook_timeout_seconds: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
+    }
+
+    // ── Issue #462: webhook_timeout_seconds ──────────────────────────────────
+
+    #[test]
+    fn webhook_timeout_seconds_defaults_to_15() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.webhook_timeout_seconds, Some(15));
+        assert_eq!(cfg.contracts[0].webhook_timeout_seconds, None);
+    }
+
+    #[test]
+    fn webhook_timeout_seconds_parses_global_and_per_contract() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            webhook_timeout_seconds = 30
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            webhook_timeout_seconds = 45
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.webhook_timeout_seconds, Some(30));
+        assert_eq!(cfg.contracts[0].webhook_timeout_seconds, Some(45));
+    }
+
+    #[test]
+    fn rejects_zero_global_webhook_timeout_seconds() {
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![valid_contract()],
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: None,
+            webhook_timeout_seconds: Some(0),
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_zero_per_contract_webhook_timeout_seconds() {
+        let mut c = valid_contract();
+        c.webhook_timeout_seconds = Some(0);
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
     }
 
     #[test]
@@ -1228,6 +1314,7 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            webhook_timeout_seconds: None,
         }
     }
 
@@ -1409,6 +1496,7 @@ mod tests {
             http_connection_verbose: None,
             cursor_file: None,
             max_alerts_per_cycle: None,
+            webhook_timeout_seconds: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -1422,6 +1510,7 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            webhook_timeout_seconds: None,
         }
     }
 
@@ -1469,6 +1558,7 @@ mod tests {
             http_connection_verbose: None,
             cursor_file: None,
             max_alerts_per_cycle: None,
+            webhook_timeout_seconds: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -1632,6 +1722,7 @@ mod tests {
                 http_connection_verbose: None,
                 cursor_file: None,
                 contracts: vec![],
+                webhook_timeout_seconds: None,
             };
             let err = cfg.validate().unwrap_err();
             assert!(
@@ -1743,6 +1834,7 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            webhook_timeout_seconds: None,
         }
     }
 
