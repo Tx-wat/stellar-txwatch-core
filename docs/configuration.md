@@ -10,6 +10,7 @@ most common configuration errors.
 | --- | --- | --- |
 | `poll_interval_seconds` | integer | How often the poller checks for new transactions. |
 | `http_user_agent` | string (optional) | Custom HTTP User-Agent header for Horizon requests (default: `txwatch/<version>`). |
+| `webhook_timeout_seconds` | integer (optional) | Timeout for each webhook delivery attempt, in seconds (default: `15`). Applies to all webhook deliveries, including contracts using TLS or pinned-certificate clients. |
 
 ## `[[contracts]]`
 
@@ -30,6 +31,7 @@ independent: `rules`, `webhook_url`, and `network` apply only to that contract.
 | `webhook_url` | yes | Endpoint that receives alert payloads. |
 | `webhook_secret` | no | HMAC-SHA256 secret sent as `X-TxWatch-Signature`. |
 | `allow_internal_webhook_urls` | no | Per-contract opt-out of SSRF protection for local webhook development. |
+| `webhook_timeout_seconds` | no | Per-contract override of the webhook delivery timeout, in seconds. Falls back to the top-level `webhook_timeout_seconds` (default: `15`). |
 
 ### Webhook Signature Verification Security Notice
 When verifying the `X-TxWatch-Signature` header, receivers **must** use constant-time comparison (e.g. `hmac.compare_digest` in Python or `crypto.timingSafeEqual` in Node.js) rather than naive string comparison (`==`). Standard equality operators leak timing information through byte-by-byte short-circuiting, exposing endpoints to timing attacks.

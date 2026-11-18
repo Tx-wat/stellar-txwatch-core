@@ -117,6 +117,47 @@ jobs:
       - name: Run cargo-deny to check licenses, bans and advisories
         run: cargo install cargo-deny --locked && cargo deny check
 
+  # ── Changelog check ─────────────────────────────────────────────────────────
+  changelog:
+    name: Changelog entry
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Require CHANGELOG.md update when crates/** changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+
+          # Escape hatch: a `skip-changelog` label exempts the PR.
+          if printf '%s\n' "$PR_LABELS" | tr ',' '\n' | grep -qx 'skip-changelog'; then
+            echo "::notice::PR labelled 'skip-changelog'; skipping changelog check."
+            exit 0
+          fi
+
+          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+
+          if ! printf '%s\n' "$changed" | grep -qE '^crates/'; then
+            echo "No changes under crates/; changelog entry not required."
+            exit 0
+          fi
+
+          if printf '%s\n' "$changed" | grep -qx 'CHANGELOG.md'; then
+            echo "CHANGELOG.md was updated alongside crates/ changes."
+            exit 0
+          fi
+
+          echo "::error::Files under crates/ changed but CHANGELOG.md was not updated."
+          echo "Add an entry under '## [Unreleased]' in CHANGELOG.md,"
+          echo "or apply the 'skip-changelog' label if no entry is warranted."
+          exit 1
+
   # ── Cross-compilation ───────────────────────────────────────────────────────
   cross-compile-aarch64:
     name: Cross-compile (aarch64-unknown-linux-musl)
