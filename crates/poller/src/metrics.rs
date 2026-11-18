@@ -247,4 +247,10 @@ mod tests {
             before_b + 1
         );
     }
-}
+#[test]
+    fn enrichment_errors_counter_increments() {
+        let before = enrichment_errors_total().get();
+        inc_enrichment_errors();
+        inc_enrichment_errors();
+        assert_eq!(enrichment_errors_total().get(), before + 2);
+    }
