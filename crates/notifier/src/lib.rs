@@ -7,8 +7,9 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use hex;
 use hmac::{Hmac, Mac};
-use reqwest::Client;
+use reqwest::{Certificate, Client, Identity};
 use sha2::Sha256;
+use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
@@ -48,10 +49,59 @@ pub struct DeliveryResult {
     pub final_status: u16,
 }
 
+/// Default webhook delivery timeout, used when no override is configured (Issue #462).
+pub const DEFAULT_WEBHOOK_TIMEOUT_SECS: u64 = 15;
+
+/// Shared HTTP client settings applied to every webhook client (Issues #461, #462).
+///
+/// These mirror the connection-pool / keepalive / user-agent tuning used by the
+/// poller's shared client so that TLS-configured contracts behave consistently.
+#[derive(Debug, Clone)]
+pub struct HttpClientSettings {
+    /// Value for the `User-Agent` header on every request.
+    pub user_agent: String,
+    /// Maximum number of idle connections kept per host.
+    pub pool_max_idle_per_host: usize,
+    /// TCP keepalive interval, if enabled.
+    pub tcp_keepalive: Option<Duration>,
+    /// Per-request timeout for webhook deliveries.
+    pub timeout: Duration,
+}
+
+impl Default for HttpClientSettings {
+    fn default() -> Self {
+        Self {
+            user_agent: format!("txwatch/{}", env!("CARGO_PKG_VERSION")),
+            pool_max_idle_per_host: 10,
+            tcp_keepalive: Some(Duration::from_secs(60)),
+            timeout: Duration::from_secs(DEFAULT_WEBHOOK_TIMEOUT_SECS),
+        }
+    }
+}
+
+impl HttpClientSettings {
+    /// Apply the shared pool/keepalive/user-agent/timeout options to a builder.
+    fn apply(&self, mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+        builder = builder
+            .timeout(self.timeout)
+            .user_agent(self.user_agent.clone())
+            .pool_max_idle_per_host(self.pool_max_idle_per_host);
+        if let Some(keepalive) = self.tcp_keepalive {
+            builder = builder.tcp_keepalive(keepalive);
+        }
+        builder
+    }
+}
+
 /// Build a shared HTTP client with sensible defaults.
 pub fn build_client() -> Result<Client> {
-    Client::builder()
-        .timeout(Duration::from_secs(15))
+    build_client_with_settings(&HttpClientSettings::default())
+}
+
+/// Build a shared HTTP client using explicit [`HttpClientSettings`].
+pub fn build_client_with_settings(settings: &HttpClientSettings) -> Result<Client> {
+    settings
+        .apply(Client::builder())
         .build()
         .map_err(|e| anyhow!("failed to build HTTP client: {}", e))
 }
@@ -61,6 +111,14 @@ pub fn build_client() -> Result<Client> {
 /// in addition to the system roots. Files are read once, here, at startup.
 /// Error messages name the file path but never include file contents.
 pub fn build_tls_client(tls: &TlsConfig) -> Result<Client> {
+    build_tls_client_with_settings(tls, &HttpClientSettings::default())
+}
+
+/// Build an mTLS client using explicit [`HttpClientSettings`] (Issues #461, #462).
+pub fn build_tls_client_with_settings(
+    tls: &TlsConfig,
+    settings: &HttpClientSettings,
+) -> Result<Client> {
     let cert = fs::read(&tls.client_cert)
         .map_err(|e| anyhow!("cannot read tls.client_cert '{}': {}", tls.client_cert, e))?;
     let key = fs::read(&tls.client_key)
@@ -74,9 +132,7 @@ pub fn build_tls_client(tls: &TlsConfig) -> Result<Client> {
         )
     })?;
 
-    let mut builder = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .identity(identity);
+    let mut builder = settings.apply(Client::builder()).identity(identity);
     if let Some(ca_path) = &tls.ca_cert {
         let ca_pem = fs::read(ca_path)
             .map_err(|e| anyhow!("cannot read tls.ca_cert '{}': {}", ca_path, e))?;
@@ -91,10 +147,18 @@ pub fn build_tls_client(tls: &TlsConfig) -> Result<Client> {
 
 /// Build an HTTP client configured with a pinned TLS root certificate (Issue #362).
 pub fn build_pinned_cert_client(cert_pem: &str) -> Result<Client> {
+    build_pinned_cert_client_with_settings(cert_pem, &HttpClientSettings::default())
+}
+
+/// Build a pinned-cert client using explicit [`HttpClientSettings`] (Issues #461, #462).
+pub fn build_pinned_cert_client_with_settings(
+    cert_pem: &str,
+    settings: &HttpClientSettings,
+) -> Result<Client> {
     let cert = reqwest::Certificate::from_pem(cert_pem.as_bytes())
         .map_err(|e| anyhow!("invalid webhook_tls_cert_pem: {}", e))?;
-    Client::builder()
-        .timeout(Duration::from_secs(15))
+    settings
+        .apply(Client::builder())
         .add_root_certificate(cert)
         .build()
         .map_err(|e| anyhow!("failed to build TLS pinned client: {}", e))

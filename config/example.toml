@@ -1,4 +1,5 @@
 poll_interval_seconds = 10
+# webhook_timeout_seconds = 15   # optional: per-request webhook delivery timeout in seconds (default: 15)
 
 [[contracts]]
 label       = "My Escrow Contract"

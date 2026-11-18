@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Four additional alert rule types: `InsufficientFunds`, `SorobanInvocation`, `SourceAccountMatch`, `TimeWindow`
+- mTLS support for webhook delivery, including pinned-certificate verification
+- SSRF guard for webhook URLs, rejecting requests to private/internal addresses
+- Webhook idempotency keys to enable deduplication of alert deliveries
+- Per-contract tags for organizing and filtering monitored contracts
+- Cursor persistence across restarts to resume polling without gaps or duplicates
+- Prometheus metrics endpoint for monitoring polling, alerting, and webhook delivery
+- Graceful shutdown handling for in-flight polls and webhook deliveries
+- Configurable webhook request timeout
+- Escalation on cursor-save failures to surface persistence errors
+
+### Changed
+
+- Webhook delivery now applies the SSRF guard and mTLS/pinned-cert settings to all outbound requests
+- Cursor state is persisted so polling resumes from the last processed ledger on restart
+
+### Fixed
+
+- Cursor-save failures are now escalated rather than silently ignored, preventing unnoticed polling gaps
+
 ## [0.1.0] - 2025-01-01
 
 ### Added
