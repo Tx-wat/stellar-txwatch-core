@@ -7,8 +7,9 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use hex;
 use hmac::{Hmac, Mac};
-use reqwest::Client;
+use reqwest::{Certificate, Client, Identity};
 use sha2::Sha256;
+use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
@@ -358,6 +359,251 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    // ── TLS integration test helpers (Issues #278, #362, #466) ────────────────
+    //
+    // These helpers generate a throwaway CA, a server certificate and a client
+    // certificate at test time using `rcgen`, then spin up a TLS-terminating
+    // mock server that requires client certificates. This proves that the
+    // `reqwest::Client` produced by `build_tls_client` / `build_pinned_cert_client`
+    // can actually complete a TLS handshake end-to-end — not just that the
+    // config parses.
+
+    use std::io::Write;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_rustls::TlsAcceptor;
+
+    /// A generated PKI bundle: PEM-encoded CA, server cert/key and client cert/key.
+    struct TestPki {
+        ca_pem:        String,
+        server_cert:   String,
+        server_key:    String,
+        client_cert:   String,
+        client_key:    String,
+    }
+
+    /// Generate a throwaway CA plus a server and client certificate signed by it.
+    fn generate_pki() -> TestPki {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
+            SanType,
+        };
+
+        // CA
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "txwatch-test-ca");
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        // Server cert signed by CA, valid for localhost / 127.0.0.1.
+        let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        server_params
+            .distinguished_name
+            .push(DnType::CommonName, "localhost");
+        server_params.subject_alt_names = vec![
+            SanType::DnsName("localhost".try_into().unwrap()),
+            SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        ];
+        server_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let server_key = KeyPair::generate().unwrap();
+        let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+
+        // Client cert signed by CA.
+        let mut client_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        client_params
+            .distinguished_name
+            .push(DnType::CommonName, "txwatch-test-client");
+        client_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let client_key = KeyPair::generate().unwrap();
+        let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+
+        TestPki {
+            ca_pem:      ca_cert.pem(),
+            server_cert: server_cert.pem(),
+            server_key:  server_key.serialize_pem(),
+            client_cert: client_cert.pem(),
+            client_key:  client_key.serialize_pem(),
+        }
+    }
+
+    /// Generate a client cert/key signed by a *different*, untrusted CA.
+    fn generate_untrusted_client() -> (String, String) {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "txwatch-untrusted-ca");
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut client_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        client_params
+            .distinguished_name
+            .push(DnType::CommonName, "txwatch-untrusted-client");
+        client_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+        ];
+        let client_key = KeyPair::generate().unwrap();
+        let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
+
+        (client_cert.pem(), client_key.serialize_pem())
+    }
+
+    /// A minimal TLS-terminating mock server that requires client certificates
+    /// and responds `200 OK` to any request. Returns the bound address and a
+    /// shutdown handle.
+    struct TlsMockServer {
+        addr:     SocketAddr,
+        shutdown: Option<oneshot::Sender<()>>,
+        handle:   Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl TlsMockServer {
+        async fn start(pki: &TestPki) -> Self {
+            use rustls::server::WebPkiClientVerifier;
+            use rustls::RootCertStore;
+
+            // Server identity.
+            let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+                rustls_pemfile::certs(&mut pki.server_cert.as_bytes())
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+            let key = rustls_pemfile::private_key(&mut pki.server_key.as_bytes())
+                .unwrap()
+                .unwrap();
+
+            // Trust the test CA for client cert verification.
+            let mut roots = RootCertStore::empty();
+            let ca_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+                rustls_pemfile::certs(&mut pki.ca_pem.as_bytes())
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+            for ca in ca_certs {
+                roots.add(ca).unwrap();
+            }
+            let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .unwrap();
+
+            let config = rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+                .unwrap();
+            let acceptor = TlsAcceptor::from(Arc::new(config));
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        accept = listener.accept() => {
+                            let (stream, _) = match accept {
+                                Ok(v) => v,
+                                Err(_) => break,
+                            };
+                            let acceptor = acceptor.clone();
+                            tokio::spawn(async move {
+                                let mut tls = match acceptor.accept(stream).await {
+                                    Ok(t) => t,
+                                    Err(_) => return, // handshake failure (e.g. bad client cert)
+                                };
+                                // Read the request headers/body (best-effort) then reply 200.
+                                let mut buf = [0u8; 4096];
+                                let _ = tls.read(&mut buf).await;
+                                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                                let _ = tls.write_all(response).await;
+                                let _ = tls.flush().await;
+                                let _ = tls.shutdown().await;
+                            });
+                        }
+                    }
+                }
+            });
+
+            Self {
+                addr,
+                shutdown: Some(shutdown_tx),
+                handle: Some(handle),
+            }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("https://localhost:{}{}", self.addr.port(), path)
+        }
+    }
+
+    impl Drop for TlsMockServer {
+        fn drop(&mut self) {
+            if let Some(tx) = self.shutdown.take() {
+                let _ = tx.send(());
+            }
+            if let Some(handle) = self.handle.take() {
+                handle.abort();
+            }
+        }
+    }
+
+    /// A temp directory that is removed on drop.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!(
+                "txwatch-notifier-tls-test-{}-{}-{}",
+                std::process::id(),
+                n,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn write(&self, name: &str, contents: &str) -> PathBuf {
+            let p = self.path.join(name);
+            let mut f = fs::File::create(&p).unwrap();
+            f.write_all(contents.as_bytes()).unwrap();
+            p
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
     fn sample_payload() -> AlertPayload {
         AlertPayload {
             label:               "Test Contract".into(),
@@ -654,5 +900,89 @@ mod tests {
         let url = format!("{}/hook", server.uri());
         let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
+    }
+
+    // ── TLS end-to-end tests (Issues #278, #362, #466) ────────────────────────
+
+    /// Issue #278 / #466: `build_tls_client` produces a client that can complete
+    /// an mTLS handshake against a server requiring client certs, and
+    /// `send_webhook` delivers successfully through it.
+    #[tokio::test]
+    async fn build_tls_client_delivers_over_mtls() {
+        let pki = generate_pki();
+        let server = TlsMockServer::start(&pki).await;
+
+        let dir = TempDir::new();
+        let client_cert = dir.write("client.crt", &pki.client_cert);
+        let client_key = dir.write("client.key", &pki.client_key);
+        let ca_cert = dir.write("ca.crt", &pki.ca_pem);
+
+        let tls = TlsConfig {
+            client_cert: client_cert.to_string_lossy().into_owned(),
+            client_key: client_key.to_string_lossy().into_owned(),
+            ca_cert: Some(ca_cert.to_string_lossy().into_owned()),
+        };
+
+        let client = build_tls_client(&tls).expect("build_tls_client should succeed");
+        let url = server.url("/hook");
+        let delivery = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown())
+            .await
+            .expect("mTLS delivery should succeed");
+        assert_eq!(delivery.final_status, 200);
+        assert_eq!(delivery.attempts, 1);
+    }
+
+    /// Issue #278 / #466: a client cert signed by an untrusted CA must fail the
+    /// handshake, so `send_webhook` returns an error after exhausting retries.
+    #[tokio::test]
+    async fn build_tls_client_rejects_untrusted_client_cert() {
+        let pki = generate_pki();
+        let server = TlsMockServer::start(&pki).await;
+
+        let (bad_cert, bad_key) = generate_untrusted_client();
+        let dir = TempDir::new();
+        let client_cert = dir.write("client.crt", &bad_cert);
+        let client_key = dir.write("client.key", &bad_key);
+        let ca_cert = dir.write("ca.crt", &pki.ca_pem);
+
+        let tls = TlsConfig {
+            client_cert: client_cert.to_string_lossy().into_owned(),
+            client_key: client_key.to_string_lossy().into_owned(),
+            ca_cert: Some(ca_cert.to_string_lossy().into_owned()),
+        };
+
+        let client = build_tls_client(&tls).expect("build_tls_client should succeed");
+        let url = server.url("/hook");
+        // Zero backoff keeps the test fast; the handshake must still fail.
+        let result = send_webhook_with_backoff_test(
+            &client,
+            &url,
+            &sample_payload(),
+            None,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "delivery with an untrusted client cert must fail, got: {:?}",
+            result
+        );
+    }
+
+    /// Issue #362 / #466: `build_pinned_cert_client` trusts the pinned CA and
+    /// delivers successfully against a server presenting a cert signed by it.
+    #[tokio::test]
+    async fn build_pinned_cert_client_delivers_to_pinned_server() {
+        let pki = generate_pki();
+        let server = TlsMockServer::start(&pki).await;
+
+        let client = build_pinned_cert_client(&pki.ca_pem)
+            .expect("build_pinned_cert_client should succeed");
+        let url = server.url("/hook");
+        let delivery = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown())
+            .await
+            .expect("pinned-cert delivery should succeed");
+        assert_eq!(delivery.final_status, 200);
+        assert_eq!(delivery.attempts, 1);
     }
 }

@@ -39,18 +39,6 @@ Use `FunctionCalled` or `AdminFunctionCalled` when you only care about specific 
 type = "SorobanInvocation"
 ```
 
-### `ContractDeployed`
-Matches transactions that deploy a new Soroban contract, i.e. `invoke_host_function`
-operations whose `function` field is `"HostFunctionTypeCreateContract"`.
-
-**Use case:** alert when a new contract is created on a watched address, e.g. to track
-factory deployments or detect unexpected contract creation.
-
-```toml
-[[contracts.rules]]
-type = "ContractDeployed"
-```
-
 ### `InsufficientFunds`
 Matches transactions that failed because the source account could not cover the fee
 (Horizon result code `txINSUFFICIENT_BALANCE`, decoded from `result_xdr`). Other failures
@@ -124,6 +112,23 @@ type           = "AdminFunctionCalled"
 function_names = ["set_admin", "upgrade", "initialize"]
 ```
 
+### `SourceAccountMatch`
+
+| Field            | Type   | Required | Description                                              |
+|------------------|--------|----------|----------------------------------------------------------|
+| `source_account` | string | yes      | Stellar account ID (`G...`, 56 characters) to match      |
+
+Matches when the transaction's source account equals `source_account`. The value is
+validated as a Stellar account ID (`G...`, 56 characters) at config load time.
+
+**Use case:** watch activity from a specific account, e.g. a treasury or admin key.
+
+```toml
+[[contracts.rules]]
+type           = "SourceAccountMatch"
+source_account = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+```
+
 ### `HighFee`
 
 | Field                | Type | Required | Description                                                   |
@@ -180,6 +185,12 @@ All matching rules fire; there is no short-circuit.
 | `function_name`       | string/null | no             | First invoked Soroban function name if available; `null` indicates a non-Soroban transaction |
 | `function_names`      | [string]    | yes            | All invoked Soroban function names in the transaction (may contain multiple entries) |
 | `amount_xlm`          | u64/null    | no             | Transfer amount in XLM if available      |
+| `amount_stroops`      | u64/null    | no             | Transfer amount in stroops if available  |
+| `operation_count`     | u32/null    | no             | Total number of operations in the transaction |
+| `memo_type`           | string/null | no             | Transaction memo type: `"text"`, `"hash"`, `"id"`, `"return"`, or `"none"` |
+| `memo`                | string/null | no             | Transaction memo value                   |
+| `ledger_sequence`     | u32/null    | no             | Ledger sequence the transaction was included in |
+| `source_account`      | string/null | no             | The `G...` account that signed/submitted the transaction |
 | `fee_charged_stroops` | u64/null    | no             | Fee charged for the transaction in stroops |
 | `timestamp`           | i64         | yes            | Unix timestamp (seconds) of transaction  |
 | `timestamp_iso`       | string      | yes            | ISO 8601 timestamp of the transaction    |
@@ -187,6 +198,10 @@ All matching rules fire; there is no short-circuit.
 | `explorer_link`       | string      | yes            | Stellar Expert explorer link for the transaction |
 
 > `horizon_link` and `explorer_link` are always present in every alert payload, even when `function_name` is `null` for a non-Soroban transaction.
+
+> **Canonical field list:** the root [`README.md`](../README.md#webhook-payload) "Webhook payload"
+> section is the single source of truth for the payload schema. The table above mirrors it; if the
+> two ever disagree, trust the README.
 
 ## Stable rule_type values
 
@@ -205,9 +220,9 @@ The webhook payload includes two rule-related fields:
 | `TransactionFailed` | `"TransactionFailed"` |
 | `InsufficientFunds` | `"InsufficientFunds"` |
 | `SorobanInvocation` | `"SorobanInvocation"` |
-| `ContractDeployed` | `"ContractDeployed"` |
 | `LargeTransfer` | `"LargeTransfer"` |
 | `FunctionCalled` | `"FunctionCalled"` |
 | `AdminFunctionCalled` | `"AdminFunctionCalled"` |
 | `HighFee` | `"HighFee"` |
+| `SourceAccountMatch` | `"SourceAccountMatch"` |
 | `TimeWindow` | `"TimeWindow"` |
