@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_path_to_error::Deserializer as PathDeserializer;
+use std::collections::HashMap;
 use std::{env, fmt, fs, path::Path};
 use url::Url;
 
@@ -411,10 +412,10 @@ pub struct WatchedContract {
     /// Allow webhook URLs resolving to localhost or private IP ranges (Issue #346).
     #[serde(default)]
     pub allow_internal_webhook_urls: Option<bool>,
-    /// Per-contract webhook delivery timeout in seconds (Issue #462).
-    /// Overrides the global `webhook_timeout_seconds` when set.
+    /// Optional key/value tags attached to this contract, e.g. `tags = { team = "defi" }`.
+    /// Keys and values are validated by `validate_tag_part`.
     #[serde(default)]
-    pub webhook_timeout_seconds: Option<u64>,
+    pub tags: Option<HashMap<String, String>>,
 }
 
 /// Maximum length, in characters, of a tag key or value.
@@ -565,6 +566,13 @@ impl WatchedContract {
         let label = self.label.clone();
         for rule in &mut self.rules {
             rule.validate(&label)?;
+        }
+
+        if let Some(tags) = &self.tags {
+            for (key, value) in tags {
+                validate_tag_part(&self.label, "key", key)?;
+                validate_tag_part(&self.label, "value", value)?;
+            }
         }
 
         if let Some(tls) = &self.tls {
