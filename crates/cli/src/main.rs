@@ -198,6 +198,14 @@ fn filter_contracts(cfg: &mut AppConfig, labels: &[String]) -> Result<()> {
     Ok(())
 }
 
+// ── SSE idempotency key helper ────────────────────────────────────────────────
+
+/// Builds the SSE event idempotency key in the form
+/// `{contract_id}:{transaction_hash}:{rule_type}`.
+fn sse_idempotency_key(contract_id: &str, transaction_hash: &str, rule_type: &str) -> String {
+    format!("{}:{}:{}", contract_id, transaction_hash, rule_type)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -235,41 +243,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::TestWebhook { url, label, secret, timeout } => {
-            let cfg = AppConfig::from_file(&cli.config)?;
-            if cfg.contracts.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "config has no contracts; cannot derive network for test-webhook"
-                ));
-            }
-            let first_contract = &cfg.contracts[0];
-            let payload = test_payload_with_network(&label, &first_contract.network);
-            let client = build_client(Duration::from_secs(timeout))
-                .context("failed to build HTTP client")?;
+        Command::
 
-            info!(url = %url, timeout_secs = timeout, "sending test webhook");
-            send_webhook(&client, &url, &payload, secret.as_deref())
-                .await
-                .with_context(|| format!("test webhook to '{}' failed", url))?;
-            let signing = if secret.is_some() { "signed with HMAC-SHA256" } else { "unsigned" };
-            println!("Test webhook delivered successfully to {} ({})", url, signing);
-        }
-
-        Command::Watch {
-            dry_run,
-            from_beginning,
-            poll_once,
-            stream_addr,
-            stream_token,
-            contracts,
-        } => {
-            let mut cfg = AppConfig::from_file(&cli.config)?;
-
-            if let Some(labels) = contracts.as_deref() {
-                filter_contracts(&mut cfg, labels)?;
-            }
-
-            let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
-
-
-/* … truncated 2684 chars — edit only what you need near the top … */
+/* … truncated 1554 chars — edit only what you need near the top … */
