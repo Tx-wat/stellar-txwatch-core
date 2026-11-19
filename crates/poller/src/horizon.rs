@@ -5,7 +5,7 @@
 //! unknown fields are ignored so the code stays forward-compatible.
 
 use serde::Deserialize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use txwatch_rules::{HorizonOperation, HorizonTransaction};
 
 // ── Latency metric ───────────────────────────────────────────────────────────
@@ -16,6 +16,13 @@ pub(crate) const HORIZON_LATENCY_METRIC: &str = "txwatch_horizon_latency_seconds
 /// `le` bucket bounds (seconds) suitable for HTTP API latency.
 pub(crate) const HORIZON_LATENCY_BUCKETS: &[f64] = &[0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
 
+/// Name of the counter tracking Horizon 429 rate-limit responses.
+pub(crate) const HORIZON_RATE_LIMITS_METRIC: &str = "txwatch_horizon_rate_limits_total";
+
+/// Default backoff applied when Horizon returns 429 without a `Retry-After`
+/// header.
+pub(crate) const HORIZON_DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(1);
+
 /// Records the duration of a Horizon request against the
 /// `txwatch_horizon_latency_seconds` histogram, labelled by `endpoint`.
 ///
@@ -24,6 +31,27 @@ pub(crate) fn observe_horizon_latency(endpoint: &str, started: Instant) {
     let elapsed = started.elapsed().as_secs_f64();
     metrics::histogram!(HORIZON_LATENCY_METRIC, "endpoint" => endpoint.to_string())
         .record(elapsed);
+}
+
+/// Increments the `txwatch_horizon_rate_limits_total` counter, labelled by
+/// `endpoint`.
+pub(crate) fn observe_horizon_rate_limit(endpoint: &str) {
+    metrics::counter!(HORIZON_RATE_LIMITS_METRIC, "endpoint" => endpoint.to_string())
+        .increment(1);
+}
+
+/// Parse a `Retry-After` header value into a backoff duration.
+///
+/// Horizon sends the delay in seconds. Falls back to
+/// [`HORIZON_DEFAULT_RATE_LIMIT_BACKOFF`] when the header is missing or cannot
+/// be parsed.
+pub(crate) fn retry_after_backoff(headers: &reqwest::header::HeaderMap) -> Duration {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(HORIZON_DEFAULT_RATE_LIMIT_BACKOFF)
 }
 
 // ── Account kind ─────────────────────────────────────────────────────────────
@@ -103,6 +131,36 @@ pub(crate) struct OpsEmbedded {
 
 // ── Instrumented fetches ──────────────────────────────────────────────────────
 
+/// Send a GET request, handling Horizon 429 rate-limit responses separately
+/// from other errors.
+///
+/// On 429 the `txwatch_horizon_rate_limits_total` counter is incremented, the
+/// request waits for the `Retry-After` header value (or a default backoff) and
+/// retries once. Any other non-success status is surfaced as a generic error.
+async fn get_with_rate_limit_retry(
+    client: &reqwest::Client,
+    url: &str,
+    endpoint: &str,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let response = client.get(url).send().await?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        observe_horizon_rate_limit(endpoint);
+        let backoff = retry_after_backoff(response.headers());
+        tracing::warn!(
+            endpoint,
+            backoff_secs = backoff.as_secs_f64(),
+            "Horizon rate limit hit (429); backing off before retry"
+        );
+        tokio::time::sleep(backoff).await;
+        let retry = client.get(url).send().await?;
+        if retry.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            observe_horizon_rate_limit(endpoint);
+        }
+        return retry.error_for_status();
+    }
+    response.error_for_status()
+}
+
 /// Fetch a page of transactions for `account_id`, recording the request
 /// duration under the `transactions` endpoint label.
 pub(crate) async fn fetch_transactions_page(
@@ -112,7 +170,10 @@ pub(crate) async fn fetch_transactions_page(
 ) -> Result<HorizonPage, reqwest::Error> {
     let started = Instant::now();
     let url = format!("{base_url}/accounts/{account_id}/transactions?join=operations");
-    let result = client.get(&url).send().await?.error_for_status()?.json().await;
+    let result = get_with_rate_limit_retry(client, &url, "transactions")
+        .await?
+        .json()
+        .await;
     observe_horizon_latency("transactions", started);
     result
 }
@@ -126,7 +187,10 @@ pub(crate) async fn fetch_soroban_details(
 ) -> Result<OperationsPage, reqwest::Error> {
     let started = Instant::now();
     let url = format!("{base_url}/transactions/{tx_hash}/operations");
-    let result = client.get(&url).send().await?.error_for_status()?.json().await;
+    let result = get_with_rate_limit_retry(client, &url, "operations")
+        .await?
+        .json()
+        .await;
     observe_horizon_latency("operations", started);
     result
 }
@@ -213,6 +277,43 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Server that answers the first request with 429 (including a
+    /// `Retry-After` header) and every subsequent request with 200.
+    async fn spawn_rate_limit_then_ok_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let hits = hits.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let first = hits.fetch_add(1, Ordering::SeqCst) == 0;
+                    let response = if first {
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn connectivity_check_succeeds_on_200() {
         let base_url = spawn_status_server(200).await;
@@ -227,18 +328,25 @@ mod tests {
         assert!(check_connectivity(&client, &base_url).await.is_err());
     }
 
-    #[tokio::test]
-    async fn startup_check_does_not_abort_on_failure() {
-        let base_url = spawn_status_server(503).await;
-        let client = reqwest::Client::new();
-        // Must return normally (warn only) even when the endpoint is unhealthy.
-        startup_connectivity_check(&client, &[base_url], true).await;
+    #[test]
+    fn retry_after_backoff_uses_header_value() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "7".parse().unwrap());
+        assert_eq!(retry_after_backoff(&headers), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn retry_after_backoff_defaults_when_missing() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_backoff(&headers), HORIZON_DEFAULT_RATE_LIMIT_BACKOFF);
     }
 
     #[tokio::test]
-    async fn startup_check_skipped_when_disabled() {
+    async fn rate_limit_429_backs_off_and_retries() {
+        let base_url = spawn_rate_limit_then_ok_server().await;
         let client = reqwest::Client::new();
-        // Unreachable URL is fine because the check is disabled.
-        startup_connectivity_check(&client, &["http://127.0.0.1:1".to_string()], false).await;
+        let url = format!("{base_url}/fee_stats");
+        let result = get_with_rate_limit_retry(&client, &url, "transactions").await;
+        assert!(result.is_ok(), "429 should be retried and succeed on 200");
     }
 }

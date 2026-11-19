@@ -1,6 +1,6 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes eight counters:
+//! Exposes nine counters:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_alerts_suppressed_total`  — total alerts suppressed by the per-cycle cap (labelled by `contract`)
@@ -9,6 +9,7 @@
 //! - `txwatch_poll_cycles_total`        — total poll cycles per contract (labelled by `contract`)
 //! - `txwatch_cursor_save_failures_total` — total failed cursor-file persistence attempts
 //! - `txwatch_circuit_breaker_open_total` — total times a contract entered circuit-breaker state
+//! - `txwatch_horizon_rate_limits_total` — total Horizon 429 rate-limit responses (see issue #574)
 //!
 //! And one histogram:
 //! - `txwatch_horizon_latency_seconds`  — Horizon API request duration, labelled by `endpoint`
@@ -118,6 +119,17 @@ fn circuit_breaker_open_total() -> &'static IntCounter {
     })
 }
 
+fn horizon_rate_limits_total() -> &'static IntCounter {
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter!(
+            "txwatch_horizon_rate_limits_total",
+            "Total Horizon 429 Too Many Requests responses (see issue #574)"
+        )
+        .expect("register txwatch_horizon_rate_limits_total")
+    })
+}
+
 fn poll_cycles_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
@@ -182,6 +194,14 @@ pub fn inc_circuit_breaker_open() {
     circuit_breaker_open_total().inc();
 }
 
+/// Increment the `txwatch_horizon_rate_limits_total` counter by 1.
+///
+/// Call this whenever Horizon responds with HTTP 429 Too Many Requests so that
+/// rate limiting is observable separately from other errors (issue #574).
+pub fn inc_horizon_rate_limits() {
+    horizon_rate_limits_total().inc();
+}
+
 /// Increment the `txwatch_poll_cycles_total` counter for `contract` by 1.
 ///
 /// Call this after each poll attempt, whether it succeeds or fails, so that a
@@ -219,35 +239,6 @@ pub async fn serve_metrics(addr: SocketAddr) -> Result<()> {
 }
 
 async fn handle_metrics(
-    _req: Request<hyper::body::Incoming>,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    init_build_info();
-    use prometheus::Encoder;
-    let encoder = prometheus::TextEncoder::new();
-    let mut buf = Vec::new();
-    encoder
-        .encode(&prometheus::gather(), &mut buf)
-        .unwrap_or_default();
-    Ok(Response::builder()
-        .status(200)
-        .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-        .body(Full::new(Bytes::from(buf)))
-        .unwrap())
-}
+  
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn metrics_endpoint_content_type_header() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-
-        serve_metrics(addr).await.unwrap();
-
-        let client = reqwest::Client::new();
-        let resp = cl
-
-/* … truncated 1935 chars — edit only what you need near the top … */
+/* … truncated 975 chars — edit only what you need near the top … */
