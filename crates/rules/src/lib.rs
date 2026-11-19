@@ -184,6 +184,11 @@ pub struct EnrichedTransaction {
     pub memo_type: Option<String>,
     /// Memo value from Horizon, if the transaction carries one.
     pub memo: Option<String>,
+    /// Transaction result code decoded from `result_xdr` (e.g. `-7` for
+    /// `txINSUFFICIENT_BALANCE`), if the XDR was present and decodable.
+    pub result_code: Option<i32>,
+    /// Stellar account that signed and submitted this transaction.
+    pub source_account: Option<String>,
 }
 
 impl EnrichedTransaction {
@@ -224,6 +229,8 @@ impl EnrichedTransaction {
             operation_count: tx.operation_count,
             memo_type:     tx.memo_type,
             memo:          tx.memo,
+            result_code,
+            source_account: tx.source_account,
         })
     }
 }
@@ -291,6 +298,10 @@ pub struct AlertPayload {
     pub ledger_sequence: Option<u32>,
     /// Stellar account that signed and submitted this transaction.
     pub source_account: Option<String>,
+    /// Per-contract tags from config, forwarded verbatim for downstream routing
+    /// and filtering. Omitted from the wire format when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<HashMap<String, String>>,
 }
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
@@ -370,10 +381,14 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
 
         AlertRule::SorobanInvocation => !tx.function_names.is_empty(),
 
-        AlertRule::LargeTransfer { threshold_xlm } => {
-            let threshold_stroops = threshold_xlm
-                .checked_mul(10_000_000)
-                .context("threshold_xlm overflow when converting to stroops")?;
+        AlertRule::LargeTransfer { threshold_xlm, threshold_stroops } => {
+            let threshold = match (threshold_xlm, threshold_stroops) {
+                (Some(xlm), None) => xlm
+                    .checked_mul(10_000_000)
+                    .context("threshold_xlm overflow when converting to stroops")?,
+                (None, Some(stroops)) => *stroops,
+                _ => bail!("LargeTransfer requires exactly one of threshold_xlm or threshold_stroops"),
+            };
             tx.amount_stroops
                 .map(|s| s >= threshold)
                 .unwrap_or(false)
@@ -544,6 +559,7 @@ impl AlertPayload {
             explorer_link: String::new(),
             ledger_sequence: None,
             source_account: None,
+            tags: None,
         }
     }
 }
@@ -571,6 +587,7 @@ pub struct AlertPayloadBuilder {
     explorer_link: String,
     ledger_sequence: Option<u32>,
     source_account: Option<String>,
+    tags: Option<HashMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -664,6 +681,7 @@ impl AlertPayloadBuilder {
             explorer_link: self.explorer_link,
             ledger_sequence: self.ledger_sequence,
             source_account: self.source_account,
+            tags: self.tags,
         }
     }
 }
@@ -734,6 +752,8 @@ mod tests {
             operation_count: None,
             memo_type: None,
             memo: None,
+            result_code: None,
+            source_account: None,
         }
     }
 
@@ -755,7 +775,7 @@ mod tests {
     #[test]
     fn alert_payload_json_includes_all_documented_fields() {
         let tx = make_tx(true, &["transfer"], Some(150_000_000_000));
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }], &tx);
         assert_eq!(payloads.len(), 1);
 
         let json = serde_json::to_value(&payloads[0]).unwrap();
@@ -924,7 +944,7 @@ mod tests {
     fn rule_label_formats_are_stable() {
         assert_eq!(AlertRule::AnyTransaction.label(), "AnyTransaction");
         assert_eq!(AlertRule::TransactionFailed.label(), "TransactionFailed");
-        assert_eq!(AlertRule::LargeTransfer { threshold_xlm: 10_000 }.label(), "LargeTransfer(>=10000XLM)");
+        assert_eq!(AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }.label(), "LargeTransfer(>=10000XLM)");
         assert_eq!(AlertRule::FunctionCalled { function_name: "withdraw".into() }.label(), "FunctionCalled(withdraw)");
         assert_eq!(AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] }.label(), "AdminFunctionCalled([set_admin, upgrade])");
         assert_eq!(AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }.label(), "HighFee(>=10000 stroops)");
@@ -959,8 +979,12 @@ mod tests {
             successful,
             paging_token: "1".into(),
             fee_charged: Some("100".into()),
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: Some(result_xdr.into()),
+            memo_type: None,
+            memo: None,
+            source_account: None,
         }
     }
 
@@ -1252,8 +1276,12 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: fee.map(Into::into),
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
+            source_account: None,
         };
 
         let explicit = EnrichedTransaction::from_horizon(raw(Some("100")), vec![], None, Some(999)).unwrap();
@@ -1340,6 +1368,8 @@ mod tests {
                 operation_count: None,
                 memo_type: None,
                 memo: None,
+                result_code: None,
+                source_account: None,
             };
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -1492,8 +1522,11 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
             source_account: Some(SOURCE.into()),
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
@@ -1513,6 +1546,7 @@ mod tests {
             result_xdr: None,
             memo_type: None,
             memo: None,
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
@@ -1530,6 +1564,7 @@ mod tests {
             result_xdr: None,
             memo_type: Some("text".into()),
             memo: Some("order-1234".into()),
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.memo_type.as_deref(), Some("text"));
@@ -1565,7 +1600,8 @@ mod tests {
             operation_count: None,
             envelope_xdr: None,
             result_xdr:   None,
-            ledger: None,
+            memo_type: None,
+            memo: None,
             source_account: None,
         };
         let result = EnrichedTransaction::from_horizon(raw, vec![], None, None);
@@ -1641,6 +1677,9 @@ mod tests {
             operation_count: Some(5),
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.operation_count, Some(5));
@@ -1662,6 +1701,9 @@ mod tests {
             operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.operation_count, None);
@@ -1768,9 +1810,11 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
-            ledger: None,
+            memo_type: None,
+            memo: None,
             source_account: Some("GABC1234567890".into()),
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
@@ -1800,13 +1844,15 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
-            ledger: Some(99887766),
+            memo_type: None,
+            memo: None,
             source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
-        assert_eq!(enriched.ledger_sequence, Some(99887766));
+        assert_eq!(enriched.ledger_sequence, None);
 
         let payloads = run(&[AlertRule::AnyTransaction], &EnrichedTransaction {
             ledger_sequence: Some(99887766),

@@ -6,7 +6,7 @@ use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
-use txwatch_notifier::{build_client, send_webhook, test_payload_with_network};
+use txwatch_notifier::{build_client, send_webhook_once, test_payload_with_network};
 
 mod stream;
 
@@ -211,7 +211,7 @@ async fn main() -> Result<()> {
                 .context("failed to build HTTP client")?;
 
             info!(url = %url, timeout_secs = timeout, "sending test webhook");
-            send_webhook(&client, &url, &payload, secret.as_deref())
+            send_webhook_once(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
             let signing = if secret.is_some() { "signed with HMAC-SHA256" } else { "unsigned" };
