@@ -224,8 +224,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-release-
 
+      - name: Verify committed lock file is valid and up to date
+        # Fails CI immediately if Cargo.lock is corrupted (e.g. duplicate
+        # package entries) or out of sync with the manifests, instead of
+        # silently regenerating it during an unlocked build.
+        run: cargo check --locked --all-targets --all-features
+
       - name: Build release binary
-        run: cargo build --release -p txwatch
+        run: cargo build --locked --release -p txwatch
 
       - name: Upload txwatch binary
         uses: actions/upload-artifact@v4
