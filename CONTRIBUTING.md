@@ -56,6 +56,48 @@ docker compose down
 
 ---
 
+## Devcontainer / one-click development environment
+
+The repository ships a [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json)
+configuration so you can get a fully working Rust development environment
+without installing anything locally.
+
+### Opening the devcontainer
+
+- **GitHub Codespaces:** click *Code → Codespaces → Create codespace on main*
+  on the repository page. The container is built and configured automatically.
+- **VS Code (local):** install the
+  [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers),
+  open the repository folder, and run *Dev Containers: Reopen in Container*
+  from the command palette (`Ctrl+Shift+P` / `Cmd+Shift+P`).
+
+The container is based on the official `rust:latest` image.
+
+### What it installs
+
+- **Rust toolchain** (stable, from the base image)
+- **clippy** and **rustfmt** components (installed via the post-create command
+  `rustup component add clippy rustfmt`)
+- **VS Code extensions:**
+  - [`rust-analyzer`](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer) — language server, completion, inline errors
+  - [`vadimcn.vscode-lldb`](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb) (CodeLLDB) — native debugger
+  - [`tamasfe.even-better-toml`](https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml) — TOML syntax highlighting and validation for config files
+
+### Building and testing inside the container
+
+Open a terminal in the container (VS Code: *Terminal → New Terminal*) and run:
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo clippy -- -D warnings
+cargo fmt --check
+```
+
+These are the same commands CI runs, so a green run locally means a green PR.
+
+---
+
 ## Local dev setup
 
 ### 1. Rust toolchain

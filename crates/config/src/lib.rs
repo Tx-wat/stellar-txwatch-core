@@ -48,6 +48,46 @@ pub fn is_valid_stellar_account_id(s: &str) -> bool {
         && s.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'))
 }
 
+// ── ContractType ──────────────────────────────────────────────────────────────
+
+/// Distinguishes Soroban contract alerts from classic Stellar account alerts.
+///
+/// Serializes as `"soroban"` or `"classic"` so webhook receivers can route
+/// alerts without parsing the `contract_id` format.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContractType {
+    Soroban,
+    Classic,
+}
+
+impl ContractType {
+    /// Derives the contract type from a `contract_id` prefix:
+    /// `'C'` → `Soroban`, `'G'` → `Classic`.
+    ///
+    /// Returns `None` for any other prefix.
+    pub fn from_contract_id(contract_id: &str) -> Option<Self> {
+        match contract_id.chars().next() {
+            Some('C') => Some(ContractType::Soroban),
+            Some('G') => Some(ContractType::Classic),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContractType::Soroban => "soroban",
+            ContractType::Classic => "classic",
+        }
+    }
+}
+
+impl fmt::Display for ContractType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ── Network ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -438,6 +478,12 @@ fn validate_tag_part(contract_label: &str, kind: &str, part: &str) -> Result<()>
 }
 
 impl WatchedContract {
+    /// Contract type derived from the `contract_id` prefix (`'C'` → Soroban,
+    /// `'G'` → Classic). Defaults to `Soroban` for unrecognised prefixes.
+    pub fn contract_type(&self) -> ContractType {
+        ContractType::from_contract_id(&self.contract_id).unwrap_or(ContractType::Soroban)
+    }
+
     pub fn validate(&mut self) -> Result<()> {
         if self.label.trim().is_empty() {
             bail!("a contract has an empty label");
@@ -1509,6 +1555,46 @@ mod tests {
         } else {
             panic!("expected AdminFunctionCalled");
         }
+    }
+
+    // ── ContractType ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn contract_type_derives_from_contract_id_prefix() {
+        assert_eq!(
+            ContractType::from_contract_id("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            Some(ContractType::Soroban)
+        );
+        assert_eq!(
+            ContractType::from_contract_id("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            Some(ContractType::Classic)
+        );
+        assert_eq!(ContractType::from_contract_id("XABC"), None);
+        assert_eq!(ContractType::from_contract_id(""), None);
+    }
+
+    #[test]
+    fn contract_type_serializes_as_lowercase() {
+        assert_eq!(serde_json::to_string(&ContractType::Soroban).unwrap(), "\"soroban\"");
+        assert_eq!(serde_json::to_string(&ContractType::Classic).unwrap(), "\"classic\"");
+        assert_eq!(
+            serde_json::from_str::<ContractType>("\"soroban\"").unwrap(),
+            ContractType::Soroban
+        );
+        assert_eq!(
+            serde_json::from_str::<ContractType>("\"classic\"").unwrap(),
+            ContractType::Classic
+        );
+    }
+
+    #[test]
+    fn watched_contract_contract_type_matches_id() {
+        let c = valid_contract();
+        assert_eq!(c.contract_type(), ContractType::Soroban);
+
+        let mut classic = valid_contract();
+        classic.contract_id = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+        assert_eq!(classic.contract_type(), ContractType::Classic);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use txwatch_config::AlertRule;
+use txwatch_config::{AlertRule, ContractType};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -196,6 +196,9 @@ pub fn transaction_result_code(result_xdr: &str) -> Option<i32> {
 pub struct AlertPayload {
     pub label: String,
     pub contract_id: String,
+    /// Whether the monitored address is a Soroban contract (`"soroban"`) or a
+    /// classic account (`"classic"`), derived from the `contract_id` prefix.
+    pub contract_type: ContractType,
     /// Serialises as the lowercase name (`"mainnet"`, `"testnet"`, `"futurenet"`),
     /// so the webhook wire format is unchanged from the old `String` field.
     pub network: Network,
@@ -262,6 +265,7 @@ pub fn evaluate(
             Ok(true) => Some(AlertPayload {
                 label: label.to_string(),
                 contract_id: contract_id.to_string(),
+                contract_type: ContractType::from_contract_id(contract_id),
                 network: network.to_string(),
                 rule_type: rule.rule_type(),
                 rule_triggered: rule.label(),
@@ -420,6 +424,7 @@ impl AlertPayload {
         Self {
             label: ctx.label.to_string(),
             contract_id: ctx.contract_id.to_string(),
+            contract_type: ContractType::from_contract_id(ctx.contract_id),
             network: ctx.network.to_string(),
             rule_type: rule_type(rule),
             rule_triggered: rule_label(rule),
@@ -573,6 +578,7 @@ impl AlertPayloadBuilder {
 
     pub fn build(self) -> AlertPayload {
         AlertPayload {
+            contract_type: ContractType::from_contract_id(&self.contract_id),
             label: self.label,
             contract_id: self.contract_id,
             network: self.network,
@@ -693,6 +699,7 @@ mod tests {
         let documented = [
             "label",
             "contract_id",
+            "contract_type",
             "network",
             "rule_type",
             "rule_triggered",
@@ -710,6 +717,61 @@ mod tests {
             assert!(object.contains_key(field), "missing documented field: {}", field);
         }
         assert_eq!(object.len(), documented.len(), "undocumented fields present: {:?}", object.keys());
+    }
+
+    // ── Issue #351: contract_type routing field ──────────────────────────────
+
+    #[test]
+    fn contract_type_serializes_as_soroban_for_c_address() {
+        let tx = make_tx(true, &[], None);
+        let payloads = run(&[AlertRule::AnyTransaction], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(
+            payloads[0].contract_id,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
+        assert_eq!(payloads[0].contract_type, ContractType::Soroban);
+        let json = serde_json::to_value(&payloads[0]).unwrap();
+        assert_eq!(json["contract_type"], "soroban");
+    }
+
+    #[test]
+    fn contract_type_serializes_as_classic_for_g_address() {
+        let tx = make_tx(true, &[], None);
+        let payloads = evaluate(
+            "Label",
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            &Network::Testnet,
+            "https://horizon-testnet.stellar.org",
+            "https://stellar.expert/explorer/testnet",
+            &[AlertRule::AnyTransaction],
+            None,
+            &tx,
+        );
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].contract_type, ContractType::Classic);
+        let json = serde_json::to_value(&payloads[0]).unwrap();
+        assert_eq!(json["contract_type"], "classic");
+    }
+
+    #[test]
+    fn alert_payload_new_derives_contract_type_from_contract_id() {
+        let tx = make_tx(true, &[], None);
+        for (contract_id, expected) in [
+            ("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ContractType::Soroban),
+            ("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ContractType::Classic),
+        ] {
+            let ctx = PayloadContext {
+                label: "Label",
+                contract_id,
+                network: "testnet",
+                horizon_base: "https://horizon-testnet.stellar.org",
+                explorer_base: "https://stellar.expert/explorer/testnet",
+                tags: None,
+            };
+            let payload = AlertPayload::new(&ctx, &tx, &AlertRule::AnyTransaction);
+            assert_eq!(payload.contract_type, expected);
+        }
     }
 
     #[test]
@@ -1511,6 +1573,7 @@ mod tests {
 
         assert_eq!(obj["label"].as_str(), Some("My Contract"));
         assert_eq!(obj["contract_id"].as_str(), Some("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+        assert_eq!(obj["contract_type"].as_str(), Some("soroban"));
         assert_eq!(obj["network"].as_str(), Some("testnet"));
         assert_eq!(obj["rule_type"].as_str(), Some("LargeTransfer"));
         assert_eq!(obj["rule_triggered"].as_str(), Some("LargeTransfer(>=10000XLM)"));
