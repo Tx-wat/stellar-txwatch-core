@@ -143,6 +143,20 @@ impl fmt::Display for ValidateSummary<'_> {
     }
 }
 
+// ── Webhook reachability helper ───────────────────────────────────────────────
+
+/// Returns `Ok(true)` if the endpoint responded with a non-error status,
+/// `Ok(false)` if it responded with an error status, and `Err` on transport failure.
+async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
+    let resp = client
+        .head(url)
+        .send()
+        .await
+        .with_context(|| format!("HEAD request to '{}' failed", url))?;
+    Ok(!resp.status().is_client_error() && !resp.status().is_server_error()
+        && resp.status() != StatusCode::NOT_FOUND)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -167,11 +181,14 @@ async fn main() -> Result<()> {
                     .context("failed to build HTTP client")?;
 
                 for c in &cfg.contracts {
-                    let reachable = check_webhook_reachable(&client, &c.webhook_url).await;
-                    if let Err(e) = reachable {
-                        warn!(webhook_url = %c.webhook_url, contract = %c.label, error = %e, "webhook reachability check failed");
-                    } else if !reachable.unwrap() {
-                        warn!(webhook_url = %c.webhook_url, contract = %c.label, "webhook endpoint is unreachable");
+                    match check_webhook_reachable(&client, &c.webhook_url).await {
+                        Err(e) => {
+                            warn!(webhook_url = %c.webhook_url, contract = %c.label, error = %e, "webhook reachability check failed");
+                        }
+                        Ok(false) => {
+                            warn!(webhook_url = %c.webhook_url, contract = %c.label, "webhook endpoint is unreachable");
+                        }
+                        Ok(true) => {}
                     }
                 }
             }
@@ -185,11 +202,8 @@ async fn main() -> Result<()> {
                 ));
             }
             let first_contract = &cfg.contracts[0];
-            let horizon_base_url = first_contract.network.horizon_base_url();
-            let payload = test_payload_with_network(&label, &url, &first_contract.network, horizon_base_url);
-            let client  = Client::builder()
-                .timeout(Duration::from_secs(timeout))
-                .build()
+            let payload = test_payload_with_network(&label, &first_contract.network);
+            let client = build_client(Duration::from_secs(timeout))
                 .context("failed to build HTTP client")?;
 
             info!(url = %url, timeout_secs = timeout, "sending test webhook");

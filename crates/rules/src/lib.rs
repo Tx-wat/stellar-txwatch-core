@@ -64,8 +64,8 @@ pub fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Opti
         }
         if op.op_type == "payment" {
             if let Some(amt_str) = op.amount {
-                if let Ok(xlm) = amt_str.parse::<f64>() {
-                    total_stroops = total_stroops.saturating_add((xlm * 10_000_000.0) as u64);
+                if let Some(stroops) = parse_xlm_to_stroops(&amt_str) {
+                    total_stroops = total_stroops.saturating_add(stroops);
                     has_payment = true;
                 }
             }
@@ -73,6 +73,62 @@ pub fn extract_soroban_details(ops: Vec<HorizonOperation>) -> (Vec<String>, Opti
     }
 
     (function_names, if has_payment { Some(total_stroops) } else { None })
+}
+
+/// Parse a decimal XLM amount string into an exact stroop count.
+///
+/// Uses integer/fixed-point arithmetic (never `f64`) so that amounts with up to
+/// 7 fractional digits convert to stroops without any rounding drift. The
+/// fractional part is padded with zeros or truncated to exactly 7 digits.
+///
+/// Returns `None` for malformed input (empty, non-numeric, more than one `.`,
+/// or values that overflow `u64` when scaled to stroops).
+fn parse_xlm_to_stroops(amount: &str) -> Option<u64> {
+    const STROOPS_PER_XLM: u64 = 10_000_000;
+    const FRACTION_DIGITS: usize = 7;
+
+    let amount = amount.trim();
+    if amount.is_empty() {
+        return None;
+    }
+
+    let (whole_str, frac_str) = match amount.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (amount, ""),
+    };
+
+    // Reject a second decimal point or any non-digit characters.
+    if frac_str.contains('.') {
+        return None;
+    }
+    if !whole_str.chars().all(|c| c.is_ascii_digit())
+        || !frac_str.chars().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    if whole_str.is_empty() && frac_str.is_empty() {
+        return None;
+    }
+
+    let whole: u64 = if whole_str.is_empty() {
+        0
+    } else {
+        whole_str.parse().ok()?
+    };
+
+    // Pad or truncate the fractional part to exactly 7 digits.
+    let mut frac_digits = [0u8; FRACTION_DIGITS];
+    for (i, byte) in frac_str.bytes().take(FRACTION_DIGITS).enumerate() {
+        frac_digits[i] = byte - b'0';
+    }
+    let mut frac: u64 = 0;
+    for digit in frac_digits {
+        frac = frac * 10 + u64::from(digit);
+    }
+
+    whole
+        .checked_mul(STROOPS_PER_XLM)?
+        .checked_add(frac)
 }
 
 // ── Horizon transaction shape ─────────────────────────────────────────────────
@@ -1743,5 +1799,38 @@ mod tests {
         let (names, amount) = extract_soroban_details(ops);
         assert_eq!(names, vec!["transfer"]);
         assert_eq!(amount, Some(2_000_000_000));
+    }
+
+    /// Regression test: an amount with 7 fractional digits near u64 magnitude must
+    /// convert to stroops exactly. Under the old `f64` implementation
+    /// (`parse::<f64>() * 10_000_000.0 as u64`) this value rounds to the wrong stroop
+    /// count, so this test fails without exact fixed-point parsing.
+    #[test]
+    fn extract_payment_amount_is_exact_to_the_stroop() {
+        // 184467440737.0955161 XLM = 1_844_674_407_370_955_161 stroops.
+        let ops = vec![make_op("payment", None, Some("184467440737.0955161"))];
+        let (_, amount) = extract_soroban_details(ops);
+        assert_eq!(amount, Some(1_844_674_407_370_955_161));
+    }
+
+    #[test]
+    fn extract_payment_amount_with_fewer_fractional_digits_is_padded() {
+        let ops = vec![make_op("payment", None, Some("1.5"))];
+        let (_, amount) = extract_soroban_details(ops);
+        assert_eq!(amount, Some(15_000_000));
+    }
+
+    #[test]
+    fn extract_payment_amount_without_fractional_part() {
+        let ops = vec![make_op("payment", None, Some("42"))];
+        let (_, amount) = extract_soroban_details(ops);
+        assert_eq!(amount, Some(420_000_000));
+    }
+
+    #[test]
+    fn extract_ignores_malformed_payment_amount() {
+        let ops = vec![make_op("payment", None, Some("not-a-number"))];
+        let (_, amount) = extract_soroban_details(ops);
+        assert!(amount.is_none());
     }
 }

@@ -18,7 +18,18 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         webhook_url: webhook_url.to_string(),
         webhook_secret: None,
         test_horizon_base_url: None,
+        max_alerts_per_cycle: None,
     }
+}
+
+/// Builds a Horizon error response body (e.g. a 503 Service Unavailable).
+pub fn horizon_error(status: u16, title: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type":   "https://stellar.org/horizon-errors/error",
+        "title":  title,
+        "status": status,
+        "detail": title,
+    })
 }
 
 pub fn tx_page(hash: &str, paging_token: &str, successful: bool) -> serde_json::Value {

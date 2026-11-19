@@ -12,11 +12,9 @@ mod helpers;
 use reqwest::Client;
 use std::time::Duration;
 
-use reqwest::Client;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use reqwest::Client;
 use txwatch_config::{AlertRule, AppConfig};
 use txwatch_rules::{evaluate, EnrichedTransaction};
 
@@ -585,9 +583,7 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         http_connection_verbose: None,
         contracts: vec![contract],
         cursor_file: None,
-        http_pool_max_idle_per_host: None,
-        http_tcp_keepalive_secs: None,
-        http_connection_verbose: None,
+        max_alerts_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run_with(cfg, true)).await;
@@ -645,11 +641,10 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         poll_interval_seconds: 1,
         cursor_file: None,
         contracts: vec![contract],
-        cursor_file: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
-        cursor_file: None,
+        max_alerts_per_cycle: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -811,6 +806,7 @@ async fn contracts_polled_concurrently() {
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
+        max_alerts_per_cycle: None,
     };
 
     let start   = std::time::Instant::now();
@@ -884,6 +880,7 @@ async fn cursor_file_is_written_after_poll_cycle() {
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
+        max_alerts_per_cycle: None,
     };
 
     // Run two poll cycles (1.5 s > 1 s interval means at least one full cycle).
@@ -904,37 +901,26 @@ async fn cursor_file_is_written_after_poll_cycle() {
     let _ = std::fs::remove_file(&cursor_path);
 }
 
-/// Issue #261: cursor_file is written atomically after each poll cycle.
+/// Issue #374: after 3 consecutive Horizon failures the circuit breaker opens and
+/// the contract is skipped for `2^failures` intervals, so no further Horizon
+/// requests are made during the skip window.
 #[tokio::test]
-async fn cursor_file_is_written_after_poll_cycle() {
-    use std::time::Duration;
-
-    let horizon = MockServer::start().await;
+async fn circuit_breaker_skips_contract_after_consecutive_failures() {
+    let horizon  = MockServer::start().await;
     let receiver = MockServer::start().await;
 
+    // Every Horizon transactions request fails with 503.
     Mock::given(method("GET"))
         .and(path_regex("/accounts/.*/transactions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(helpers::tx_page("cursor_tx", "999", true)),
-        )
-        .up_to_n_times(1)
+        .respond_with(ResponseTemplate::new(503))
         .mount(&horizon)
         .await;
 
-    Mock::given(method("GET"))
-        .and(path_regex("/accounts/.*/transactions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
-        .mount(&horizon)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path_regex("/transactions/.*/operations"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
-        .mount(&horizon)
-        .await;
-
+    // No webhooks should ever be delivered.
     Mock::given(method("POST"))
+        .and(path("/hook"))
         .respond_with(ResponseTemplate::new(200))
+        .expect(0)
         .mount(&receiver)
         .await;
 
@@ -942,33 +928,103 @@ async fn cursor_file_is_written_after_poll_cycle() {
         &format!("{}/hook", receiver.uri()),
         vec![AlertRule::AnyTransaction],
     );
-    contract.horizon_base_url_override = Some(horizon.uri());
-    let contract_id = contract.contract_id.clone();
-
-    let cursor_path = std::env::temp_dir()
-        .join(format!("txwatch_cursor_test_{}.json", std::process::id()));
-    let cursor_path_str = cursor_path.to_string_lossy().to_string();
+    contract.test_horizon_base_url = Some(horizon.uri());
 
     let cfg = AppConfig {
         poll_interval_seconds: 1,
         contracts: vec![contract],
-        cursor_file: Some(cursor_path_str.clone()),
+        cursor_file: None,
+        max_alerts_per_cycle: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
     };
 
-    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+    // Run long enough for several poll cycles. Once the breaker opens after the
+    // 3rd consecutive failure, the contract is skipped for 2^3 = 8 intervals,
+    // so the total number of Horizon requests must stay small (bounded by the
+    // failures needed to trip the breaker plus at most one in-flight request).
+    let _ = tokio::time::timeout(Duration::from_millis(2500), txwatch_poller::run(cfg)).await;
 
-    let raw = std::fs::read_to_string(&cursor_path)
-        .expect("cursor_file should be written after poll cycle");
-    let map: std::collections::HashMap<String, String> =
-        serde_json::from_str(&raw).expect("cursor_file should be valid JSON");
-    assert_eq!(
-        map.get(&contract_id).map(String::as_str),
-        Some("999"),
-        "cursor_file should contain the latest paging token '999'"
+    let horizon_requests = horizon.received_requests().await.unwrap();
+    let tx_requests = horizon_requests
+        .iter()
+        .filter(|r| r.url.path().contains("/transactions"))
+        .count();
+
+    assert!(
+        tx_requests <= 4,
+        "circuit breaker should stop polling after 3 consecutive failures, \
+         but saw {} Horizon transaction requests",
+        tx_requests
     );
+    assert!(
+        tx_requests >= 3,
+        "expected at least 3 Horizon requests before the breaker opens, saw {}",
+        tx_requests
+    );
+}
 
-    let _ = std::fs::remove_file(&cursor_path);
+/// Issue #374: the circuit breaker recovers once Horizon starts responding
+/// successfully again, and polling resumes for the contract.
+#[tokio::test]
+async fn circuit_breaker_recovers_after_successful_response() {
+    let horizon  = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // First three requests fail with 503 to trip the breaker.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(3)
+        .mount(&horizon)
+        .await;
+
+    // Subsequent requests succeed with an empty page.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
+    contract.test_horizon_base_url = Some(horizon.uri());
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        cursor_file: None,
+        max_alerts_per_cycle: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    // Run long enough to trip the breaker (3 failures), wait out the backoff
+    // window, and observe a successful poll after recovery.
+    let _ = tokio::time::timeout(Duration::from_millis(4000), txwatch_poller::run(cfg)).await;
+
+    let horizon_requests = horizon.received_requests().await.unwrap();
+    let tx_requests = horizon_requests
+        .iter()
+        .filter(|r| r.url.path().contains("/transactions"))
+        .count();
+
+    // More than the 3 failing requests means polling resumed after the breaker
+    // opened, i.e. the contract recovered.
+    assert!(
+        tx_requests > 3,
+        "expected polling to resume after recovery, but saw only {} Horizon requests",
+        tx_requests
+    );
 }

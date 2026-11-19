@@ -1,12 +1,13 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes six counters:
+//! Exposes seven counters:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
 //! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
 //! - `txwatch_poll_cycles_total`        — total poll cycles per contract (labelled by `contract`)
 //! - `txwatch_cursor_save_failures_total` — total failed cursor-file persistence attempts
+//! - `txwatch_circuit_breaker_open_total` — total times a contract entered circuit-breaker state
 //!
 //! And one histogram:
 //! - `txwatch_horizon_latency_seconds`  — Horizon API request duration, labelled by `endpoint`
@@ -93,6 +94,17 @@ fn cursor_save_failures_total() -> &'static IntCounter {
     })
 }
 
+fn circuit_breaker_open_total() -> &'static IntCounter {
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter!(
+            "txwatch_circuit_breaker_open_total",
+            "Total times a contract entered circuit-breaker state after consecutive Horizon failures (see issue #374)"
+        )
+        .expect("register txwatch_circuit_breaker_open_total")
+    })
+}
+
 fn poll_cycles_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
@@ -137,6 +149,14 @@ pub fn inc_config_reload() {
 /// cursor-persistence breakage is visible to operators (issue #460).
 pub fn inc_cursor_save_failures() {
     cursor_save_failures_total().inc();
+}
+
+/// Increment the `txwatch_circuit_breaker_open_total` counter by 1.
+///
+/// Call this whenever a contract transitions into the circuit-breaker open
+/// state after consecutive Horizon failures (issue #374).
+pub fn inc_circuit_breaker_open() {
+    circuit_breaker_open_total().inc();
 }
 
 /// Increment the `txwatch_poll_cycles_total` counter for `contract` by 1.
@@ -219,6 +239,14 @@ mod tests {
         assert_eq!(build_info.get_metric().len(), 1);
         let metric = &build_info.get_metric()[0];
         assert_eq!(metric.get_gauge().get_value(), 1.0);
+    }
+
+    #[test]
+    fn circuit_breaker_open_counter_increments() {
+        let before = circuit_breaker_open_total().get();
+        inc_circuit_breaker_open();
+        inc_circuit_breaker_open();
+        assert_eq!(circuit_breaker_open_total().get(), before + 2);
     }
 
     #[test]
