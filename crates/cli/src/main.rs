@@ -3,6 +3,7 @@ use std::{fmt, path::PathBuf, time::Duration};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::{Client, StatusCode};
+use serde::Deserialize;
 use tokio::sync::watch;
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
@@ -93,6 +94,97 @@ enum Command {
         #[arg(long, default_value_t = 15)]
         timeout: u64,
     },
+
+    /// Import a contract watchlist from a JSON file and write a TOML config
+    ///
+    /// The JSON file must contain a top-level `contracts` array. Each entry
+    /// requires `contract_id`, `label`, `network`, and `webhook_url`.
+    ///
+    /// Exit codes: 0 = import succeeded, 1 = invalid JSON or validation error
+    Import {
+        /// Path to the JSON watchlist file to import
+        #[arg(long = "from", value_name = "JSON")]
+        from: PathBuf,
+
+        /// Path to write the generated TOML config to
+        #[arg(long, value_name = "TOML")]
+        output: PathBuf,
+    },
+}
+
+// ── JSON import schema ────────────────────────────────────────────────────────
+
+/// Top-level JSON import document.
+#[derive(Debug, Deserialize)]
+struct ImportDocument {
+    contracts: Vec<ImportContract>,
+}
+
+/// A single contract entry in the JSON import document.
+#[derive(Debug, Deserialize)]
+struct ImportContract {
+    contract_id: String,
+    label: String,
+    network: String,
+    webhook_url: String,
+    #[serde(default)]
+    webhook_secret: Option<String>,
+}
+
+/// Validates a Stellar contract ID: a 56-character StrKey starting with `C`
+/// and consisting only of base32 characters.
+fn is_valid_contract_id(id: &str) -> bool {
+    id.len() == 56
+        && id.starts_with('C')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || ('2'..='7').contains(&c))
+}
+
+/// Validates the imported contracts and returns a list of human-readable errors.
+fn validate_import(doc: &ImportDocument) -> Vec<String> {
+    let mut errors = Vec::new();
+    if doc.contracts.is_empty() {
+        errors.push("import contains no contracts".to_string());
+    }
+    for (i, c) in doc.contracts.iter().enumerate() {
+        if c.label.trim().is_empty() {
+            errors.push(format!("contracts[{i}]: label must not be empty"));
+        }
+        if !is_valid_contract_id(&c.contract_id) {
+            errors.push(format!(
+                "contracts[{i}]: invalid contract_id '{}' (expected 56-char StrKey starting with 'C')",
+                c.contract_id
+            ));
+        }
+        if c.network.trim().is_empty() {
+            errors.push(format!("contracts[{i}]: network must not be empty"));
+        }
+        if !(c.webhook_url.starts_with("http://") || c.webhook_url.starts_with("https://")) {
+            errors.push(format!(
+                "contracts[{i}]: webhook_url '{}' must start with http:// or https://",
+                c.webhook_url
+            ));
+        }
+    }
+    errors
+}
+
+/// Renders validated import contracts into the TOML config format.
+fn render_import_toml(doc: &ImportDocument) -> String {
+    let mut out = String::new();
+    for c in &doc.contracts {
+        out.push_str("[[contracts]]\n");
+        out.push_str(&format!("contract_id = {:?}\n", c.contract_id));
+        out.push_str(&format!("label = {:?}\n", c.label));
+        out.push_str(&format!("network = {:?}\n", c.network));
+        out.push_str(&format!("webhook_url = {:?}\n", c.webhook_url));
+        if let Some(secret) = &c.webhook_secret {
+            out.push_str(&format!("webhook_secret = {:?}\n", secret));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 // ── Validate summary formatter ────────────────────────────────────────────────
@@ -214,6 +306,34 @@ async fn main() -> Result<()> {
             println!("Test webhook delivered successfully to {} ({})", url, signing);
         }
 
+        Command::Import { from, output } => {
+            let raw = std::fs::read_to_string(&from)
+                .with_context(|| format!("failed to read import file '{}'", from.display()))?;
+            let doc: ImportDocument = serde_json::from_str(&raw)
+                .with_context(|| format!("failed to parse JSON import file '{}'", from.display()))?;
+
+            let errors = validate_import(&doc);
+            if !errors.is_empty() {
+                for e in &errors {
+                    eprintln!("error: {}", e);
+                }
+                return Err(anyhow::anyhow!(
+                    "import validation failed with {} error(s)",
+                    errors.len()
+                ));
+            }
+
+            let toml = render_import_toml(&doc);
+            std::fs::write(&output, toml)
+                .with_context(|| format!("failed to write output file '{}'", output.display()))?;
+            println!(
+                "Imported {} contract(s) from {} to {}",
+                doc.contracts.len(),
+                from.display(),
+                output.display()
+            );
+        }
+
         Command::Watch {
             dry_run,
             from_beginning,
@@ -224,70 +344,6 @@ async fn main() -> Result<()> {
             let cfg = AppConfig::from_file(&cli.config)?;
 
             let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
-            let broadcast_tx = if stream_addr.is_some() {
-                Some(broadcast_tx)
-            } else {
-                None
-            };
 
-            if let Some(addr) = stream_addr {
-                let rx = broadcast_rx;
-                let tx = broadcast_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::stream::run_sse_server(addr, stream_token, rx).await {
-                        warn!(error = ?e, "SSE server terminated");
-                    }
-                });
-                let _ = tx;
-            }
 
-            if poll_once {
-                let failed = txwatch_poller::run_once_with_broadcast(
-                    cfg,
-                    dry_run,
-                    broadcast_tx.clone(),
-                )
-                .await?;
-                if failed > 0 {
-                    return Err(anyhow::anyhow!("{} contract poll(s) failed", failed));
-                }
-                info!("poll-once cycle completed for all contracts");
-                return Ok(());
-            }
-
-            // Graceful shutdown: allow the current poll cycle to finish before exiting.
-            // Handles both Ctrl+C (SIGINT) and SIGTERM (e.g. from Docker/systemd).
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            tokio::spawn(async move {
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let mut sigterm = signal(SignalKind::terminate())
-                        .expect("failed to install SIGTERM handler");
-                    tokio::select! {
-                        result = tokio::signal::ctrl_c() => {
-                            if let Err(e) = result {
-                                warn!(error = ?e, "failed to install Ctrl+C handler");
-                            }
-                        }
-                        _ = sigterm.recv() => {
-                            info!("received SIGTERM");
-                        }
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    if let Err(e) = tokio::signal::ctrl_c().await {
-                        warn!(error = ?e, "failed to install Ctrl+C handler");
-                    }
-                }
-                info!("shutdown signal received — finishing current poll cycle");
-                let _ = shutdown_tx.send(true);
-            });
-
-            info!(
-                version        = VERSION,
-                contracts      = cfg.contracts.len(),
-                interval_secs  = cfg.poll_interva
-
-/* … truncated 3436 chars — edit only what you need near the top … */
+/* … truncated 2684 chars — edit only what you need near the top … */
