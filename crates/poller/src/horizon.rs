@@ -65,6 +65,9 @@ impl AccountKind {
 /// when the `join=operations` query parameter is used.
 #[derive(Deserialize)]
 pub(crate) struct HorizonTransactionWithOps {
+    /// The transaction record. `source_account` is captured on
+    /// `HorizonTransaction` itself (via `#[serde(rename = "source_account")]`),
+    /// and `#[serde(flatten)]` passes it through unchanged here.
     #[serde(flatten)]
     pub tx: HorizonTransaction,
     /// Inline operations embedded by Horizon when `join=operations` is used.
@@ -240,5 +243,23 @@ mod tests {
         let client = reqwest::Client::new();
         // Unreachable URL is fine because the check is disabled.
         startup_connectivity_check(&client, &["http://127.0.0.1:1".to_string()], false).await;
+    }
+
+    #[test]
+    fn transaction_with_ops_deserialises_source_account() {
+        // `source_account` lives on `HorizonTransaction` and must survive the
+        // `#[serde(flatten)]` in `HorizonTransactionWithOps`.
+        let json = r#"{
+            "id": "abc",
+            "hash": "deadbeef",
+            "source_account": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "successful": true,
+            "operations": []
+        }"#;
+        let parsed: HorizonTransactionWithOps = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.tx.source_account.as_deref(),
+            Some("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+        );
     }
 }

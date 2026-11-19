@@ -34,6 +34,45 @@ subscriptions, no infrastructure beyond a single Rust binary.
   Your webhook receiver     ← Slack, PagerDuty, custom API, etc.
 ```
 
+### Architecture diagram
+
+```mermaid
+flowchart TD
+    subgraph Network["Stellar Network"]
+        SN[Stellar Network]
+    end
+
+    subgraph Horizon["Horizon REST API"]
+        HZ["Horizon REST API<br/>(testnet / mainnet / futurenet)"]
+    end
+
+    subgraph Crates["txwatch crates"]
+        CLI["txwatch (cli binary)"]
+        CFG["txwatch-config"]
+        POLL["txwatch-poller"]
+        RULES["txwatch-rules"]
+        NOTIF["txwatch-notifier"]
+    end
+
+    subgraph Receiver["Your infrastructure"]
+        WH["Your webhook receiver<br/>(Slack, PagerDuty, custom API, etc.)"]
+    end
+
+    SN --> HZ
+    HZ --> POLL
+    POLL --> RULES
+    RULES --> NOTIF
+    NOTIF --> WH
+
+    CLI --> CFG
+    CLI --> POLL
+    CLI --> RULES
+    CLI --> NOTIF
+    POLL --> CFG
+    POLL --> RULES
+    RULES --> CFG
+```
+
 ---
 
 ## Stellar / Soroban primer
@@ -127,7 +166,46 @@ Or validate your config:
 docker run -v $(pwd)/config.toml:/config.toml txwatch --config /config.toml validate
 ```
 
-For local development with webhook testing, see [Local Development with Docker Compose](#local-development-with-docker-compose) in [CONTRIBUTING.md](CONTRIBUTING.md).
+For local development with webhook testing, see [Local Development with Docker Compose](#local-development-with-docker-compose) below.
+
+### Local Development with Docker Compose
+
+The repo ships an example `docker-compose.yml` that runs TxWatch alongside a small
+Node.js webhook receiver, so you can watch alerts end-to-end without any external
+infrastructure.
+
+```bash
+# Start txwatch and the webhook receiver
+docker compose up --build
+```
+
+The stack contains two services:
+
+| Service | Description | Port |
+|---|---|---|
+| `txwatch` | Polls Horizon and POSTs alerts to the receiver | — |
+| `webhook-receiver` | Node.js example receiver that logs every alert it receives | `3000` (host) → `3000` (container) |
+
+The receiver listens on `http://localhost:3000/webhook` from your host, and TxWatch
+is wired to POST to `http://webhook-receiver:3000/webhook` inside the Compose network.
+Edit `config/docker-compose.toml` (or the `webhook_url` in your mounted config) if you
+want to point TxWatch at a different receiver.
+
+To confirm TxWatch delivers alerts to the receiver:
+
+```bash
+# 1. Send a test payload through the same path TxWatch uses
+docker compose exec txwatch txwatch --config /config.toml \
+  test-webhook --url http://webhook-receiver:3000/webhook
+
+# 2. Check the receiver logs for the delivered payload
+docker compose logs -f webhook-receiver
+```
+
+You should see the JSON alert payload (including the `X-TxWatch-Idempotency-Key`
+and, when a `webhook_secret` is set, `X-TxWatch-Signature` headers) logged by the
+receiver. Any alerts triggered by live contract activity will appear in the same
+log stream.
 
 ---
 
@@ -244,9 +322,15 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
   "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123...",
   "ledger_sequence":  12345678,
-  "source_account":   "GABC..."
+  "source_account":   "GABC...",
+  "tags":             { "team": "payments", "env": "prod" }
 }
 ```
+
+> **Note:** `tags` is optional and is **omitted entirely** from the JSON body when the
+> contract has no `tags` configured, so existing receivers are unaffected. When present it
+> is a JSON object mapping string keys to string values, copied from the contract's
+> `tags` config and useful for routing and filtering in downstream systems.
 
 **Webhook headers:**
 - `Content-Type: application/json`
@@ -524,6 +608,12 @@ To prevent noisy log output during extended idle periods, TxWatch samples `debug
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+Please do **not** open a public issue for security vulnerabilities. See
+[SECURITY.md](SECURITY.md) for supported versions, the responsible-disclosure
+process, and expected response timelines.
 
 ## License
 
