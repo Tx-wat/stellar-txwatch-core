@@ -1,0 +1,16 @@
+{
+  "name": "Rust Development",
+  "image": "mcr.microsoft.com/devcontainers/rust:latest",
+  "features": {},
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  },
+  "postCreateCommand": "rustup component add clippy rustfmt",
+  "remoteUser": "vscode"
+}
