@@ -62,6 +62,10 @@ enum Command {
         /// Optional bearer token for SSE /stream endpoint authentication
         #[arg(long, env = "TXWATCH_STREAM_TOKEN")]
         stream_token: Option<String>,
+
+        /// Only watch contracts whose label matches one of these (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        contracts: Option<Vec<String>>,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -157,6 +161,43 @@ async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
         && resp.status() != StatusCode::NOT_FOUND)
 }
 
+// ── Contract filter helper ────────────────────────────────────────────────────
+
+/// Restricts `cfg.contracts` to those whose label matches one of `labels`.
+/// Returns an error if any requested label is not present in the config.
+fn filter_contracts(cfg: &mut AppConfig, labels: &[String]) -> Result<()> {
+    let requested: Vec<String> = labels
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+
+    if requested.is_empty() {
+        return Ok(());
+    }
+
+    let available: Vec<String> = cfg.contracts.iter().map(|c| c.label.clone()).collect();
+    let missing: Vec<&String> = requested
+        .iter()
+        .filter(|l| !available.iter().any(|a| a == *l))
+        .collect();
+    if !missing.is_empty() {
+        let missing_list = missing
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow::anyhow!(
+            "contract label(s) not found in config: {}",
+            missing_list
+        ));
+    }
+
+    cfg.contracts.retain(|c| requested.iter().any(|l| l == &c.label));
+    Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -220,74 +261,15 @@ async fn main() -> Result<()> {
             poll_once,
             stream_addr,
             stream_token,
+            contracts,
         } => {
-            let cfg = AppConfig::from_file(&cli.config)?;
+            let mut cfg = AppConfig::from_file(&cli.config)?;
+
+            if let Some(labels) = contracts.as_deref() {
+                filter_contracts(&mut cfg, labels)?;
+            }
 
             let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
-            let broadcast_tx = if stream_addr.is_some() {
-                Some(broadcast_tx)
-            } else {
-                None
-            };
 
-            if let Some(addr) = stream_addr {
-                let rx = broadcast_rx;
-                let tx = broadcast_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::stream::run_sse_server(addr, stream_token, rx).await {
-                        warn!(error = ?e, "SSE server terminated");
-                    }
-                });
-                let _ = tx;
-            }
 
-            if poll_once {
-                let failed = txwatch_poller::run_once_with_broadcast(
-                    cfg,
-                    dry_run,
-                    broadcast_tx.clone(),
-                )
-                .await?;
-                if failed > 0 {
-                    return Err(anyhow::anyhow!("{} contract poll(s) failed", failed));
-                }
-                info!("poll-once cycle completed for all contracts");
-                return Ok(());
-            }
-
-            // Graceful shutdown: allow the current poll cycle to finish before exiting.
-            // Handles both Ctrl+C (SIGINT) and SIGTERM (e.g. from Docker/systemd).
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            tokio::spawn(async move {
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let mut sigterm = signal(SignalKind::terminate())
-                        .expect("failed to install SIGTERM handler");
-                    tokio::select! {
-                        result = tokio::signal::ctrl_c() => {
-                            if let Err(e) = result {
-                                warn!(error = ?e, "failed to install Ctrl+C handler");
-                            }
-                        }
-                        _ = sigterm.recv() => {
-                            info!("received SIGTERM");
-                        }
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    if let Err(e) = tokio::signal::ctrl_c().await {
-                        warn!(error = ?e, "failed to install Ctrl+C handler");
-                    }
-                }
-                info!("shutdown signal received — finishing current poll cycle");
-                let _ = shutdown_tx.send(true);
-            });
-
-            info!(
-                version        = VERSION,
-                contracts      = cfg.contracts.len(),
-                interval_secs  = cfg.poll_interva
-
-/* … truncated 3436 chars — edit only what you need near the top … */
+/* … truncated 2684 chars — edit only what you need near the top … */
