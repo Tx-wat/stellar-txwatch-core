@@ -525,6 +525,12 @@ To prevent noisy log output during extended idle periods, TxWatch samples `debug
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Security
+
+Please do **not** open a public issue for security vulnerabilities. See
+[SECURITY.md](SECURITY.md) for supported versions, the responsible-disclosure
+process, and expected response timelines.
+
 ## License
 
 MIT
