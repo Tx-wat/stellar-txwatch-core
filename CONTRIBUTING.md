@@ -56,22 +56,47 @@ docker compose down
 
 ---
 
-## Development setup
+## Devcontainer / one-click development environment
 
-A `Makefile` at the repo root wraps the common developer tasks. These targets
-mirror the commands CI runs, so running them locally catches most failures
-before you push:
+The repository ships a [`.devcontainer/devcontainer.json`](.devcontainer/devcontainer.json)
+configuration so you can get a fully working Rust development environment
+without installing anything locally.
+
+### Opening the devcontainer
+
+- **GitHub Codespaces:** click *Code → Codespaces → Create codespace on main*
+  on the repository page. The container is built and configured automatically.
+- **VS Code (local):** install the
+  [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers),
+  open the repository folder, and run *Dev Containers: Reopen in Container*
+  from the command palette (`Ctrl+Shift+P` / `Cmd+Shift+P`).
+
+The container is based on the official `rust:latest` image.
+
+### What it installs
+
+- **Rust toolchain** (stable, from the base image)
+- **clippy** and **rustfmt** components (installed via the post-create command
+  `rustup component add clippy rustfmt`)
+- **VS Code extensions:**
+  - [`rust-analyzer`](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer) — language server, completion, inline errors
+  - [`vadimcn.vscode-lldb`](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb) (CodeLLDB) — native debugger
+  - [`tamasfe.even-better-toml`](https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml) — TOML syntax highlighting and validation for config files
+
+### Building and testing inside the container
+
+Open a terminal in the container (VS Code: *Terminal → New Terminal*) and run:
 
 ```bash
-make test     # cargo test --all
-make clippy   # cargo clippy --all-targets --all-features -- -D warnings
-make fmt      # cargo fmt --all
-make build    # cargo build --release
-make docker   # docker build -t txwatch .
+cargo build --workspace
+cargo test --workspace
+cargo clippy -- -D warnings
+cargo fmt --check
 ```
 
-Run `make <target>` from the repository root. The individual steps below
-describe the same setup in more detail.
+These are the same commands CI runs, so a green run locally means a green PR.
+
+---
 
 ## Local dev setup
 
@@ -253,7 +278,36 @@ test in `crates/poller/tests/integration.rs`.
 
 ### Step 7 — Document it
 
-Add an entry to `docs/alert-rules.md`.
+`docs/alert-rules.md` has two distinct places that must be updated for every
+new rule. Do both:
+
+1. **Add a `### RuleName` section to `docs/alert-rules.md`** describing the
+   rule, its fields, and a TOML example:
+
+   ````markdown
+   ### MyNewRule
+
+   Fires when ... .
+
+   | Field | Type | Required | Description |
+   |-------|------|----------|-------------|
+   | `my_field` | string | yes | ... |
+
+   ```toml
+   [[contracts.rules]]
+   type     = "MyNewRule"
+   my_field = "some_value"
+   ```
+   ````
+
+2. **Add a row to the "Stable rule_type values" → Rule type table in
+   `docs/alert-rules.md`** mapping the rule name to its `rule_type` string
+   (the value returned by `AlertRule::rule_type()`):
+
+   ```markdown
+   | `MyNewRule` | `MyNewRule` |
+   ```
+=======
 
 ## Architecture Decision Records (ADRs)
 
@@ -285,7 +339,7 @@ docs: document MyNewRule in alert-rules.md
 - [ ] `cargo test` passes
 - [ ] `cargo clippy -- -D warnings` passes
 - [ ] `cargo fmt` applied
-- [ ] New rule documented in `docs/alert-rules.md`
+- [ ] New rule documented in `docs/alert-rules.md`: a `### RuleName` prose section **and** a row in the "Stable rule_type values" → Rule type table
 - [ ] CONTRIBUTING.md updated if the contribution process changed
 - [ ] CHANGELOG.md entry added under `## [Unreleased]` in the matching section: `### Added`, `### Changed`, `### Fixed` or `### Removed` (see [Keep a Changelog](https://keepachangelog.com/en/1.0.0/))
 

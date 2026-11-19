@@ -249,6 +249,142 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 
 > **`horizon_link` vs `explorer_link`**: `horizon_link` points to the Horizon REST API endpoint and returns raw JSON — useful for programmatic access. `explorer_link` points to the [Stellar Expert](https://stellar.expert) web UI — useful for human inspection. Both are always present for every alert regardless of rule type.
 
+### Payload changelog
+
+The webhook payload evolves over time. This table records the version in which each field was
+introduced so integrators can handle version differences. The payload version is also sent in the
+`X-TxWatch-Version` header.
+
+| Field | Introduced in | Notes |
+|---|---|---|
+| `label` | 0.1.0 | Contract label from config |
+| `contract_id` | 0.1.0 | Stellar contract address |
+| `network` | 0.1.0 | `testnet`, `mainnet`, or `futurenet` |
+| `rule_triggered` | 0.1.0 | Human-readable rule description |
+| `transaction_hash` | 0.1.0 | Stellar transaction hash |
+| `amount_xlm` | 0.1.0 | Payment amount in XLM, or `null` |
+| `amount_stroops` | 0.1.0 | Payment amount in stroops, or `null` |
+| `timestamp` | 0.1.0 | Unix timestamp (seconds) |
+| `timestamp_iso` | 0.1.0 | ISO-8601 timestamp |
+| `function_name` | 0.2.0 | First invoked Soroban function, or `null` |
+| `operation_count` | 0.3.0 | Number of operations, or `null` |
+| `memo_type` | 0.3.0 | Memo type, or `null` |
+| `memo` | 0.3.0 | Memo value, or `null` |
+| `ledger_sequence` | 0.3.0 | Ledger sequence number, or `null` |
+| `source_account` | 0.3.0 | Source account, or `null` |
+| `rule_type` | 0.4.0 | Stable machine-readable rule variant |
+| `function_names` | 0.4.0 | All invoked Soroban function names |
+| `horizon_link` | 0.4.0 | Horizon REST API URL for the transaction |
+| `explorer_link` | 0.4.0 | Stellar Expert explorer URL for the transaction |
+| `fee_charged_stroops` | 0.5.0 | Fee charged for the transaction, in stroops |
+
+**Compatibility policy:**
+
+- **New optional fields** are added in minor releases without breaking changes. Receivers must
+  tolerate unknown fields and treat newly added fields as optional (they may be absent in payloads
+  from older versions).
+- **Removed or renamed fields** require a **major version bump**. Receivers should not rely on a
+  field being present unless it is documented as always present.
+- Existing fields keep their meaning and type across minor releases.
+
+---
+
+## Verifying webhook signatures
+
+When `webhook_secret` is configured, TxWatch sends an `X-TxWatch-Signature` header of the form
+`sha256=<hmac>`. The signature is computed as:
+
+```
+hex(HMAC-SHA256(body_bytes, secret))
+```
+
+where `body_bytes` is the **raw JSON request body exactly as sent on the wire** — the signature
+covers the raw bytes, **not** a canonicalized or re-serialized form. Do not parse and re-encode the
+JSON before verifying, as that will change the bytes and invalidate the signature. Compare the
+computed hex digest against the value after `sha256=` using a **constant-time comparison**.
+
+### Node.js
+
+```js
+const crypto = require("crypto");
+
+function verifyTxWatchSignature(rawBody, secret, signatureHeader) {
+  // rawBody must be the raw request body as a Buffer or string, not parsed JSON.
+  const expected =
+    "sha256=" +
+    crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signatureHeader || "");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+// Express example (must use a raw body parser for this route):
+// app.post("/webhook", express.raw({ type: "application/json" }), (req, res) => {
+//   const ok = verifyTxWatchSignature(req.body, process.env.TXWATCH_SECRET, req.get("X-TxWatch-Signature"));
+//   if (!ok) return res.status(401).send("invalid signature");
+//   const payload = JSON.parse(req.body.toString("utf8"));
+//   res.sendStatus(200);
+// });
+```
+
+### Python
+
+```python
+import hashlib
+import hmac
+
+def verify_txwatch_signature(raw_body: bytes, secret: str, signature_header: str) -> bool:
+    # raw_body must be the raw request body bytes, not parsed JSON.
+    expected = "sha256=" + hmac.new(
+        secret.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header or "")
+
+# Flask example:
+# @app.post("/webhook")
+# def webhook():
+#     raw_body = request.get_data()  # raw bytes
+#     if not verify_txwatch_signature(raw_body, os.environ["TXWATCH_SECRET"],
+#                                     request.headers.get("X-TxWatch-Signature")):
+#         return "invalid signature", 401
+#     payload = json.loads(raw_body)
+#     return "", 200
+```
+
+### Go
+
+```go
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"strings"
+)
+
+func verifyTxWatchSignature(rawBody []byte, secret, signatureHeader string) bool {
+	// rawBody must be the raw request body bytes, not a decoded struct.
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(rawBody)
+	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(signatureHeader))
+}
+
+// net/http example:
+// func webhook(w http.ResponseWriter, r *http.Request) {
+//     rawBody, _ := io.ReadAll(r.Body)
+//     if !verifyTxWatchSignature(rawBody, os.Getenv("TXWATCH_SECRET"),
+//         r.Header.Get("X-TxWatch-Signature")) {
+//         http.Error(w, "invalid signature", http.StatusUnauthorized)
+//         return
+//     }
+//     // ... handle rawBody ...
+// }
+```
+
 ---
 
 ## Architecture

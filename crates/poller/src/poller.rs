@@ -383,7 +383,11 @@ pub(crate) async fn poll_contract_with_http(
         if enriched.operations.is_empty() {
             match fetch_soroban_details(client, contract, &record.hash).await {
                 Ok(details) => enriched.soroban = details,
-                Err(e) => debug!(error = %e, hash = %record.hash, "soroban details fetch failed"),
+                Err(e) => {
+                    debug!(error = %e, hash = %record.hash, "soroban details fetch failed");
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::inc_enrichment_errors();
+                }
             }
         } else {
             enriched.soroban = extract_soroban_details(&enriched.operations);

@@ -49,6 +49,46 @@ pub fn is_valid_stellar_account_id(s: &str) -> bool {
         && s.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'2'..=b'7'))
 }
 
+// ── ContractType ──────────────────────────────────────────────────────────────
+
+/// Distinguishes Soroban contract alerts from classic Stellar account alerts.
+///
+/// Serializes as `"soroban"` or `"classic"` so webhook receivers can route
+/// alerts without parsing the `contract_id` format.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContractType {
+    Soroban,
+    Classic,
+}
+
+impl ContractType {
+    /// Derives the contract type from a `contract_id` prefix:
+    /// `'C'` → `Soroban`, `'G'` → `Classic`.
+    ///
+    /// Returns `None` for any other prefix.
+    pub fn from_contract_id(contract_id: &str) -> Option<Self> {
+        match contract_id.chars().next() {
+            Some('C') => Some(ContractType::Soroban),
+            Some('G') => Some(ContractType::Classic),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContractType::Soroban => "soroban",
+            ContractType::Classic => "classic",
+        }
+    }
+}
+
+impl fmt::Display for ContractType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ── Network ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -464,6 +504,12 @@ fn validate_tag_part(contract_label: &str, kind: &str, part: &str) -> Result<()>
 }
 
 impl WatchedContract {
+    /// Contract type derived from the `contract_id` prefix (`'C'` → Soroban,
+    /// `'G'` → Classic). Defaults to `Soroban` for unrecognised prefixes.
+    pub fn contract_type(&self) -> ContractType {
+        ContractType::from_contract_id(&self.contract_id).unwrap_or(ContractType::Soroban)
+    }
+
     pub fn validate(&mut self) -> Result<()> {
         if self.label.trim().is_empty() {
             bail!("a contract has an empty label");
@@ -974,6 +1020,60 @@ mod tests {
             c.allow_internal_webhook_urls = Some(true);
             assert!(c.validate().is_ok(), "expected acceptance for {url}");
         }
+    }
+
+    /// #475: a global `allow_internal_webhook_urls = true` propagates to contracts
+    /// that don't set their own value, while an explicit per-contract `false` is
+    /// preserved and an explicit per-contract `true` stays `true`.
+    #[test]
+    fn global_allow_internal_webhook_urls_propagates_to_contracts() {
+        let mut unset = valid_contract();
+        unset.label = "Unset".into();
+        unset.contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+        unset.webhook_url = "http://127.0.0.1/hook".into();
+        unset.allow_internal_webhook_urls = None;
+
+        let mut explicit_false = valid_contract();
+        explicit_false.label = "ExplicitFalse".into();
+        explicit_false.contract_id =
+            "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+        explicit_false.webhook_url = "https://example.com/hook".into();
+        explicit_false.allow_internal_webhook_urls = Some(false);
+
+        let mut explicit_true = valid_contract();
+        explicit_true.label = "ExplicitTrue".into();
+        explicit_true.contract_id =
+            "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".into();
+        explicit_true.webhook_url = "https://example.com/hook".into();
+        explicit_true.allow_internal_webhook_urls = Some(true);
+
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![unset, explicit_false, explicit_true],
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: None,
+            allow_internal_webhook_urls: Some(true),
+        };
+        cfg.validate().unwrap();
+
+        assert_eq!(
+            cfg.contracts[0].allow_internal_webhook_urls,
+            Some(true),
+            "contract without its own value should inherit the global true"
+        );
+        assert_eq!(
+            cfg.contracts[1].allow_internal_webhook_urls,
+            Some(false),
+            "explicit per-contract false must not be overridden by the global true"
+        );
+        assert_eq!(
+            cfg.contracts[2].allow_internal_webhook_urls,
+            Some(true),
+            "explicit per-contract true should stay true"
+        );
     }
 
     #[test]
@@ -1497,6 +1597,46 @@ mod tests {
         }
     }
 
+    // ── ContractType ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn contract_type_derives_from_contract_id_prefix() {
+        assert_eq!(
+            ContractType::from_contract_id("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            Some(ContractType::Soroban)
+        );
+        assert_eq!(
+            ContractType::from_contract_id("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            Some(ContractType::Classic)
+        );
+        assert_eq!(ContractType::from_contract_id("XABC"), None);
+        assert_eq!(ContractType::from_contract_id(""), None);
+    }
+
+    #[test]
+    fn contract_type_serializes_as_lowercase() {
+        assert_eq!(serde_json::to_string(&ContractType::Soroban).unwrap(), "\"soroban\"");
+        assert_eq!(serde_json::to_string(&ContractType::Classic).unwrap(), "\"classic\"");
+        assert_eq!(
+            serde_json::from_str::<ContractType>("\"soroban\"").unwrap(),
+            ContractType::Soroban
+        );
+        assert_eq!(
+            serde_json::from_str::<ContractType>("\"classic\"").unwrap(),
+            ContractType::Classic
+        );
+    }
+
+    #[test]
+    fn watched_contract_contract_type_matches_id() {
+        let c = valid_contract();
+        assert_eq!(c.contract_type(), ContractType::Soroban);
+
+        let mut classic = valid_contract();
+        classic.contract_id = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+        assert_eq!(classic.contract_type(), ContractType::Classic);
+    }
+
     #[test]
     fn network_urls() {
         assert!(Network::Mainnet.horizon_base_url().contains("horizon.stellar.org"));
@@ -1866,13 +2006,7 @@ mod tests {
                     webhook_url: "https://example.com/hook".into(),
                     webhook_secret: None,
                     test_horizon_base_url: None,
-                    horizon_url: None,
-                    max_alerts_per_cycle: None,
-                    webhook_timeout_seconds: None,
                     allow_internal_webhook_urls: None,
-                    tags: None,
-                    tls: None,
-                    webhook_tls_cert_pem: None,
                 }
             })
             .collect();

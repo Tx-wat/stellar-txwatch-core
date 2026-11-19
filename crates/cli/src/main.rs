@@ -223,13 +223,31 @@ async fn main() -> Result<()> {
         } => {
             let cfg = AppConfig::from_file(&cli.config)?;
 
+            let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
+            let broadcast_tx = if stream_addr.is_some() {
+                Some(broadcast_tx)
+            } else {
+                None
+            };
+
             if let Some(addr) = stream_addr {
-                let (_broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
-                crate::stream::run_sse_server(addr, stream_token, broadcast_rx).await?;
+                let rx = broadcast_rx;
+                let tx = broadcast_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::stream::run_sse_server(addr, stream_token, rx).await {
+                        warn!(error = ?e, "SSE server terminated");
+                    }
+                });
+                let _ = tx;
             }
 
             if poll_once {
-                let failed = txwatch_poller::run_once(cfg, dry_run).await?;
+                let failed = txwatch_poller::run_once_with_broadcast(
+                    cfg,
+                    dry_run,
+                    broadcast_tx.clone(),
+                )
+                .await?;
                 if failed > 0 {
                     return Err(anyhow::anyhow!("{} contract poll(s) failed", failed));
                 }

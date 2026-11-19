@@ -13,7 +13,7 @@ use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
-use txwatch_config::{Network, TlsConfig};
+use txwatch_config::{ContractType, Network, TlsConfig};
 use txwatch_rules::AlertPayload;
 
 const MAX_RETRIES: u32 = 3;
@@ -359,9 +359,11 @@ pub fn test_payload_with_network(
     let tx_hash = "0000000000000000000000000000000000000000000000000000000000000000";
     // Stellar Expert names the mainnet explorer path "public".
     let explorer_network = if network.as_str() == "mainnet" { "public" } else { network.as_str() };
+    let contract_id = "CTEST000000000000000000000000000000000000000000000000000";
     AlertPayload {
         label:               label.to_string(),
-        contract_id:         "CTEST000000000000000000000000000000000000000000000000000".into(),
+        contract_id:         contract_id.into(),
+        contract_type:       ContractType::from_contract_id(contract_id),
         network:             network.clone(),
         rule_type:           "TestWebhook".into(),
         rule_triggered:      "TestWebhook".into(),
@@ -668,9 +670,11 @@ mod tests {
     }
 
     fn sample_payload() -> AlertPayload {
+        let contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         AlertPayload {
             label:               "Test Contract".into(),
-            contract_id:         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            contract_id:         contract_id.into(),
+            contract_type:       ContractType::from_contract_id(contract_id),
             network:             Network::Testnet,
             rule_type:           "AnyTransaction".into(),
             rule_triggered:      "AnyTransaction".into(),
@@ -886,6 +890,15 @@ mod tests {
         assert!(p.contract_id.starts_with('C'), "contract_id must start with 'C'");
         assert!(p.horizon_link.contains("/transactions/"));
         assert!(p.explorer_link.contains("stellar.expert"));
+        assert_eq!(p.contract_type, ContractType::Soroban);
+    }
+
+    /// Issue #351: test_payload serializes contract_type as "soroban".
+    #[test]
+    fn test_payload_serializes_contract_type() {
+        let p = test_payload("My Contract", "https://example.com/hook");
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["contract_type"], "soroban");
     }
 
     /// Issue #13: test_payload_with_network derives links from the supplied network config.
