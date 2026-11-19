@@ -939,6 +939,60 @@ mod tests {
         }
     }
 
+    /// #475: a global `allow_internal_webhook_urls = true` propagates to contracts
+    /// that don't set their own value, while an explicit per-contract `false` is
+    /// preserved and an explicit per-contract `true` stays `true`.
+    #[test]
+    fn global_allow_internal_webhook_urls_propagates_to_contracts() {
+        let mut unset = valid_contract();
+        unset.label = "Unset".into();
+        unset.contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+        unset.webhook_url = "http://127.0.0.1/hook".into();
+        unset.allow_internal_webhook_urls = None;
+
+        let mut explicit_false = valid_contract();
+        explicit_false.label = "ExplicitFalse".into();
+        explicit_false.contract_id =
+            "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+        explicit_false.webhook_url = "https://example.com/hook".into();
+        explicit_false.allow_internal_webhook_urls = Some(false);
+
+        let mut explicit_true = valid_contract();
+        explicit_true.label = "ExplicitTrue".into();
+        explicit_true.contract_id =
+            "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".into();
+        explicit_true.webhook_url = "https://example.com/hook".into();
+        explicit_true.allow_internal_webhook_urls = Some(true);
+
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![unset, explicit_false, explicit_true],
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: None,
+            allow_internal_webhook_urls: Some(true),
+        };
+        cfg.validate().unwrap();
+
+        assert_eq!(
+            cfg.contracts[0].allow_internal_webhook_urls,
+            Some(true),
+            "contract without its own value should inherit the global true"
+        );
+        assert_eq!(
+            cfg.contracts[1].allow_internal_webhook_urls,
+            Some(false),
+            "explicit per-contract false must not be overridden by the global true"
+        );
+        assert_eq!(
+            cfg.contracts[2].allow_internal_webhook_urls,
+            Some(true),
+            "explicit per-contract true should stay true"
+        );
+    }
+
     #[test]
     fn time_window_rule_validation() {
         let mut valid_rule = AlertRule::TimeWindow {
@@ -1822,7 +1876,8 @@ mod tests {
                     rules: vec![AlertRule::AnyTransaction],
                     webhook_url: "https://example.com/hook".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    test_horizon_base_url: None,
+                    allow_internal_webhook_urls: None,
                 }
             })
             .collect();
