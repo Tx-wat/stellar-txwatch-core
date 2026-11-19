@@ -31,6 +31,7 @@ fn one_of_each_rule() -> Vec<AlertRule> {
         AlertRule::FunctionCalled { function_name: "withdraw".into() },
         AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] },
         AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None },
+        AlertRule::LedgerSequenceRange { from: 1_000, to: 2_000 },
     ]
 }
 

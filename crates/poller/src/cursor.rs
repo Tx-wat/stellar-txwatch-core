@@ -266,15 +266,63 @@ impl CursorMap {
         }
     }
 
-    /// Persist the current cursor map to a JSON file.
+    /// Persist the current cursor map to a JSON file atomically.
+    ///
+    /// The JSON is written to a uniquely-named temporary file in the same
+    /// directory as `path`, flushed and fsynced, then atomically renamed over
+    /// `path`. A crash mid-write therefore leaves either the old file or the
+    /// new file intact — never a truncated/corrupt one. On any error the
+    /// temporary file is removed before returning.
     ///
     /// Errors are returned to the caller; the poller can choose to log and
     /// continue rather than aborting the poll cycle.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+
         let json = serde_json::to_string_pretty(self)
             .context("failed to serialise cursor map to JSON")?;
-        std::fs::write(path, json)
-            .with_context(|| format!("failed to write cursor file '{}'", path.display()))
+
+        // Build a temp path in the same directory so the rename stays on the
+        // same filesystem (required for atomicity).
+        let tmp_path = {
+            let mut name = path
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_else(|| std::ffi::OsString::from("cursor"));
+            name.push(format!(".tmp.{}", std::process::id()));
+            match path.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+                _ => std::path::PathBuf::from(name),
+            }
+        };
+
+        let write_result = (|| -> Result<()> {
+            let mut file = std::fs::File::create(&tmp_path).with_context(|| {
+                format!("failed to create temp cursor file '{}'", tmp_path.display())
+            })?;
+            file.write_all(json.as_bytes()).with_context(|| {
+                format!("failed to write temp cursor file '{}'", tmp_path.display())
+            })?;
+            file.sync_all().with_context(|| {
+                format!("failed to fsync temp cursor file '{}'", tmp_path.display())
+            })?;
+            drop(file);
+            std::fs::rename(&tmp_path, path).with_context(|| {
+                format!(
+                    "failed to rename temp cursor file '{}' to '{}'",
+                    tmp_path.display(),
+                    path.display()
+                )
+            })?;
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            // Best-effort cleanup so a failed write doesn't leave stale temps.
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+
+        write_result
     }
 }
 
@@ -296,6 +344,7 @@ mod tests {
             webhook_secret: None,
             horizon_base_url_override: None,
             cursor_alias: None,
+            test_horizon_base_url: None,
         }
     }
 
@@ -363,6 +412,22 @@ mod tests {
         let contracts = vec![contract(ID_A)];
         let map = CursorMap::load_from_file(&tmp, &contracts);
         assert_eq!(map.get(ID_A), "now");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn save_to_file_produces_valid_json() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_valid_json.json");
+        let contracts = vec![contract(ID_A)];
+
+        let mut map = CursorMap::new_for_contracts(&contracts);
+        map.set(ID_A, "424242");
+        map.save_to_file(&tmp).unwrap();
+
+        let raw = std::fs::read_to_string(&tmp).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(parsed.is_object(), "cursor file should be a JSON object");
+
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -508,6 +573,41 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_write_leaves_original_file_intact() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_atomic.json");
+        let contracts = vec![contract(ID_A)];
+
+        // Establish a good cursor file first.
+        let mut original = CursorMap::new_for_contracts(&contracts);
+        original.set(ID_A, "111");
+        original.save_to_file(&tmp).unwrap();
+
+        // Simulate a crash mid-write: a stale temp file is left behind.
+        let stale_tmp = tmp.with_file_name(format!(
+            "{}.tmp.{}",
+            tmp.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        std::fs::write(&stale_tmp, "{\"partial\":").unwrap();
+
+        // The original file must be untouched and still load correctly.
+        let loaded = CursorMap::load_from_file(&tmp, &contracts);
+        assert_eq!(loaded.get(ID_A), "111");
+
+        // A subsequent successful save must overwrite the stale temp and
+        // produce a valid file.
+        let mut updated = CursorMap::new_for_contracts(&contracts);
+        updated.set(ID_A, "222");
+        updated.save_to_file(&tmp).unwrap();
+
+        let reloaded = CursorMap::load_from_file(&tmp, &contracts);
+        assert_eq!(reloaded.get(ID_A), "222");
+        assert!(!stale_tmp.exists(), "temp file should be cleaned up");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
     fn load_prefers_primary_key_over_alias() {
         let tmp = std::env::temp_dir().join("txwatch_cursor_alias_primary.json");
         let partial = serde_json::json!({ ID_A: "111", "old-label": "222" });
@@ -536,6 +636,21 @@ mod tests {
         let map = CursorMap::load_from_file(&tmp, &contracts);
 
         assert_eq!(map.get(ID_A), "now");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn corrupt_cursor_file_falls_back_to_now_without_panicking() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_truncated.json");
+        // Truncated JSON, as if a non-atomic write was interrupted.
+        std::fs::write(&tmp, "{\"CAAAA").unwrap();
+
+        let contracts = vec![contract(ID_A), contract(ID_B)];
+        let map = CursorMap::load_from_file(&tmp, &contracts);
+
+        assert_eq!(map.get(ID_A), "now");
+        assert_eq!(map.get(ID_B), "now");
 
         let _ = std::fs::remove_file(&tmp);
     }

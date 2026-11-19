@@ -110,6 +110,42 @@ fn json_string(value: &str) -> String {
     out
 }
 
+/// Builds the SSE event payload for an alert message, embedding the webhook
+/// idempotency key (Issue #578) so SSE consumers can deduplicate events.
+///
+/// The idempotency key is formatted as
+/// `{contract_id}:{transaction_hash}:{rule_type}`. When the alert message is a
+/// JSON object containing those fields they are used directly; otherwise the
+/// key falls back to a hash of the raw message so every event still carries a
+/// stable, deduplicable identifier.
+fn build_sse_event(msg: &str) -> String {
+    let idempotency_key = extract_idempotency_key(msg);
+    let payload = serde_json::json!({
+        "idempotency_key": idempotency_key,
+        "data": msg,
+    });
+    format!("data: {}\n\n", payload)
+}
+
+/// Derives the idempotency key from an alert message.
+fn extract_idempotency_key(msg: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(msg) {
+        let contract_id = value.get("contract_id").and_then(|v| v.as_str());
+        let transaction_hash = value.get("transaction_hash").and_then(|v| v.as_str());
+        let rule_type = value.get("rule_type").and_then(|v| v.as_str());
+        if let (Some(contract_id), Some(transaction_hash), Some(rule_type)) =
+            (contract_id, transaction_hash, rule_type)
+        {
+            return format!("{}:{}:{}", contract_id, transaction_hash, rule_type);
+        }
+    }
+    // Fallback: stable hash of the raw message.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    msg.hash(&mut hasher);
+    format!("unknown:unknown:{:016x}", hasher.finish())
+}
+
 /// Runs an HTTP Server-Sent Events (SSE) streaming server (Issue #355).
 /// Clients can connect via `GET /stream` to receive real-time alert events.
 ///
@@ -187,7 +223,7 @@ pub async fn run_sse_server(
                 let _ = writer.flush().await;
 
                 while let Ok(msg) = client_rx.recv().await {
-                    let sse_msg = format!("data: {}\n\n", msg);
+                    let sse_msg = build_sse_event(&msg);
                     if writer.write_all(sse_msg.as_bytes()).await.is_err() {
                         break;
                     }
@@ -297,6 +333,13 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+
+    #[test]
+    fn sse_event_includes_idempotency_key() {
+        let msg = r#"{"contract_id":"C123","transaction_hash":"abc","rule_type":"large_transfer"}"#;
+        let event = build_sse_event(msg);
+        assert!(event.contains("\"idempotency_key\":\"C123:abc:large_transfer\""));
+    }
 
     #[tokio::test]
     async fn sse_server_streams_alerts_with_auth() {

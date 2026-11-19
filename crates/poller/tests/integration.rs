@@ -903,6 +903,106 @@ async fn cursor_file_is_written_after_poll_cycle() {
     let _ = std::fs::remove_file(&cursor_path);
 }
 
+/// Issue #448: cursors must be keyed by `contract_id`, not `label`.
+///
+/// Builds a config where `label != contract_id`, persists a `cursor_file`,
+/// and runs two poll cycles. The first cycle returns a transaction with a
+/// known `paging_token`; the second cycle's Horizon request must carry
+/// `cursor=<that token>` (not `cursor=now`), proving the cursor was read back
+/// under the contract_id key.
+#[tokio::test]
+async fn cursor_is_read_back_by_contract_id_not_label() {
+    let horizon  = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // First poll returns one transaction with paging_token "777".
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(helpers::tx_page("label_tx", "777", true)),
+        )
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+
+    // Subsequent polls return empty.
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/transactions/.*/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
+    // Ensure label differs from contract_id.
+    contract.label = "My Escrow Contract".to_string();
+    contract.contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+    contract.test_horizon_base_url = Some(horizon.uri());
+
+    let cursor_path = std::env::temp_dir()
+        .join(format!("txwatch_cursor_label_test_{}.json", std::process::id()));
+    let cursor_path_str = cursor_path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&cursor_path);
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        cursor_file: Some(cursor_path_str.clone()),
+        max_alerts_per_cycle: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    // Run long enough for at least two poll cycles.
+    let _ = tokio::time::timeout(Duration::from_millis(2500), txwatch_poller::run(cfg)).await;
+
+    let horizon_requests = horizon.received_requests().await.unwrap();
+    let tx_urls: Vec<String> = horizon_requests
+        .iter()
+        .filter(|r| r.url.path().contains("/transactions"))
+        .map(|r| r.url.to_string())
+        .collect();
+
+    assert!(
+        tx_urls.iter().any(|u| u.contains("cursor=777")),
+        "expected a Horizon request with cursor=777 after processing label_tx \
+         (paging_token=777); got: {:?}",
+        tx_urls
+    );
+
+    // The persisted cursor file must be keyed by contract_id, not label.
+    let raw = std::fs::read_to_string(&cursor_path)
+        .expect("cursor_file should be written after poll cycle");
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&raw).expect("cursor_file should be valid JSON");
+    assert_eq!(
+        map.get("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").map(String::as_str),
+        Some("777"),
+        "cursor_file should key the cursor by contract_id"
+    );
+    assert!(
+        !map.contains_key("My Escrow Contract"),
+        "cursor_file must not key the cursor by label"
+    );
+
+    let _ = std::fs::remove_file(&cursor_path);
+}
+
 /// Issue #374: after 3 consecutive Horizon failures the circuit breaker opens and
 /// the contract is skipped for `2^failures` intervals, so no further Horizon
 /// requests are made during the skip window.

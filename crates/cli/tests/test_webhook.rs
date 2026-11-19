@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use flate2::read::GzDecoder;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -33,6 +34,18 @@ webhook_url = "https://hooks.example.com/test"
 fn write_valid_config(file_name: &str) -> PathBuf {
     let path = env::temp_dir().join(file_name);
     fs::write(&path, VALID_CONFIG).unwrap();
+    path
+}
+
+/// Writes a config identical to `VALID_CONFIG` but with `webhook_compress`
+/// set on the contract.
+fn write_compressed_config(file_name: &str) -> PathBuf {
+    let config = VALID_CONFIG.replace(
+        "webhook_url = \"https://hooks.example.com/test\"",
+        "webhook_url = \"https://hooks.example.com/test\"\nwebhook_compress = true",
+    );
+    let path = env::temp_dir().join(file_name);
+    fs::write(&path, config).unwrap();
     path
 }
 
@@ -490,6 +503,62 @@ fn test_webhook_without_secret_sends_no_signature() {
         stdout.contains("(unsigned)"),
         "output should report the payload is unsigned, got: {}",
         stdout
+    );
+}
+
+#[test]
+fn test_webhook_compresses_body_when_enabled() {
+    let cfg_path = write_compressed_config("txwatch_test_webhook_compressed.toml");
+    let (url, receiver) = spawn_receiver();
+
+    let output = run_test_webhook(&cfg_path, &url, &[]);
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (headers, body) = receiver.join().unwrap();
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "expected Content-Encoding: gzip when webhook_compress is enabled"
+    );
+
+    let mut decoded = String::new();
+    GzDecoder::new(&body[..])
+        .read_to_string(&mut decoded)
+        .expect("body should be valid gzip data");
+    assert!(
+        decoded.contains("function_names"),
+        "decompressed payload should contain the webhook payload, got: {}",
+        decoded
+    );
+}
+
+#[test]
+fn test_webhook_body_is_uncompressed_when_disabled() {
+    let cfg_path = write_valid_config("txwatch_test_webhook_uncompressed.toml");
+    let (url, receiver) = spawn_receiver();
+
+    let output = run_test_webhook(&cfg_path, &url, &[]);
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (headers, body) = receiver.join().unwrap();
+    assert!(
+        !headers.contains_key("content-encoding"),
+        "no Content-Encoding header expected when webhook_compress is disabled"
+    );
+
+    let decoded = String::from_utf8(body).expect("body should be plain UTF-8 JSON");
+    assert!(
+        decoded.contains("function_names"),
+        "payload should be uncompressed JSON, got: {}",
+        decoded
     );
 }
 

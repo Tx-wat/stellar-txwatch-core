@@ -164,8 +164,40 @@ type           = "HighFee"
 threshold_xlm  = 1
 ```
 
+### `SuccessRateThreshold`
+
+| Field             | Type | Required | Description                                                        |
+|-------------------|------|----------|--------------------------------------------------------------------|
+| `min_success_rate`| f64  | yes      | Minimum acceptable success ratio in `[0.0, 1.0]` (e.g. `0.95` = 95%) |
+| `window_size`     | u32  | yes      | Number of most recent transactions per contract to consider (> 0)  |
+
+Matches when the success rate over the contract's rolling window of the last `window_size`
+transactions falls below `min_success_rate`. The window is tracked per contract and updated
+on every observed transaction (successful or failed); the rule does not fire until the
+window is full, so a single early failure cannot trigger an alert.
+
+**Use case:** alert when a contract starts failing a meaningful share of its transactions,
+e.g. a Soroban contract whose invocations begin reverting.
+
+```toml
+[[contracts.rules]]
+type             = "SuccessRateThreshold"
+min_success_rate = 0.95
+window_size      = 100
+```
+
 ### `TimeWindow`
 Restricts alert firing to specific UTC hours and weekdays to prevent alert fatigue outside business hours. Can optionally wrap another rule via `wrap_rule`.
+
+`wrap_rule` accepts only the following rule type names:
+
+- `TransactionFailed`
+- `InsufficientFunds`
+- `SorobanInvocation`
+- `LargeTransfer`
+- `AnyTransaction`
+
+Any other value (including `FunctionCalled`, `AdminFunctionCalled`, `HighFee`, `SourceAccountMatch`, and `TimeWindow` itself) is rejected at config-validation time with a clear error, rather than silently matching every transaction inside the window. Note that `wrap_rule` carries only a bare rule type name, so parameterised rules such as `FunctionCalled` cannot be expressed; use the corresponding supported rule or combine separate rules instead.
 
 ```toml
 [[contracts.rules]]
@@ -199,6 +231,7 @@ All matching rules fire; there is no short-circuit.
 | `memo`                | string/null | no             | Transaction memo value                   |
 | `ledger_sequence`     | u32/null    | no             | Ledger sequence the transaction was included in |
 | `source_account`      | string/null | no             | The `G...` account that signed/submitted the transaction |
+| `tags`                | object/null | no             | Per-contract tags from config (string→string map) for routing/filtering; omitted entirely when unset |
 | `fee_charged_stroops` | u64/null    | no             | Fee charged for the transaction in stroops |
 | `timestamp`           | i64         | yes            | Unix timestamp (seconds) of transaction  |
 | `timestamp_iso`       | string      | yes            | ISO 8601 timestamp of the transaction    |
@@ -233,6 +266,7 @@ The webhook payload includes two rule-related fields:
 | `AdminFunctionCalled` | `"AdminFunctionCalled"` |
 | `HighFee` | `"HighFee"` |
 | `SourceAccountMatch` | `"SourceAccountMatch"` |
+| `SuccessRateThreshold` | `"SuccessRateThreshold"` |
 | `TimeWindow` | `"TimeWindow"` |
 
 ## SSE event types (`/stream`)

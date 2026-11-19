@@ -1,5 +1,6 @@
 poll_interval_seconds = 10
 # webhook_timeout_seconds = 15   # optional: per-request webhook delivery timeout in seconds (default: 15)
+# batch_alerts_per_tx = true     # optional: group alerts by transaction hash and send a single webhook POST (default: false)
 
 [[contracts]]
 label       = "My Escrow Contract"
@@ -19,6 +20,11 @@ webhook_url = "https://hooks.example.com/my-webhook"
 
   [[contracts.rules]]
   type = "TransactionFailed"
+
+  [[contracts.rules]]
+  type            = "SuccessRateThreshold"
+  min_success_rate = 0.95   # alert when success rate drops below 95%
+  window_size      = 100    # over the last 100 transactions
 
 [[contracts]]
 label       = "Mainnet Vault"
