@@ -223,6 +223,40 @@ impl fmt::Display for ValidateSummary<'_> {
     }
 }
 
+// ── Startup banner ────────────────────────────────────────────────────────────
+
+/// Renders the human-readable startup banner printed when the watch engine starts.
+struct StartupBanner<'a> {
+    config: &'a AppConfig,
+}
+
+impl fmt::Display for StartupBanner<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cfg = self.config;
+        let mut networks: Vec<String> = cfg
+            .contracts
+            .iter()
+            .map(|c| c.network.display_name().to_string())
+            .collect();
+        networks.sort();
+        networks.dedup();
+        let networks = if networks.is_empty() {
+            "none".to_string()
+        } else {
+            networks.join(", ")
+        };
+
+        writeln!(f, "╔══════════════════════════════════════════════════════════╗")?;
+        writeln!(f, "║  txwatch — Stellar Soroban contract monitor              ║")?;
+        writeln!(f, "╚══════════════════════════════════════════════════════════╝")?;
+        writeln!(f, "  version        : {}", VERSION)?;
+        writeln!(f, "  contracts      : {}", cfg.contracts.len())?;
+        writeln!(f, "  networks       : {}", networks)?;
+        writeln!(f, "  poll_interval  : {}s", cfg.poll_interval_seconds)?;
+        Ok(())
+    }
+}
+
 // ── Webhook reachability helper ───────────────────────────────────────────────
 
 /// Returns `Ok(true)` if the endpoint responded with a non-error status,
@@ -235,6 +269,69 @@ async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
         .with_context(|| format!("HEAD request to '{}' failed", url))?;
     Ok(!resp.status().is_client_error() && !resp.status().is_server_error()
         && resp.status() != StatusCode::NOT_FOUND)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use txwatch_config::{ContractConfig, Network};
+
+    fn fixed_config() -> AppConfig {
+        AppConfig {
+            poll_interval_seconds: 30,
+            contracts: vec![
+                ContractConfig {
+                    label: "alpha".to_string(),
+                    contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                        .to_string(),
+                    network: Network::Testnet,
+                    webhook_url: "https://example.com/hook-a".to_string(),
+                    webhook_secret: None,
+                    rules: vec![],
+                    cursor_file: None,
+                },
+                ContractConfig {
+                    label: "beta".to_string(),
+                    contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBSC4"
+                        .to_string(),
+                    network: Network::Mainnet,
+                    webhook_url: "https://example.com/hook-b".to_string(),
+                    webhook_secret: None,
+                    rules: vec![],
+                    cursor_file: None,
+                },
+                ContractConfig {
+                    label: "gamma".to_string(),
+                    contract_id: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+                        .to_string(),
+                    network: Network::Testnet,
+                    webhook_url: "https://example.com/hook-c".to_string(),
+                    webhook_secret: None,
+                    rules: vec![],
+                    cursor_file: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn startup_banner_snapshot() {
+        let cfg = fixed_config();
+        let rendered = StartupBanner { config: &cfg }.to_string();
+        let expected = format!(
+            "╔══════════════════════════════════════════════════════════╗\n\
+             ║  txwatch — Stellar Soroban contract monitor              ║\n\
+             ╚══════════════════════════════════════════════════════════╝\n\
+             \x20 version        : {}\n\
+             \x20 contracts      : 3\n\
+             \x20 networks       : Mainnet, Testnet\n\
+             \x20 poll_interval  : 30s\n",
+            VERSION
+        );
+        assert_eq!(rendered, expected);
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -302,6 +399,23 @@ async fn main() -> Result<()> {
             stream_token,
         } => {
             let cfg = AppConfig::from_file(&cli.config)?;
+
+            let mut networks: Vec<String> = cfg
+                .contracts
+                .iter()
+                .map(|c| c.network.display_name().to_string())
+                .collect();
+            networks.sort();
+            networks.dedup();
+
+            info!(
+                version             = VERSION,
+                contracts           = cfg.contracts.len(),
+                poll_interval_seconds = cfg.poll_interval_seconds,
+                networks            = ?networks,
+                "starting txwatch"
+            );
+            info!("\n{}", StartupBanner { config: &cfg });
 
             let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
             let broadcast_tx = if stream_addr.is_some() {

@@ -8,10 +8,10 @@
 //! data-extraction logic lives in this crate (no I/O, fully unit-testable) and the
 //! poller only handles HTTP concerns.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use txwatch_config::{AlertRule, ContractType};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -304,6 +304,49 @@ pub struct AlertPayload {
     pub tags: Option<HashMap<String, String>>,
 }
 
+// ── Rolling success-rate window ───────────────────────────────────────────────
+
+/// Per-contract rolling window of transaction outcomes (success/failure).
+///
+/// Used by `AlertRule::SuccessRateThreshold` to compute the success ratio over the
+/// last `window_size` transactions. The window is bounded by the largest
+/// `window_size` seen for that contract, so memory stays proportional to the
+/// configured window rather than the number of transactions observed.
+#[derive(Debug, Default)]
+pub struct SuccessRateTracker {
+    windows: HashMap<String, VecDeque<bool>>,
+}
+
+impl SuccessRateTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one transaction outcome for `contract_id` and return the current
+    /// success ratio over the last `window_size` outcomes.
+    ///
+    /// Returns `None` when fewer than `window_size` outcomes have been recorded,
+    /// so the rule does not fire on an incomplete window.
+    pub fn record(&mut self, contract_id: &str, successful: bool, window_size: u32) -> Option<f64> {
+        let window = self.windows.entry(contract_id.to_string()).or_default();
+        window.push_back(successful);
+        let cap = window_size as usize;
+        while window.len() > cap {
+            window.pop_front();
+        }
+        if window.len() < cap || cap == 0 {
+            return None;
+        }
+        let successes = window.iter().filter(|&&ok| ok).count();
+        Some(successes as f64 / cap as f64)
+    }
+
+    /// Drop the tracked window for a contract (e.g. when it is removed from config).
+    pub fn forget(&mut self, contract_id: &str) {
+        self.windows.remove(contract_id);
+    }
+}
+
 // ── Rule evaluation ───────────────────────────────────────────────────────────
 
 /// Evaluate all rules for one contract against one transaction.
@@ -319,6 +362,34 @@ pub fn evaluate(
     tags: Option<&HashMap<String, String>>,
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
+    let mut tracker = SuccessRateTracker::new();
+    evaluate_with_tracker(
+        label,
+        contract_id,
+        network,
+        horizon_base,
+        explorer_base,
+        rules,
+        tags,
+        tx,
+        &mut tracker,
+    )
+}
+
+/// Like [`evaluate`], but uses a caller-supplied [`SuccessRateTracker`] so the
+/// rolling success/failure window persists across transactions.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_with_tracker(
+    label: &str,
+    contract_id: &str,
+    network: &Network,
+    horizon_base: &str,
+    explorer_base: &str,
+    rules: &[AlertRule],
+    tags: Option<&HashMap<String, String>>,
+    tx: &EnrichedTransaction,
+    tracker: &mut SuccessRateTracker,
+) -> Vec<AlertPayload> {
     let horizon_base  = horizon_base.trim_end_matches('/');
     let explorer_base = explorer_base.trim_end_matches('/');
     let horizon_link  = format!("{}/transactions/{}", horizon_base, tx.hash);
@@ -328,7 +399,7 @@ pub fn evaluate(
 
     rules
         .iter()
-        .filter_map(|rule| match eval_rule(rule, tx) {
+        .filter_map(|rule| match eval_rule(rule, tx, contract_id, tracker) {
             Ok(true) => Some(AlertPayload {
                 label: label.to_string(),
                 contract_id: contract_id.to_string(),
@@ -369,7 +440,12 @@ pub fn evaluate(
 // NOTE: When adding a new AlertRule variant, update both `eval_rule()` and
 // `AlertRule::label()` together. Rust's exhaustive matching catches missing arms,
 // but this convention should be preserved for new rule variants.
-fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
+fn eval_rule(
+    rule: &AlertRule,
+    tx: &EnrichedTransaction,
+    contract_id: &str,
+    tracker: &mut SuccessRateTracker,
+) -> Result<bool> {
     Ok(match rule {
         AlertRule::AnyTransaction => true,
 
