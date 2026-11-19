@@ -14,6 +14,7 @@ most common configuration errors.
 | `http_user_agent` | string (optional) | Custom HTTP User-Agent header for Horizon requests (default: `txwatch/<version>`). |
 | `webhook_timeout_seconds` | integer (optional) | Timeout for each webhook delivery attempt, in seconds (default: `15`). Applies to all webhook deliveries, including contracts using TLS or pinned-certificate clients. |
 | `max_alerts_per_cycle` | integer (optional) | Upper bound on the number of alerts dispatched per polling cycle (default: `100`). |
+| `batch_alerts_per_tx` | boolean (optional) | When `true`, alerts from multiple rules firing on the same transaction are grouped and delivered as a single webhook POST containing a `rules_triggered` array instead of one POST per rule (default: `false`). |
 | `allow_internal_webhook_urls` | boolean (optional) | Global opt-out of SSRF protection for webhook URLs, allowing internal/private addresses. Can be overridden per contract (default: `false`). |
 | `tls` | table (optional) | TLS settings for the webhook HTTP client. See [TLS settings](#tls-settings). |
 | `webhook_tls_cert_pem` | string (optional) | Path to a PEM-encoded client certificate (or CA bundle) used for webhook TLS connections. |

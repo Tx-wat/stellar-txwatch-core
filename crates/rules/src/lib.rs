@@ -8,10 +8,10 @@
 //! data-extraction logic lives in this crate (no I/O, fully unit-testable) and the
 //! poller only handles HTTP concerns.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use txwatch_config::{AlertRule, ContractType};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -293,6 +293,49 @@ pub struct AlertPayload {
     pub source_account: Option<String>,
 }
 
+// ── Rolling success-rate window ───────────────────────────────────────────────
+
+/// Per-contract rolling window of transaction outcomes (success/failure).
+///
+/// Used by `AlertRule::SuccessRateThreshold` to compute the success ratio over the
+/// last `window_size` transactions. The window is bounded by the largest
+/// `window_size` seen for that contract, so memory stays proportional to the
+/// configured window rather than the number of transactions observed.
+#[derive(Debug, Default)]
+pub struct SuccessRateTracker {
+    windows: HashMap<String, VecDeque<bool>>,
+}
+
+impl SuccessRateTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one transaction outcome for `contract_id` and return the current
+    /// success ratio over the last `window_size` outcomes.
+    ///
+    /// Returns `None` when fewer than `window_size` outcomes have been recorded,
+    /// so the rule does not fire on an incomplete window.
+    pub fn record(&mut self, contract_id: &str, successful: bool, window_size: u32) -> Option<f64> {
+        let window = self.windows.entry(contract_id.to_string()).or_default();
+        window.push_back(successful);
+        let cap = window_size as usize;
+        while window.len() > cap {
+            window.pop_front();
+        }
+        if window.len() < cap || cap == 0 {
+            return None;
+        }
+        let successes = window.iter().filter(|&&ok| ok).count();
+        Some(successes as f64 / cap as f64)
+    }
+
+    /// Drop the tracked window for a contract (e.g. when it is removed from config).
+    pub fn forget(&mut self, contract_id: &str) {
+        self.windows.remove(contract_id);
+    }
+}
+
 // ── Rule evaluation ───────────────────────────────────────────────────────────
 
 /// Evaluate all rules for one contract against one transaction.
@@ -308,6 +351,34 @@ pub fn evaluate(
     tags: Option<&HashMap<String, String>>,
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
+    let mut tracker = SuccessRateTracker::new();
+    evaluate_with_tracker(
+        label,
+        contract_id,
+        network,
+        horizon_base,
+        explorer_base,
+        rules,
+        tags,
+        tx,
+        &mut tracker,
+    )
+}
+
+/// Like [`evaluate`], but uses a caller-supplied [`SuccessRateTracker`] so the
+/// rolling success/failure window persists across transactions.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_with_tracker(
+    label: &str,
+    contract_id: &str,
+    network: &Network,
+    horizon_base: &str,
+    explorer_base: &str,
+    rules: &[AlertRule],
+    tags: Option<&HashMap<String, String>>,
+    tx: &EnrichedTransaction,
+    tracker: &mut SuccessRateTracker,
+) -> Vec<AlertPayload> {
     let horizon_base  = horizon_base.trim_end_matches('/');
     let explorer_base = explorer_base.trim_end_matches('/');
     let horizon_link  = format!("{}/transactions/{}", horizon_base, tx.hash);
@@ -317,7 +388,7 @@ pub fn evaluate(
 
     rules
         .iter()
-        .filter_map(|rule| match eval_rule(rule, tx) {
+        .filter_map(|rule| match eval_rule(rule, tx, contract_id, tracker) {
             Ok(true) => Some(AlertPayload {
                 label: label.to_string(),
                 contract_id: contract_id.to_string(),
@@ -358,7 +429,12 @@ pub fn evaluate(
 // NOTE: When adding a new AlertRule variant, update both `eval_rule()` and
 // `AlertRule::label()` together. Rust's exhaustive matching catches missing arms,
 // but this convention should be preserved for new rule variants.
-fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
+fn eval_rule(
+    rule: &AlertRule,
+    tx: &EnrichedTransaction,
+    contract_id: &str,
+    tracker: &mut SuccessRateTracker,
+) -> Result<bool> {
     Ok(match rule {
         AlertRule::AnyTransaction => true,
 
@@ -406,6 +482,22 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
 
         AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
             eval_time_window(hours_utc, weekdays, wrap_rule.as_deref(), tx, chrono::Utc::now())?
+        }
+
+        AlertRule::SuccessRateThreshold { min_success_rate, window_size } => {
+            if !(0.0..=1.0).contains(min_success_rate) {
+                bail!(
+                    "min_success_rate {} is outside [0.0, 1.0]",
+                    min_success_rate
+                );
+            }
+            if *window_size == 0 {
+                bail!("window_size must be greater than 0");
+            }
+            match tracker.record(contract_id, tx.successful, *window_size) {
+                Some(rate) => rate < *min_success_rate,
+                None => false,
+            }
         }
     })
 }
@@ -1032,6 +1124,132 @@ mod tests {
         let tx = make_tx(true, &[], None);
         let payloads = run(&[AlertRule::TransactionFailed], &tx);
         assert!(payloads.is_empty());
+    }
+
+    // ── SuccessRateThreshold ─────────────────────────────────────────────────
+
+    const SR_CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    fn success_rate_rule(min_success_rate: f64, window_size: u32) -> AlertRule {
+        AlertRule::SuccessRateThreshold {
+            min_success_rate,
+            window_size,
+        }
+    }
+
+    fn feed(
+        tracker: &mut SuccessRateTracker,
+        outcomes: &[bool],
+        rule: &AlertRule,
+    ) -> Vec<Vec<AlertPayload>> {
+        outcomes
+            .iter()
+            .map(|&ok| {
+                let tx = make_tx(ok, &[], None);
+                evaluate_with_tracker(
+                    "Label",
+                    SR_CONTRACT,
+                    &Network::Testnet,
+                    "https://horizon-testnet.stellar.org",
+                    "https://stellar.expert/explorer/testnet",
+                    std::slice::from_ref(rule),
+                    None,
+                    &tx,
+                    tracker,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn success_rate_does_not_fire_before_window_is_full() {
+        let rule = success_rate_rule(0.9, 3);
+        let mut tracker = SuccessRateTracker::new();
+        let results = feed(&mut tracker, &[false, false], &rule);
+        assert!(results.iter().all(|p| p.is_empty()));
+    }
+
+    #[test]
+    fn success_rate_fires_when_ratio_falls_below_threshold() {
+        let rule = success_rate_rule(0.9, 3);
+        let mut tracker = SuccessRateTracker::new();
+        // 2 failures out of 3 => 0.333 < 0.9
+        let results = feed(&mut tracker, &[true, false, false], &rule);
+        assert!(results[0].is_empty());
+        assert!(results[1].is_empty());
+        assert_eq!(results[2].len(), 1);
+        assert_eq!(results[2][0].rule_type, "SuccessRateThreshold");
+    }
+
+    #[test]
+    fn success_rate_does_not_fire_when_ratio_meets_threshold() {
+        let rule = success_rate_rule(0.5, 4);
+        let mut tracker = SuccessRateTracker::new();
+        // 2 successes out of 4 => 0.5, not strictly below 0.5
+        let results = feed(&mut tracker, &[true, false, true, false], &rule);
+        assert!(results.iter().all(|p| p.is_empty()));
+    }
+
+    #[test]
+    fn success_rate_window_slides_and_recovers() {
+        let rule = success_rate_rule(0.9, 2);
+        let mut tracker = SuccessRateTracker::new();
+        // [fail, fail] => 0.0 fires; then [fail, ok] => 0.5 fires; then [ok, ok] => 1.0 stops
+        let results = feed(&mut tracker, &[false, false, true, true], &rule);
+        assert_eq!(results[0].len(), 0);
+        assert_eq!(results[1].len(), 1);
+        assert_eq!(results[2].len(), 1);
+        assert_eq!(results[3].len(), 0);
+    }
+
+    #[test]
+    fn success_rate_tracks_contracts_independently() {
+        let rule = success_rate_rule(0.9, 2);
+        let mut tracker = SuccessRateTracker::new();
+        let other = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+        let failed = make_tx(false, &[], None);
+        let ok = make_tx(true, &[], None);
+
+        let eval = |tracker: &mut SuccessRateTracker, contract: &str, tx: &EnrichedTransaction| {
+            evaluate_with_tracker(
+                "Label",
+                contract,
+                &Network::Testnet,
+                "https://horizon-testnet.stellar.org",
+                "https://stellar.expert/explorer/testnet",
+                std::slice::from_ref(&rule),
+                None,
+                tx,
+                tracker,
+            )
+        };
+
+        assert!(eval(&mut tracker, SR_CONTRACT, &failed).is_empty());
+        assert!(eval(&mut tracker, other, &ok).is_empty());
+        // Second failure on SR_CONTRACT completes its window; `other` is unaffected.
+        assert_eq!(eval(&mut tracker, SR_CONTRACT, &failed).len(), 1);
+        assert!(eval(&mut tracker, other, &ok).is_empty());
+    }
+
+    #[test]
+    fn success_rate_rejects_invalid_parameters() {
+        let tx = make_tx(false, &[], None);
+        let mut tracker = SuccessRateTracker::new();
+        for rule in [success_rate_rule(1.5, 2), success_rate_rule(-0.1, 2), success_rate_rule(0.5, 0)] {
+            let payloads = evaluate_with_tracker(
+                "Label",
+                SR_CONTRACT,
+                &Network::Testnet,
+                "https://horizon-testnet.stellar.org",
+                "https://stellar.expert/explorer/testnet",
+                std::slice::from_ref(&rule),
+                None,
+                &tx,
+                &mut tracker,
+            );
+            assert!(payloads.is_empty(), "invalid rule should not fire: {:?}", rule);
+        }
     }
 
     #[test]

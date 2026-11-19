@@ -164,6 +164,28 @@ type           = "HighFee"
 threshold_xlm  = 1
 ```
 
+### `SuccessRateThreshold`
+
+| Field             | Type | Required | Description                                                        |
+|-------------------|------|----------|--------------------------------------------------------------------|
+| `min_success_rate`| f64  | yes      | Minimum acceptable success ratio in `[0.0, 1.0]` (e.g. `0.95` = 95%) |
+| `window_size`     | u32  | yes      | Number of most recent transactions per contract to consider (> 0)  |
+
+Matches when the success rate over the contract's rolling window of the last `window_size`
+transactions falls below `min_success_rate`. The window is tracked per contract and updated
+on every observed transaction (successful or failed); the rule does not fire until the
+window is full, so a single early failure cannot trigger an alert.
+
+**Use case:** alert when a contract starts failing a meaningful share of its transactions,
+e.g. a Soroban contract whose invocations begin reverting.
+
+```toml
+[[contracts.rules]]
+type             = "SuccessRateThreshold"
+min_success_rate = 0.95
+window_size      = 100
+```
+
 ### `TimeWindow`
 Restricts alert firing to specific UTC hours and weekdays to prevent alert fatigue outside business hours. Can optionally wrap another rule via `wrap_rule`.
 
@@ -233,4 +255,5 @@ The webhook payload includes two rule-related fields:
 | `AdminFunctionCalled` | `"AdminFunctionCalled"` |
 | `HighFee` | `"HighFee"` |
 | `SourceAccountMatch` | `"SourceAccountMatch"` |
+| `SuccessRateThreshold` | `"SuccessRateThreshold"` |
 | `TimeWindow` | `"TimeWindow"` |
