@@ -283,9 +283,15 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
   "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123...",
   "ledger_sequence":  12345678,
-  "source_account":   "GABC..."
+  "source_account":   "GABC...",
+  "tags":             { "team": "payments", "env": "prod" }
 }
 ```
+
+> **Note:** `tags` is optional and is **omitted entirely** from the JSON body when the
+> contract has no `tags` configured, so existing receivers are unaffected. When present it
+> is a JSON object mapping string keys to string values, copied from the contract's
+> `tags` config and useful for routing and filtering in downstream systems.
 
 **Webhook headers:**
 - `Content-Type: application/json`
@@ -563,6 +569,12 @@ To prevent noisy log output during extended idle periods, TxWatch samples `debug
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+Please do **not** open a public issue for security vulnerabilities. See
+[SECURITY.md](SECURITY.md) for supported versions, the responsible-disclosure
+process, and expected response timelines.
 
 ## License
 

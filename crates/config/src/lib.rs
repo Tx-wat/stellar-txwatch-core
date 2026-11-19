@@ -177,9 +177,9 @@ pub enum AlertRule {
     /// converted to stroops during validation); the two are mutually exclusive.
     LargeTransfer {
         #[serde(default)]
-        threshold_stroops: Option<u64>,
-        #[serde(default)]
         threshold_xlm: Option<u64>,
+        #[serde(default)]
+        threshold_stroops: Option<u64>,
     },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
@@ -315,7 +315,33 @@ impl AlertRule {
                     );
                 }
             }
-            AlertRule::TimeWindow { hours_utc, weekdays, .. } => {
+            AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
+                if let Some(wrapped) = wrap_rule {
+                    // Only rule types whose condition can be evaluated from the
+                    // transaction alone are supported here. Types that require
+                    // parameters (function names, thresholds, account IDs) cannot be
+                    // expressed by `wrap_rule: Option<String>`, so reject them at
+                    // validation time rather than silently always-firing (#453).
+                    const SUPPORTED_WRAP_RULES: [&str; 5] = [
+                        "TransactionFailed",
+                        "InsufficientFunds",
+                        "SorobanInvocation",
+                        "LargeTransfer",
+                        "AnyTransaction",
+                    ];
+                    if !SUPPORTED_WRAP_RULES.contains(&wrapped.as_str()) {
+                        bail!(
+                            "contract '{}': TimeWindow wrap_rule '{}' is not supported: \
+                             wrap_rule only accepts rule types that need no parameters \
+                             ({}). Rule types such as FunctionCalled, AdminFunctionCalled, \
+                             HighFee and SourceAccountMatch require parameters that \
+                             wrap_rule cannot express; use them as standalone rules instead.",
+                            contract_label,
+                            wrapped,
+                            SUPPORTED_WRAP_RULES.join(", ")
+                        );
+                    }
+                }
                 let parts: Vec<&str> = hours_utc.split('-').collect();
                 if parts.len() != 2 {
                     bail!(
@@ -382,6 +408,9 @@ impl AlertRule {
                     format!("TimeWindow({}, [{}])", hours_utc, weekdays.join(", "))
                 }
             }
+            AlertRule::LedgerSequenceRange { from, to } => {
+                format!("LedgerSequenceRange({}..{})", from, to)
+            }
         }
     }
 
@@ -400,6 +429,7 @@ impl AlertRule {
             AlertRule::HighFee { .. } => "HighFee".into(),
             AlertRule::SourceAccountMatch { .. } => "SourceAccountMatch".into(),
             AlertRule::TimeWindow { .. } => "TimeWindow".into(),
+            AlertRule::LedgerSequenceRange { .. } => "LedgerSequenceRange".into(),
         }
     }
 }
@@ -485,6 +515,10 @@ pub struct WatchedContract {
     /// Optional inline PEM-encoded client certificate for webhook mTLS.
     #[serde(default)]
     pub webhook_tls_cert_pem: Option<String>,
+    /// Gzip-compress webhook request bodies (Issue #540). When enabled, the body
+    /// is sent with `Content-Encoding: gzip`. Defaults to `false`.
+    #[serde(default)]
+    pub webhook_compress: bool,
 }
 
 /// Maximum length, in characters, of a tag key or value.
@@ -730,6 +764,10 @@ pub struct AppConfig {
     /// contract (Issue #346). Per-contract settings take precedence.
     #[serde(default)]
     pub allow_internal_webhook_urls: Option<bool>,
+    /// Run an optional Horizon connectivity probe at startup (Issue #380).
+    /// Warn-only: a failed probe never aborts the poller. Default: false.
+    #[serde(default)]
+    pub horizon_startup_check: bool,
 }
 
 /// Default webhook delivery timeout in seconds (Issue #462).
@@ -1149,6 +1187,7 @@ mod tests {
             tags: None,
             tls: None,
             webhook_tls_cert_pem: None,
+            webhook_compress: false,
         }
     }
 
@@ -1238,6 +1277,7 @@ mod tests {
             http_connection_verbose: None,
             max_alerts_per_cycle: None,
             allow_internal_webhook_urls: Some(true),
+            horizon_startup_check: false,
         };
         cfg.validate().unwrap();
 
@@ -1280,6 +1320,55 @@ mod tests {
             wrap_rule: None,
         };
         assert!(bad_weekday.validate("test").is_err());
+    }
+
+    /// #453: `wrap_rule` values that `eval_time_window` cannot evaluate must be
+    /// rejected at validation time instead of silently always-firing.
+    #[test]
+    fn time_window_rejects_unsupported_wrap_rule() {
+        for unsupported in [
+            "FunctionCalled",
+            "AdminFunctionCalled",
+            "HighFee",
+            "SourceAccountMatch",
+            "NotARule",
+        ] {
+            let mut rule = AlertRule::TimeWindow {
+                hours_utc: "09:00-17:00".into(),
+                weekdays: vec!["Mon".into()],
+                wrap_rule: Some(unsupported.into()),
+            };
+            let err = rule.validate("test").unwrap_err().to_string();
+            assert!(
+                err.contains("wrap_rule") && err.contains(unsupported),
+                "expected wrap_rule rejection for '{}', got: {}",
+                unsupported,
+                err
+            );
+        }
+    }
+
+    /// #453: every rule type the evaluator actually handles is accepted.
+    #[test]
+    fn time_window_accepts_supported_wrap_rules() {
+        for supported in [
+            "TransactionFailed",
+            "InsufficientFunds",
+            "SorobanInvocation",
+            "LargeTransfer",
+            "AnyTransaction",
+        ] {
+            let mut rule = AlertRule::TimeWindow {
+                hours_utc: "09:00-17:00".into(),
+                weekdays: vec!["Mon".into()],
+                wrap_rule: Some(supported.into()),
+            };
+            assert!(
+                rule.validate("test").is_ok(),
+                "expected '{}' to be accepted as wrap_rule",
+                supported
+            );
+        }
     }
 
     /// #268: horizon_url is optional and absent by default.
@@ -1331,6 +1420,7 @@ mod tests {
             max_alerts_per_cycle: Some(0),
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
@@ -1386,6 +1476,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: Some(0),
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
@@ -1637,6 +1728,7 @@ mod tests {
             http_connection_verbose: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         }
     }
 
@@ -1693,6 +1785,18 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&dir);
         assert!(err.contains("is not writable"), "got: {}", err);
+    }
+
+    /// #438: `label()` for a stroops-configured `LargeTransfer` rule must match
+    /// `large_transfer_label`'s output exactly.
+    #[test]
+    fn large_transfer_label_matches_helper_for_stroops() {
+        let rule = AlertRule::LargeTransfer {
+            threshold_xlm: None,
+            threshold_stroops: Some(5_000_000),
+        };
+        assert_eq!(rule.label(), large_transfer_label(None, Some(5_000_000)));
+        assert_eq!(rule.label(), "LargeTransfer(>=0.5XLM)");
     }
 
     #[test]
@@ -1860,6 +1964,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -1875,6 +1980,7 @@ mod tests {
             http_connection_verbose: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         }
     }
 
@@ -1924,6 +2030,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -2086,8 +2193,10 @@ mod tests {
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
                 max_alerts_per_cycle: None,
+                http_user_agent: None,
                 webhook_timeout_seconds: None,
                 allow_internal_webhook_urls: None,
+                horizon_startup_check: false,
             };
             let err = cfg.validate().unwrap_err();
             assert!(
@@ -2189,6 +2298,7 @@ mod tests {
                     webhook_secret: None,
                     test_horizon_base_url: None,
                     allow_internal_webhook_urls: None,
+                    webhook_compress: false,
                 }
             })
             .collect();
@@ -2203,6 +2313,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         }
     }
 
