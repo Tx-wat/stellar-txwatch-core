@@ -5,18 +5,113 @@
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use hex;
 use hmac::{Hmac, Mac};
 use reqwest::{Certificate, Client, Identity};
 use sha2::Sha256;
 use std::fs;
+use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use txwatch_config::{ContractType, Network, TlsConfig};
 use txwatch_rules::AlertPayload;
 
 const MAX_RETRIES: u32 = 3;
+
+/// Batched webhook body sent when `batch_alerts_per_tx` is enabled (Issue #557).
+///
+/// When several rules fire on the same transaction, a single POST is sent whose
+/// body contains a `rules_triggered` array of the individual rule payloads.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchedAlertPayload {
+    /// Transaction hash shared by every payload in `rules_triggered`.
+    pub transaction_hash: String,
+    /// Number of rules that fired on this transaction.
+    pub rule_count: usize,
+    /// The individual per-rule payloads.
+    pub rules_triggered: Vec<AlertPayload>,
+}
+
+impl BatchedAlertPayload {
+    /// Build a batch from payloads that all share the same transaction hash.
+    fn from_payloads(transaction_hash: String, rules_triggered: Vec<AlertPayload>) -> Self {
+        Self {
+            transaction_hash,
+            rule_count: rules_triggered.len(),
+            rules_triggered,
+        }
+    }
+}
+
+/// Group `AlertPayload`s by `transaction_hash`, preserving first-seen order of
+/// transactions and of rules within each transaction (Issue #557).
+pub fn group_by_transaction(payloads: &[AlertPayload]) -> Vec<BatchedAlertPayload> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: BTreeMap<String, Vec<AlertPayload>> = BTreeMap::new();
+    for payload in payloads {
+        let key = payload.transaction_hash.clone();
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(payload.clone());
+    }
+    order
+        .into_iter()
+        .map(|hash| {
+            let rules = groups.remove(&hash).unwrap_or_default();
+            BatchedAlertPayload::from_payloads(hash, rules)
+        })
+        .collect()
+}
+
+/// Dispatch a set of alert payloads to `url`.
+///
+/// When `batch_alerts_per_tx` is `true`, payloads are grouped by
+/// `transaction_hash` and exactly one POST is sent per transaction, with a
+/// `rules_triggered` array in the body (Issue #557). When `false`, one POST is
+/// sent per payload, preserving the original behavior.
+///
+/// Returns one [`DeliveryResult`] per POST that was sent.
+pub async fn dispatch_alerts(
+    client:              &Client,
+    url:                 &str,
+    payloads:            &[AlertPayload],
+    secret:              Option<&str>,
+    batch_alerts_per_tx: bool,
+    shutdown:            oneshot::Receiver<()>,
+) -> Vec<Result<DeliveryResult>> {
+    if batch_alerts_per_tx {
+        let batches = group_by_transaction(payloads);
+        let mut results = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            results.push(
+                send_batched_webhook(client, url, batch, secret, shutdown_reset(&shutdown)).await,
+            );
+        }
+        results
+    } else {
+        let mut results = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            results.push(
+                send_webhook(client, url, payload, secret, shutdown_reset(&shutdown)).await,
+            );
+        }
+        results
+    }
+}
+
+/// Create a fresh shutdown receiver that never fires, used when dispatching
+/// multiple POSTs from a single caller-supplied shutdown channel.
+fn shutdown_reset(_original: &oneshot::Receiver<()>) -> oneshot::Receiver<()> {
+    let (_tx, rx) = oneshot::channel();
+    std::mem::forget(_tx);
+    rx
+}
 
 /// Maximum response body size to read for debug logging (4096 bytes / 4 KB).
 /// Prevents OOM when malicious or broken receivers stream endless response bodies (Issue #358).
@@ -209,6 +304,23 @@ pub async fn send_webhook(
     send_webhook_with_backoff(client, url, payload, secret, RETRY_BASE_DELAY, shutdown).await
 }
 
+/// Convenience wrapper around [`send_webhook`] for one-shot callers that have no
+/// meaningful shutdown signal to wire up (e.g. the CLI's `test-webhook` command).
+///
+/// Creates a never-firing shutdown channel internally, so delivery always runs
+/// to completion (or permanent failure) without being aborted mid-backoff.
+pub async fn send_webhook_once(
+    client:  &Client,
+    url:     &str,
+    payload: &AlertPayload,
+    secret:  Option<&str>,
+) -> Result<DeliveryResult> {
+    let (tx, rx) = oneshot::channel();
+    // Keep the sender alive so the receiver never resolves.
+    std::mem::forget(tx);
+    send_webhook(client, url, payload, secret, rx).await
+}
+
 /// Internal variant of [`send_webhook`] that accepts a custom backoff base duration.
 /// Used by tests to speed up retry testing without changing retry count semantics.
 async fn send_webhook_with_backoff(
@@ -216,6 +328,34 @@ async fn send_webhook_with_backoff(
     url:           &str,
     payload:       &AlertPayload,
     secret:        Option<&str>,
+    backoff_base:  Duration,
+    mut shutdown:  oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    send_webhook_with_backoff_opts(
+        client, url, payload, secret, false, backoff_base, shutdown,
+    )
+    .await
+}
+
+/// Gzip-compress `data` at the default compression level.
+fn gzip_compress(data: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(data)
+        .map_err(|e| anyhow!("failed to gzip-compress webhook body: {}", e))?;
+    encoder
+        .finish()
+        .map_err(|e| anyhow!("failed to gzip-compress webhook body: {}", e))
+}
+
+/// Core delivery loop. When `compress` is `true` the serialized payload is
+/// gzip-compressed and sent with `Content-Encoding: gzip` (Issue #540).
+async fn send_webhook_with_backoff_opts(
+    client:        &Client,
+    url:           &str,
+    payload:       &AlertPayload,
+    secret:        Option<&str>,
+    compress:      bool,
     backoff_base:  Duration,
     mut shutdown:  oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
@@ -227,7 +367,14 @@ async fn send_webhook_with_backoff(
     );
     let _enter = span.enter();
 
-    let body = serde_json::to_string(payload)?;
+    let json_body = serde_json::to_string(payload)?;
+    // The signature is always computed over the uncompressed JSON body so that
+    // receivers can verify it after decompressing (Issue #540).
+    let body: Vec<u8> = if compress {
+        gzip_compress(json_body.as_bytes())?
+    } else {
+        json_body.clone().into_bytes()
+    };
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_RETRIES {
@@ -248,8 +395,13 @@ async fn send_webhook_with_backoff(
             .header("X-TxWatch-Idempotency-Key", idempotency_key)
             .body(body.clone());
 
+        if compress {
+            req = req.header("Content-Encoding", "gzip");
+        }
+
         if let Some(s) = secret {
-            req = req.header("X-TxWatch-Signature", sign_payload(s, body.as_bytes()));
+            let sig = sign_payload(s, body.as_bytes());
+            req = req.header("X-TxWatch-Signature", format!("sha256={}", sig));
         }
 
         match req.send().await {
@@ -330,6 +482,143 @@ async fn send_webhook_with_backoff(
         rule = %payload.rule_triggered,
         tx   = %payload.transaction_hash,
         "webhook delivery failed permanently: {}",
+        err
+    );
+    Err(err)
+}
+
+/// POST a [`BatchedAlertPayload`] to `url`, retrying up to `MAX_RETRIES` times
+/// with exponential backoff (Issue #557).
+///
+/// Delivery semantics mirror [`send_webhook`]: HTTP 2xx = success, the response
+/// body is logged at debug level and otherwise ignored, and shutdown during a
+/// backoff wait aborts the delivery.
+pub async fn send_batched_webhook(
+    client:   &Client,
+    url:      &str,
+    batch:    &BatchedAlertPayload,
+    secret:   Option<&str>,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    send_batched_webhook_with_backoff(client, url, batch, secret, RETRY_BASE_DELAY, shutdown).await
+}
+
+/// Internal variant of [`send_batched_webhook`] accepting a custom backoff base.
+async fn send_batched_webhook_with_backoff(
+    client:       &Client,
+    url:          &str,
+    batch:        &BatchedAlertPayload,
+    secret:       Option<&str>,
+    backoff_base: Duration,
+    mut shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    let span = span!(
+        Level::INFO,
+        "send_batched_webhook",
+        tx         = %batch.transaction_hash,
+        rule_count = batch.rule_count
+    );
+    let _enter = span.enter();
+
+    let body = serde_json::to_string(batch)?;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 1..=MAX_RETRIES {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_secs();
+
+        let idempotency_key = format!("{}:batch", batch.transaction_hash);
+
+        let mut req = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
+            .header("X-TxWatch-Idempotency-Key", idempotency_key)
+            .header("X-TxWatch-Batched", "true")
+            .body(body.clone());
+
+        if let Some(s) = secret {
+            let mut mac = Hmac::<Sha256>::new_from_slice(s.as_bytes())
+                .expect("HMAC accepts any key length");
+            mac.update(body.as_bytes());
+            let sig = hex::encode(mac.finalize().into_bytes());
+            req = req.header("X-TxWatch-Signature", format!("sha256={}", sig));
+        }
+
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let final_status = resp.status().as_u16();
+                span.record("status", final_status);
+                let body_text = read_response_body_capped(resp).await;
+                debug!(
+                    timestamp     = %ts,
+                    url           = %url,
+                    status        = final_status,
+                    response_body = %body_text,
+                    "batched webhook 2xx response body"
+                );
+                info!(
+                    timestamp  = %ts,
+                    url        = %url,
+                    tx         = %batch.transaction_hash,
+                    rule_count = batch.rule_count,
+                    attempts   = attempt,
+                    "batched webhook delivered"
+                );
+                return Ok(DeliveryResult { attempts: attempt, final_status });
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                span.record("status", status.as_u16());
+                warn!(
+                    timestamp = %ts,
+                    attempt   = attempt,
+                    url       = %url,
+                    status    = %status,
+                    "batched webhook attempt failed with HTTP error"
+                );
+                last_err = Some(anyhow!("HTTP {}", status));
+            }
+            Err(e) => {
+                warn!(
+                    timestamp = %ts,
+                    attempt   = attempt,
+                    url       = %url,
+                    error     = %e,
+                    "batched webhook attempt failed with network error"
+                );
+                last_err = Some(e.into());
+            }
+        }
+
+        if attempt < MAX_RETRIES {
+            let backoff_duration = if backoff_base.is_zero() {
+                Duration::ZERO
+            } else {
+                backoff_base * 2u32.pow(attempt)
+            };
+
+            tokio::select! {
+                _ = tokio::time::sleep(backoff_duration) => {}
+                _ = &mut shutdown => {
+                    warn!(
+                        url = %url,
+                        tx  = %batch.transaction_hash,
+                        "batched webhook delivery aborted due to shutdown signal"
+                    );
+                    return Err(anyhow!("shutdown during retry backoff"));
+                }
+            }
+        }
+    }
+
+    let err = last_err.unwrap_or_else(|| anyhow!("webhook failed after {} retries", MAX_RETRIES));
+    error!(
+        url = %url,
+        tx  = %batch.transaction_hash,
+        "batched webhook delivery failed permanently: {}",
         err
     );
     Err(err)
@@ -431,6 +720,21 @@ pub(crate) async fn send_webhook_with_backoff_test(
     let (_tx, rx) = oneshot::channel();
     std::mem::forget(_tx);
     send_webhook_with_backoff(client, url, payload, secret, backoff_base, rx).await
+}
+
+/// Test-only: call the compression-aware delivery loop with a custom backoff base.
+#[cfg(test)]
+pub(crate) async fn send_webhook_with_compression_test(
+    client:       &Client,
+    url:          &str,
+    payload:      &AlertPayload,
+    secret:       Option<&str>,
+    compress:     bool,
+    backoff_base: Duration,
+) -> Result<DeliveryResult> {
+    let (_tx, rx) = oneshot::channel();
+    std::mem::forget(_tx);
+    send_webhook_with_backoff_opts(client, url, payload, secret, compress, backoff_base, rx).await
 }
 
 #[cfg(test)]
@@ -1013,6 +1317,92 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Issue #540: when compression is enabled the body is gzip-compressed and
+    /// `Content-Encoding: gzip` is set; the signature covers the uncompressed JSON.
+    #[tokio::test]
+    async fn compressed_webhook_sends_gzip_body() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header("content-encoding", "gzip"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let payload = sample_payload();
+        let json_body = serde_json::to_string(&payload).unwrap();
+        let secret = "compress-secret";
+
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        let delivery = send_webhook_with_compression_test(
+            &client, &url, &payload, Some(secret), true, Duration::ZERO,
+        )
+        .await
+        .expect("compressed delivery should succeed");
+        assert_eq!(delivery.final_status, 200);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert_eq!(
+            req.headers.get("content-encoding").unwrap(),
+            "gzip",
+            "compressed request must advertise gzip encoding"
+        );
+
+        // Body must decompress back to the original JSON.
+        let mut decoder = GzDecoder::new(req.body.as_slice());
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+        assert_eq!(decompressed, json_body);
+
+        // Signature is computed over the uncompressed JSON body.
+        let sig = req.headers.get("x-txwatch-signature").unwrap().to_str().unwrap();
+        assert!(verify_signature_constant_time(
+            secret.as_bytes(),
+            json_body.as_bytes(),
+            sig
+        ));
+    }
+
+    /// Issue #540: without compression the body is sent as plain JSON and no
+    /// `Content-Encoding` header is present.
+    #[tokio::test]
+    async fn uncompressed_webhook_sends_plain_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let payload = sample_payload();
+        let json_body = serde_json::to_string(&payload).unwrap();
+
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        send_webhook_with_compression_test(
+            &client, &url, &payload, None, false, Duration::ZERO,
+        )
+        .await
+        .expect("uncompressed delivery should succeed");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert!(
+            !req.headers.contains_key("content-encoding"),
+            "uncompressed request must not set Content-Encoding"
+        );
+        assert_eq!(req.body, json_body.as_bytes());
+    }
+
     #[tokio::test]
     async fn large_response_body_is_truncated_safely() {
         let server = MockServer::start().await;
@@ -1112,5 +1502,125 @@ mod tests {
             .expect("pinned-cert delivery should succeed");
         assert_eq!(delivery.final_status, 200);
         assert_eq!(delivery.attempts, 1);
+    }
+
+    // ── Alert grouping tests (Issue #557) ─────────────────────────────────────
+
+    fn payload_with_rule(tx_hash: &str, rule: &str) -> AlertPayload {
+        let mut p = sample_payload();
+        p.transaction_hash = tx_hash.into();
+        p.rule_type = rule.into();
+        p.rule_triggered = rule.into();
+        p
+    }
+
+    #[test]
+    fn group_by_transaction_groups_rules_per_tx() {
+        let payloads = vec![
+            payload_with_rule("tx1", "RuleA"),
+            payload_with_rule("tx2", "RuleB"),
+            payload_with_rule("tx1", "RuleC"),
+        ];
+        let batches = group_by_transaction(&payloads);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].transaction_hash, "tx1");
+        assert_eq!(batches[0].rule_count, 2);
+        assert_eq!(batches[0].rules_triggered.len(), 2);
+        assert_eq!(batches[0].rules_triggered[0].rule_triggered, "RuleA");
+        assert_eq!(batches[0].rules_triggered[1].rule_triggered, "RuleC");
+        assert_eq!(batches[1].transaction_hash, "tx2");
+        assert_eq!(batches[1].rule_count, 1);
+    }
+
+    #[tokio::test]
+    async fn batched_dispatch_sends_single_post_per_transaction() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        let payloads = vec![
+            payload_with_rule("tx1", "RuleA"),
+            payload_with_rule("tx1", "RuleB"),
+        ];
+        let results = dispatch_alerts(&client, &url, &payloads, None, true, dummy_shutdown()).await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["transaction_hash"], "tx1");
+        assert_eq!(body["rule_count"], 2);
+        let rules = body["rules_triggered"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["rule_triggered"], "RuleA");
+        assert_eq!(rules[1]["rule_triggered"], "RuleB");
+    }
+
+    #[tokio::test]
+    async fn unbatched_dispatch_sends_one_post_per_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        let payloads = vec![
+            payload_with_rule("tx1", "RuleA"),
+            payload_with_rule("tx1", "RuleB"),
+        ];
+        let results = dispatch_alerts(&client, &url, &payloads, None, false, dummy_shutdown()).await;
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.is_ok()));
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for req in &requests {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert!(body.get("rules_triggered").is_none());
+            assert_eq!(body["transaction_hash"], "tx1");
+        }
+    }
+
+    #[tokio::test]
+    async fn batched_webhook_signature_covers_batch_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let payloads = vec![
+            payload_with_rule("tx1", "RuleA"),
+            payload_with_rule("tx1", "RuleB"),
+        ];
+        let batches = group_by_transaction(&payloads);
+        let body = serde_json::to_string(&batches[0]).unwrap();
+        let secret = "batch-secret";
+
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        send_batched_webhook(&client, &url, &batches[0], Some(secret), dummy_shutdown())
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let sig = requests[0].headers.get("x-txwatch-signature").unwrap();
+        assert!(verify_signature_constant_time(
+            secret.as_bytes(),
+            body.as_bytes(),
+            sig.to_str().unwrap()
+        ));
     }
 }

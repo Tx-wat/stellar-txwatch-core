@@ -223,3 +223,21 @@ fn validate_example_config_is_valid() {
         String::from_utf8_lossy(&output.stderr),
     );
 }
+
+#[test]
+fn version_flag_prints_cargo_pkg_version() {
+    let output = txwatch_bin()
+        .arg("--version")
+        .output()
+        .expect("failed to run txwatch");
+
+    assert!(output.status.success(), "expected exit code 0 for --version");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "expected --version output to contain version {}, got: {}",
+        env!("CARGO_PKG_VERSION"),
+        stdout
+    );
+}

@@ -1,14 +1,90 @@
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::{Client, StatusCode};
-use tokio::sync::watch;
+use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
-use txwatch_notifier::{build_client, send_webhook, test_payload_with_network};
+use txwatch_notifier::{build_client, send_webhook_once, test_payload_with_network};
 
 mod stream;
+
+/// Debounce window for config file change events.
+const CONFIG_WATCH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Spawns a background task that watches `path` for modifications and reloads
+/// the config into `shared` on each debounced change. Parse/validation failures
+/// are logged and the previous config is retained. The task exits when
+/// `shutdown_rx` observes `true`.
+fn spawn_config_watcher(
+    path: PathBuf,
+    shared: Arc<RwLock<AppConfig>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        use notify::{Event, EventKind, RecursiveMode, Watcher};
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<()>(16);
+        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<Event>| {
+            if let Ok(event) = res {
+                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                    // Non-blocking send; drop if the channel is full (already pending reload).
+                    let _ = event_tx.try_send(());
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e, "failed to create config file watcher; hot-reload disabled");
+                return;
+            }
+        };
+
+        // Watch the parent directory so atomic-rename saves (common editors) are detected.
+        let watch_target = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let Err(e) = watcher.watch(&watch_target, RecursiveMode::NonRecursive) {
+            warn!(error = %e, path = %watch_target.display(), "failed to watch config directory; hot-reload disabled");
+            return;
+        }
+
+        info!(path = %path.display(), "config file watcher started");
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("config file watcher shutting down");
+                        break;
+                    }
+                }
+                evt = event_rx.recv() => {
+                    if evt.is_none() {
+                        break;
+                    }
+                    // Debounce: drain any additional events that arrive within the window.
+                    tokio::time::sleep(CONFIG_WATCH_DEBOUNCE).await;
+                    while event_rx.try_recv().is_ok() {}
+
+                    match AppConfig::from_file(&path) {
+                        Ok(new_cfg) => {
+                            let mut guard = shared.write().await;
+                            *guard = new_cfg;
+                            info!(path = %path.display(), "config reloaded");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, path = %path.display(), "config reload failed; keeping previous config");
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -28,6 +104,10 @@ const VERSION: &str = concat!(
     about   = "Stellar Soroban contract monitor & webhook alert engine"
 )]
 struct Cli {
+    /// Print version information and exit
+    #[arg(short = 'V', long = "version", action = clap::ArgAction::Version)]
+    version: Option<bool>,
+
     /// Path to the TOML config file [env: TXWATCH_CONFIG]
     #[arg(short, long, env = "TXWATCH_CONFIG", default_value = "config/example.toml")]
     config: PathBuf,
@@ -62,6 +142,10 @@ enum Command {
         /// Optional bearer token for SSE /stream endpoint authentication
         #[arg(long, env = "TXWATCH_STREAM_TOKEN")]
         stream_token: Option<String>,
+
+        /// Only watch contracts whose label matches one of these (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        contracts: Option<Vec<String>>,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -143,6 +227,40 @@ impl fmt::Display for ValidateSummary<'_> {
     }
 }
 
+// ── Startup banner ────────────────────────────────────────────────────────────
+
+/// Renders the human-readable startup banner printed when the watch engine starts.
+struct StartupBanner<'a> {
+    config: &'a AppConfig,
+}
+
+impl fmt::Display for StartupBanner<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cfg = self.config;
+        let mut networks: Vec<String> = cfg
+            .contracts
+            .iter()
+            .map(|c| c.network.display_name().to_string())
+            .collect();
+        networks.sort();
+        networks.dedup();
+        let networks = if networks.is_empty() {
+            "none".to_string()
+        } else {
+            networks.join(", ")
+        };
+
+        writeln!(f, "╔══════════════════════════════════════════════════════════╗")?;
+        writeln!(f, "║  txwatch — Stellar Soroban contract monitor              ║")?;
+        writeln!(f, "╚══════════════════════════════════════════════════════════╝")?;
+        writeln!(f, "  version        : {}", VERSION)?;
+        writeln!(f, "  contracts      : {}", cfg.contracts.len())?;
+        writeln!(f, "  networks       : {}", networks)?;
+        writeln!(f, "  poll_interval  : {}s", cfg.poll_interval_seconds)?;
+        Ok(())
+    }
+}
+
 // ── Webhook reachability helper ───────────────────────────────────────────────
 
 /// Returns `Ok(true)` if the endpoint responded with a non-error status,
@@ -155,6 +273,69 @@ async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
         .with_context(|| format!("HEAD request to '{}' failed", url))?;
     Ok(!resp.status().is_client_error() && !resp.status().is_server_error()
         && resp.status() != StatusCode::NOT_FOUND)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use txwatch_config::{ContractConfig, Network};
+
+    fn fixed_config() -> AppConfig {
+        AppConfig {
+            poll_interval_seconds: 30,
+            contracts: vec![
+                ContractConfig {
+                    label: "alpha".to_string(),
+                    contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                        .to_string(),
+                    network: Network::Testnet,
+                    webhook_url: "https://example.com/hook-a".to_string(),
+                    webhook_secret: None,
+                    rules: vec![],
+                    cursor_file: None,
+                },
+                ContractConfig {
+                    label: "beta".to_string(),
+                    contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBSC4"
+                        .to_string(),
+                    network: Network::Mainnet,
+                    webhook_url: "https://example.com/hook-b".to_string(),
+                    webhook_secret: None,
+                    rules: vec![],
+                    cursor_file: None,
+                },
+                ContractConfig {
+                    label: "gamma".to_string(),
+                    contract_id: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+                        .to_string(),
+                    network: Network::Testnet,
+                    webhook_url: "https://example.com/hook-c".to_string(),
+                    webhook_secret: None,
+                    rules: vec![],
+                    cursor_file: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn startup_banner_snapshot() {
+        let cfg = fixed_config();
+        let rendered = StartupBanner { config: &cfg }.to_string();
+        let expected = format!(
+            "╔══════════════════════════════════════════════════════════╗\n\
+             ║  txwatch — Stellar Soroban contract monitor              ║\n\
+             ╚══════════════════════════════════════════════════════════╝\n\
+             \x20 version        : {}\n\
+             \x20 contracts      : 3\n\
+             \x20 networks       : Mainnet, Testnet\n\
+             \x20 poll_interval  : 30s\n",
+            VERSION
+        );
+        assert_eq!(rendered, expected);
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -212,7 +393,7 @@ async fn main() -> Result<()> {
                 .context("failed to build HTTP client")?;
 
             info!(url = %url, timeout_secs = timeout, "sending test webhook");
-            send_webhook(&client, &url, &payload, secret.as_deref())
+            send_webhook_once(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
 
@@ -242,6 +423,23 @@ async fn main() -> Result<()> {
             stream_token,
         } => {
             let cfg = AppConfig::from_file(&cli.config)?;
+
+            let mut networks: Vec<String> = cfg
+                .contracts
+                .iter()
+                .map(|c| c.network.display_name().to_string())
+                .collect();
+            networks.sort();
+            networks.dedup();
+
+            info!(
+                version             = VERSION,
+                contracts           = cfg.contracts.len(),
+                poll_interval_seconds = cfg.poll_interval_seconds,
+                networks            = ?networks,
+                "starting txwatch"
+            );
+            info!("\n{}", StartupBanner { config: &cfg });
 
             let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
             let broadcast_tx = if stream_addr.is_some() {
@@ -278,6 +476,15 @@ async fn main() -> Result<()> {
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             // Handles both Ctrl+C (SIGINT) and SIGTERM (e.g. from Docker/systemd).
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            // Hot-reload: watch the config file and swap the active config on change.
+            let shared_cfg = Arc::new(RwLock::new(cfg));
+            spawn_config_watcher(
+                cli.config.clone(),
+                Arc::clone(&shared_cfg),
+                shutdown_rx.clone(),
+            );
+
             tokio::spawn(async move {
                 #[cfg(unix)]
                 {
@@ -305,9 +512,10 @@ async fn main() -> Result<()> {
                 let _ = shutdown_tx.send(true);
             });
 
+            let cfg = shared_cfg.read().await.clone();
             info!(
                 version        = VERSION,
                 contracts      = cfg.contracts.len(),
                 interval_secs  = cfg.poll_interva
 
-/* … truncated 3436 chars — edit only what you need near the top … */
+/* … truncated 1554 chars — edit only what you need near the top … */
