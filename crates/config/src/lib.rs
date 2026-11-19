@@ -174,9 +174,9 @@ pub enum AlertRule {
     /// converted to stroops during validation); the two are mutually exclusive.
     LargeTransfer {
         #[serde(default)]
-        threshold_stroops: Option<u64>,
-        #[serde(default)]
         threshold_xlm: Option<u64>,
+        #[serde(default)]
+        threshold_stroops: Option<u64>,
     },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
@@ -753,6 +753,10 @@ pub struct AppConfig {
     /// contract (Issue #346). Per-contract settings take precedence.
     #[serde(default)]
     pub allow_internal_webhook_urls: Option<bool>,
+    /// Run an optional Horizon connectivity probe at startup (Issue #380).
+    /// Warn-only: a failed probe never aborts the poller. Default: false.
+    #[serde(default)]
+    pub horizon_startup_check: bool,
 }
 
 /// Default webhook delivery timeout in seconds (Issue #462).
@@ -1095,6 +1099,7 @@ mod tests {
             http_connection_verbose: None,
             max_alerts_per_cycle: None,
             allow_internal_webhook_urls: Some(true),
+            horizon_startup_check: false,
         };
         cfg.validate().unwrap();
 
@@ -1237,6 +1242,7 @@ mod tests {
             max_alerts_per_cycle: Some(0),
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
@@ -1292,6 +1298,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: Some(0),
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
@@ -1543,6 +1550,7 @@ mod tests {
             http_connection_verbose: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         }
     }
 
@@ -1599,6 +1607,18 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&dir);
         assert!(err.contains("is not writable"), "got: {}", err);
+    }
+
+    /// #438: `label()` for a stroops-configured `LargeTransfer` rule must match
+    /// `large_transfer_label`'s output exactly.
+    #[test]
+    fn large_transfer_label_matches_helper_for_stroops() {
+        let rule = AlertRule::LargeTransfer {
+            threshold_xlm: None,
+            threshold_stroops: Some(5_000_000),
+        };
+        assert_eq!(rule.label(), large_transfer_label(None, Some(5_000_000)));
+        assert_eq!(rule.label(), "LargeTransfer(>=0.5XLM)");
     }
 
     #[test]
@@ -1766,6 +1786,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -1781,6 +1802,7 @@ mod tests {
             http_connection_verbose: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         }
     }
 
@@ -1830,6 +1852,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -1992,8 +2015,10 @@ mod tests {
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
                 max_alerts_per_cycle: None,
+                http_user_agent: None,
                 webhook_timeout_seconds: None,
                 allow_internal_webhook_urls: None,
+                horizon_startup_check: false,
             };
             let err = cfg.validate().unwrap_err();
             assert!(
@@ -2109,6 +2134,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         }
     }
 
