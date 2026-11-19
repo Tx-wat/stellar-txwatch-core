@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A single transaction record returned by Horizon.
 #[derive(Debug, Clone, Deserialize)]
@@ -38,13 +39,65 @@ pub trait HorizonClient {
     fn fetch_transactions(&self, cursor: Option<&str>) -> Result<TransactionPage>;
 }
 
+/// Per-status-code counters backing the `txwatch_horizon_errors_total` metric.
+///
+/// Indexed by HTTP status code (0..=599); codes outside that range are ignored.
+static HORIZON_ERRORS_TOTAL: [AtomicU64; 600] = [const { AtomicU64::new(0) }; 600];
+
+/// Record a Horizon error for the given HTTP status code, incrementing the
+/// `txwatch_horizon_errors_total{status_code="<code>"}` counter.
+pub fn record_horizon_error(status_code: u16) {
+    if let Some(counter) = HORIZON_ERRORS_TOTAL.get(status_code as usize) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Return the current value of `txwatch_horizon_errors_total` for a status code.
+pub fn horizon_errors_total(status_code: u16) -> u64 {
+    HORIZON_ERRORS_TOTAL
+        .get(status_code as usize)
+        .map(|c| c.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Fetch a single page of transactions from Horizon, counting non-success
+/// HTTP status responses in `txwatch_horizon_errors_total`.
+pub fn fetch_page<C: HorizonClient>(
+    client: &C,
+    cursor: Option<&str>,
+) -> Result<TransactionPage> {
+    match client.fetch_transactions(cursor) {
+        Ok(page) => Ok(page),
+        Err(err) => {
+            if let Some(status) = err.downcast_ref::<HorizonStatusError>() {
+                record_horizon_error(status.status_code);
+            }
+            Err(err)
+        }
+    }
+}
+
+/// Error carrying the HTTP status code returned by Horizon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HorizonStatusError {
+    pub status_code: u16,
+}
+
+impl std::fmt::Display for HorizonStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "horizon returned non-success status {}", self.status_code)
+    }
+}
+
+impl std::error::Error for HorizonStatusError {}
+
 /// Poll a contract for new transactions, advancing the cursor only when new
 /// records are present.
 pub fn poll_contract<C: HorizonClient>(
     client: &C,
     cursor: Option<&str>,
 ) -> Result<PollResult> {
-    let page = client.fetch_transactions(cursor)?;
+    let page = fetch_page(client, cursor)?;
     let records = page.embedded.records;
 
     if records.is_empty() {
@@ -81,6 +134,19 @@ mod tests {
         }
     }
 
+    struct FailingHorizon {
+        status_code: u16,
+    }
+
+    impl HorizonClient for FailingHorizon {
+        fn fetch_transactions(&self, _cursor: Option<&str>) -> Result<TransactionPage> {
+            Err(HorizonStatusError {
+                status_code: self.status_code,
+            }
+            .into())
+        }
+    }
+
     fn empty_page() -> TransactionPage {
         TransactionPage {
             embedded: EmbeddedRecords { records: vec![] },
@@ -112,5 +178,14 @@ mod tests {
         assert_eq!(result.transactions, 0);
         assert_eq!(result.alerts, 0);
         assert_eq!(result.cursor, None, "cursor must remain unset");
+    }
+
+    #[test]
+    fn fetch_page_increments_error_counter_by_status_code() {
+        let before = horizon_errors_total(500);
+        let client = FailingHorizon { status_code: 500 };
+
+        assert!(fetch_page(&client, None).is_err());
+        assert_eq!(horizon_errors_total(500), before + 1);
     }
 }
