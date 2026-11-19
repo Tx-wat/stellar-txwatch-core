@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Allow manually re-running the full pipeline against a specific ref so a
+  # stale/incorrect status on `main` HEAD can be re-verified on demand.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,7 +48,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          # Include the toolchain in the key so a stale cache from a different
+          # compiler version can never mask a real clippy failure.
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain*') }}
           restore-keys: |
             ${{ runner.os }}-cargo-clippy-
 
@@ -70,7 +75,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('rust-toolchain*') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
 

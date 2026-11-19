@@ -3,8 +3,7 @@ name    = "txwatch-poller"
 version = "0.1.0"
 license = "Apache-2.0"
 edition = "2021"
-license   = "Apache-2.0"
-publish   = false
+publish = false
 
 [features]
 # Enable Prometheus metrics counters and optional /metrics HTTP endpoint.

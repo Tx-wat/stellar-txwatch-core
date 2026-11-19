@@ -56,6 +56,23 @@ docker compose down
 
 ---
 
+## Development setup
+
+A `Makefile` at the repo root wraps the common developer tasks. These targets
+mirror the commands CI runs, so running them locally catches most failures
+before you push:
+
+```bash
+make test     # cargo test --all
+make clippy   # cargo clippy --all-targets --all-features -- -D warnings
+make fmt      # cargo fmt --all
+make build    # cargo build --release
+make docker   # docker build -t txwatch .
+```
+
+Run `make <target>` from the repository root. The individual steps below
+describe the same setup in more detail.
+
 ## Local dev setup
 
 ### 1. Rust toolchain

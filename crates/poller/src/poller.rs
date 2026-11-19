@@ -18,6 +18,7 @@ use txwatch_config::{AppConfig, WatchedContract, MAX_CONTRACTS};
 use txwatch_notifier::send_webhook;
 use txwatch_rules::{evaluate, extract_soroban_details, EnrichedTransaction};
 
+use crate::circuit_breaker::CircuitBreakerMap;
 use crate::cursor::CursorMap;
 use crate::enrichment::fetch_soroban_details;
 use crate::horizon::HorizonPage;
@@ -127,6 +128,9 @@ pub async fn run_with_shutdown(
         CursorMap::new_for_contracts(&cfg.contracts)
     };
 
+    // #374: per-contract circuit breaker state, keyed by contract label.
+    let mut breakers = CircuitBreakerMap::new();
+
     let interval      = Duration::from_secs(cfg.poll_interval_seconds);
     let summary_every = Duration::from_secs(60);
     let counters      = Arc::new(Counters::default());
@@ -230,6 +234,16 @@ pub async fn run_with_shutdown(
         }
 
         for contract in &cfg.contracts {
+            // #374: skip polling while the circuit breaker is open for this
+            // contract (backing off exponentially after consecutive failures).
+            if breakers.should_skip(&contract.label) {
+                debug!(
+                    contract = %contract.label,
+                    "circuit breaker open — skipping poll for this contract"
+                );
+                continue;
+            }
+
             let result =
                 poll_contract_with_http(&client, contract, &mut cursors, dry_run, &webhook_http)
                     .await;
@@ -238,6 +252,13 @@ pub async fn run_with_shutdown(
             crate::metrics::inc_poll_cycles(&contract.label);
             match result {
                 Ok((txs, alerts)) => {
+                    // #374: reset the breaker and log recovery on success.
+                    if breakers.record_success(&contract.label) {
+                        info!(
+                            contract = %contract.label,
+                            "circuit breaker closed — contract polling recovered"
+                        );
+                    }
                     counters.transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
                     counters.interval_transactions.fetch_add(txs, Ordering::Relaxed);
@@ -248,7 +269,19 @@ pub async fn run_with_shutdown(
                         crate::metrics::inc_alerts(alerts);
                     }
                 }
-                Err(e) => error!(error = %e, "contract polling task failed"),
+                Err(e) => {
+                    // #374: count the failure and log when the breaker opens.
+                    if breakers.record_failure(&contract.label) {
+                        warn!(
+                            contract = %contract.label,
+                            error = %e,
+                            "circuit breaker open — skipping polling for this contract"
+                        );
+                        #[cfg(feature = "metrics")]
+                        crate::metrics::inc_circuit_breaker_open();
+                    }
+                    error!(error = %e, "contract polling task failed");
+                }
             }
         }
 
@@ -441,5 +474,51 @@ mod tests {
 
         assert_eq!(crate::metrics::poll_cycles_total("test-contract-a"), before_a + 2);
         assert_eq!(crate::metrics::poll_cycles_total("test-contract-b"), before_b + 1);
+    }
+
+    // ── #374: circuit breaker integration ────────────────────────────────────
+
+    #[test]
+    fn breaker_skips_after_three_consecutive_failures() {
+        let mut breakers = CircuitBreakerMap::new();
+        let label = "breaker-test-contract";
+
+        // Two failures: still polled.
+        assert!(!breakers.record_failure(label));
+        assert!(!breakers.record_failure(label));
+        assert!(!breakers.should_skip(label));
+
+        // Third failure opens the breaker.
+        assert!(breakers.record_failure(label));
+        assert!(breakers.should_skip(label));
+    }
+
+    #[test]
+    fn breaker_recovers_on_success() {
+        let mut breakers = CircuitBreakerMap::new();
+        let label = "breaker-recovery-contract";
+
+        for _ in 0..3 {
+            breakers.record_failure(label);
+        }
+        assert!(breakers.should_skip(label));
+
+        // A success closes the breaker and reports the transition.
+        assert!(breakers.record_success(label));
+        assert!(!breakers.should_skip(label));
+        // Subsequent successes do not report a transition.
+        assert!(!breakers.record_success(label));
+    }
+
+    #[test]
+    fn breaker_backoff_grows_exponentially() {
+        let mut breakers = CircuitBreakerMap::new();
+        let label = "breaker-backoff-contract";
+
+        for _ in 0..3 {
+            breakers.record_failure(label);
+        }
+        // 2^3 = 8 intervals skipped after the third failure.
+        assert_eq!(breakers.skip_intervals(label), 8);
     }
 }

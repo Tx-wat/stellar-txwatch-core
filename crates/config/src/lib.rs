@@ -6,7 +6,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_path_to_error::Deserializer as PathDeserializer;
 use std::collections::HashMap;
-use std::{env, fmt, fs, path::Path};
+use std::str::FromStr;
+use std::{fmt, fs, path::Path};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -128,7 +129,15 @@ pub enum AlertRule {
     InsufficientFunds,
     /// Fires when the transaction invokes any Soroban host function, regardless of name.
     SorobanInvocation,
-    LargeTransfer       { threshold_xlm: u64 },
+    /// Fires when a transfer of at least the threshold occurs.
+    /// Specify either `threshold_stroops` (raw stroops) or `threshold_xlm` (whole XLM,
+    /// converted to stroops during validation); the two are mutually exclusive.
+    LargeTransfer {
+        #[serde(default)]
+        threshold_stroops: Option<u64>,
+        #[serde(default)]
+        threshold_xlm: Option<u64>,
+    },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
     /// Fires when the transaction's fee exceeds the threshold.
@@ -304,8 +313,8 @@ impl AlertRule {
             AlertRule::TransactionFailed => "TransactionFailed".into(),
             AlertRule::InsufficientFunds => "InsufficientFunds".into(),
             AlertRule::SorobanInvocation => "SorobanInvocation".into(),
-            AlertRule::LargeTransfer { threshold_xlm } => {
-                format!("LargeTransfer(>={}XLM)", threshold_xlm)
+            AlertRule::LargeTransfer { threshold_xlm, threshold_stroops } => {
+                large_transfer_label(*threshold_xlm, *threshold_stroops)
             }
             AlertRule::FunctionCalled { function_name } => {
                 format!("FunctionCalled({})", function_name)
@@ -409,6 +418,17 @@ pub struct WatchedContract {
     /// set programmatically in tests. Production code must leave this `None`.
     #[serde(skip, default)]
     pub test_horizon_base_url: Option<String>,
+    /// Optional per-contract Horizon base URL override (Issue #268).
+    #[serde(default)]
+    pub horizon_url: Option<String>,
+    /// Maximum webhooks sent for this contract in a single poll cycle (Issue #269).
+    /// Unset means unlimited (or the global cap, if configured).
+    #[serde(default)]
+    pub max_alerts_per_cycle: Option<u64>,
+    /// Per-contract webhook delivery timeout in seconds (Issue #462).
+    /// Unset means the global `webhook_timeout_seconds` applies.
+    #[serde(default)]
+    pub webhook_timeout_seconds: Option<u64>,
     /// Allow webhook URLs resolving to localhost or private IP ranges (Issue #346).
     #[serde(default)]
     pub allow_internal_webhook_urls: Option<bool>,
@@ -416,6 +436,12 @@ pub struct WatchedContract {
     /// Keys and values are validated by `validate_tag_part`.
     #[serde(default)]
     pub tags: Option<HashMap<String, String>>,
+    /// Optional mutual-TLS settings for webhook delivery (Issue #278).
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    /// Optional inline PEM-encoded client certificate for webhook mTLS.
+    #[serde(default)]
+    pub webhook_tls_cert_pem: Option<String>,
 }
 
 /// Maximum length, in characters, of a tag key or value.
@@ -651,6 +677,10 @@ pub struct AppConfig {
     /// Defaults to 15 seconds for backward compatibility.
     #[serde(default = "default_webhook_timeout_seconds")]
     pub webhook_timeout_seconds: Option<u64>,
+    /// Allow webhook URLs resolving to localhost or private IP ranges for every
+    /// contract (Issue #346). Per-contract settings take precedence.
+    #[serde(default)]
+    pub allow_internal_webhook_urls: Option<bool>,
 }
 
 /// Default webhook delivery timeout in seconds (Issue #462).
@@ -777,7 +807,9 @@ impl AppConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("cannot read config file '{}'", path.display()))?;
-        let mut cfg: AppConfig = deserialize_toml_with_field_context(&raw)
+        // Tolerate a leading UTF-8 BOM, which some editors prepend.
+        let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+        let mut cfg: AppConfig = deserialize_toml_with_field_context(raw)
             .with_context(|| format!("failed to parse config file '{}'", path.display()))?;
         cfg.resolve_env_vars()?;
         cfg.validate()?;
@@ -882,8 +914,13 @@ mod tests {
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
             test_horizon_base_url: None,
-            allow_internal_webhook_urls: None,
+            horizon_url: None,
+            max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
         }
     }
 
@@ -1011,6 +1048,7 @@ mod tests {
             http_connection_verbose: None,
             max_alerts_per_cycle: Some(0),
             webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
@@ -1065,6 +1103,7 @@ mod tests {
             http_connection_verbose: None,
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: Some(0),
+            allow_internal_webhook_urls: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
@@ -1315,6 +1354,7 @@ mod tests {
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
             webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
         }
     }
 
@@ -1497,6 +1537,7 @@ mod tests {
             cursor_file: None,
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -1511,6 +1552,7 @@ mod tests {
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
             webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
         }
     }
 
@@ -1559,6 +1601,7 @@ mod tests {
             cursor_file: None,
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -1720,9 +1763,9 @@ mod tests {
                 http_pool_max_idle_per_host: None,
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
-                cursor_file: None,
-                contracts: vec![],
+                max_alerts_per_cycle: None,
                 webhook_timeout_seconds: None,
+                allow_internal_webhook_urls: None,
             };
             let err = cfg.validate().unwrap_err();
             assert!(
@@ -1822,7 +1865,14 @@ mod tests {
                     rules: vec![AlertRule::AnyTransaction],
                     webhook_url: "https://example.com/hook".into(),
                     webhook_secret: None,
-                    horizon_base_url_override: None,
+                    test_horizon_base_url: None,
+                    horizon_url: None,
+                    max_alerts_per_cycle: None,
+                    webhook_timeout_seconds: None,
+                    allow_internal_webhook_urls: None,
+                    tags: None,
+                    tls: None,
+                    webhook_tls_cert_pem: None,
                 }
             })
             .collect();
@@ -1834,7 +1884,9 @@ mod tests {
             http_pool_max_idle_per_host: None,
             http_tcp_keepalive_secs: None,
             http_connection_verbose: None,
+            max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
         }
     }
 

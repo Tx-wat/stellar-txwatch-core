@@ -31,7 +31,7 @@ pub async fn run_sse_server(
             let mut client_rx = alert_rx.resubscribe();
 
             tokio::spawn(async move {
-                let (reader, mut writer) = socket.split();
+                let (reader, mut writer) = tokio::io::split(socket);
                 let mut buf_reader = BufReader::new(reader);
 
                 let mut request_line = String::new();
@@ -102,10 +102,9 @@ mod tests {
     async fn sse_server_streams_alerts_with_auth() {
         let (tx, rx) = broadcast::channel(16);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let addr = format!("127.0.0.1:{}", port).parse().unwrap();
         run_sse_server(addr, Some("secret123".into()), rx).await.unwrap();
 
         // 1. Unauthorized request

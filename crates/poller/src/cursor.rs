@@ -18,6 +18,59 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 use txwatch_config::WatchedContract;
 
+/// Number of consecutive Horizon failures before the circuit breaker opens.
+pub const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+
+// ── ContractState ─────────────────────────────────────────────────────────────
+
+/// Per-contract polling state: the last-seen paging token plus circuit-breaker
+/// bookkeeping.
+///
+/// All circuit-breaker fields use `serde(default)` so that cursor files written
+/// by older versions (which stored only the token string) still deserialize.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractState {
+    /// Last-seen Horizon paging token (or the sentinel `"now"`).
+    #[serde(default = "default_token")]
+    pub token: String,
+    /// Number of consecutive Horizon failures for this contract.
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    /// Number of poll intervals to skip once the breaker is open.
+    #[serde(default)]
+    pub skip_intervals: u32,
+    /// Remaining poll intervals to skip before polling resumes.
+    #[serde(default)]
+    pub skip_remaining: u32,
+}
+
+fn default_token() -> String {
+    "now".to_string()
+}
+
+impl Default for ContractState {
+    fn default() -> Self {
+        Self {
+            token: default_token(),
+            consecutive_failures: 0,
+            skip_intervals: 0,
+            skip_remaining: 0,
+        }
+    }
+}
+
+impl ContractState {
+    /// Build a fresh state starting at `"now"`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the circuit breaker is currently open (polling should be skipped).
+    pub fn is_skipped(&self) -> bool {
+        self.skip_remaining > 0
+    }
+}
+
 // ── CursorMap ─────────────────────────────────────────────────────────────────
 
 /// Tracks the last-seen Horizon paging token for each watched contract.
@@ -26,7 +79,7 @@ use txwatch_config::WatchedContract;
 /// APIs so the intent is always clear at the call site.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct CursorMap(HashMap<String, String>);
+pub struct CursorMap(HashMap<String, ContractState>);
 
 impl CursorMap {
     /// Build a fresh `CursorMap` from a slice of contracts.
@@ -37,19 +90,107 @@ impl CursorMap {
         Self(
             contracts
                 .iter()
-                .map(|c| (c.contract_id.clone(), "now".to_string()))
+                .map(|c| (c.contract_id.clone(), ContractState::new()))
                 .collect(),
         )
     }
 
     /// Return the current paging token for `contract_id`, or `"now"` if not set.
     pub fn get(&self, contract_id: &str) -> &str {
-        self.0.get(contract_id).map(String::as_str).unwrap_or("now")
+        self.0
+            .get(contract_id)
+            .map(|s| s.token.as_str())
+            .unwrap_or("now")
     }
 
     /// Update the paging token for `contract_id`.
     pub fn set(&mut self, contract_id: &str, token: &str) {
-        self.0.insert(contract_id.to_string(), token.to_string());
+        self.0
+            .entry(contract_id.to_string())
+            .or_default()
+            .token = token.to_string();
+    }
+
+    /// Return the full per-contract state, if present.
+    pub fn state(&self, contract_id: &str) -> Option<&ContractState> {
+        self.0.get(contract_id)
+    }
+
+    /// Whether polling for `contract_id` should be skipped this cycle.
+    pub fn is_skipped(&self, contract_id: &str) -> bool {
+        self.0
+            .get(contract_id)
+            .map(ContractState::is_skipped)
+            .unwrap_or(false)
+    }
+
+    /// Record a Horizon failure for `contract_id`.
+    ///
+    /// Increments the consecutive-failure counter. Once the counter reaches
+    /// [`CIRCUIT_BREAKER_THRESHOLD`], the circuit breaker opens and the contract
+    /// is skipped for `2^failures` poll intervals.
+    ///
+    /// Returns `true` if the breaker just opened on this call (i.e. the
+    /// contract transitioned into the open state).
+    pub fn record_failure(&mut self, contract_id: &str) -> bool {
+        let state = self.0.entry(contract_id.to_string()).or_default();
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+
+        if state.consecutive_failures < CIRCUIT_BREAKER_THRESHOLD {
+            return false;
+        }
+
+        let was_open = state.is_skipped();
+        // 2^failures, capped to avoid overflow / absurd skip windows.
+        let intervals = 1u32
+            .checked_shl(state.consecutive_failures)
+            .unwrap_or(u32::MAX);
+        state.skip_intervals = intervals;
+        state.skip_remaining = intervals;
+
+        let just_opened = !was_open;
+        if just_opened {
+            warn!(
+                contract = %contract_id,
+                consecutive_failures = state.consecutive_failures,
+                skip_intervals = intervals,
+                "circuit breaker open: skipping polling for contract"
+            );
+        }
+        just_opened
+    }
+
+    /// Record a successful Horizon poll for `contract_id`, resetting the
+    /// circuit-breaker state.
+    ///
+    /// Returns `true` if the contract was previously in the open state (i.e.
+    /// the breaker just recovered).
+    pub fn record_success(&mut self, contract_id: &str) -> bool {
+        let state = self.0.entry(contract_id.to_string()).or_default();
+        let was_open = state.is_skipped() || state.consecutive_failures >= CIRCUIT_BREAKER_THRESHOLD;
+
+        state.consecutive_failures = 0;
+        state.skip_intervals = 0;
+        state.skip_remaining = 0;
+
+        if was_open {
+            warn!(
+                contract = %contract_id,
+                "circuit breaker recovered: resuming polling for contract"
+            );
+        }
+        was_open
+    }
+
+    /// Consume one skipped poll interval for `contract_id`, if any remain.
+    ///
+    /// Returns `true` if the contract is still skipped after this call.
+    pub fn tick_skip(&mut self, contract_id: &str) -> bool {
+        let state = self.0.entry(contract_id.to_string()).or_default();
+        if state.skip_remaining > 0 {
+            state.skip_remaining -= 1;
+        }
+        state.is_skipped()
     }
 
     /// Load a `CursorMap` from a JSON file.
@@ -65,7 +206,7 @@ impl CursorMap {
                     for c in contracts {
                         map.0
                             .entry(c.contract_id.clone())
-                            .or_insert_with(|| "now".to_string());
+                            .or_insert_with(ContractState::new);
                     }
                     map
                 }
@@ -194,6 +335,131 @@ mod tests {
 
         assert_eq!(map.get(ID_A), "500", "existing cursor should be preserved");
         assert_eq!(map.get(ID_B), "now", "new contract should start at 'now'");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_legacy_string_cursor_file_is_backward_compatible() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_legacy.json");
+        // Legacy format: plain string values, no circuit-breaker fields.
+        let legacy = serde_json::json!({ ID_A: "777" });
+        std::fs::write(&tmp, legacy.to_string()).unwrap();
+
+        let contracts = vec![contract(ID_A)];
+        let map = CursorMap::load_from_file(&tmp, &contracts);
+
+        assert_eq!(map.get(ID_A), "777");
+        let state = map.state(ID_A).unwrap();
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.skip_intervals, 0);
+        assert_eq!(state.skip_remaining, 0);
+        assert!(!map.is_skipped(ID_A));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn failures_below_threshold_do_not_open_breaker() {
+        let mut map = CursorMap::new_for_contracts(&[contract(ID_A)]);
+        assert!(!map.record_failure(ID_A));
+        assert!(!map.record_failure(ID_A));
+        assert!(!map.is_skipped(ID_A));
+        assert_eq!(map.state(ID_A).unwrap().consecutive_failures, 2);
+    }
+
+    #[test]
+    fn third_failure_opens_breaker_with_exponential_backoff() {
+        let mut map = CursorMap::new_for_contracts(&[contract(ID_A)]);
+        map.record_failure(ID_A);
+        map.record_failure(ID_A);
+        assert!(map.record_failure(ID_A), "third failure should open breaker");
+
+        let state = map.state(ID_A).unwrap();
+        assert_eq!(state.consecutive_failures, 3);
+        // 2^3 == 8 intervals
+        assert_eq!(state.skip_intervals, 8);
+        assert_eq!(state.skip_remaining, 8);
+        assert!(map.is_skipped(ID_A));
+    }
+
+    #[test]
+    fn backoff_grows_with_consecutive_failures() {
+        let mut map = CursorMap::new_for_contracts(&[contract(ID_A)]);
+        for _ in 0..4 {
+            map.record_failure(ID_A);
+        }
+        // 2^4 == 16
+        assert_eq!(map.state(ID_A).unwrap().skip_intervals, 16);
+
+        map.record_failure(ID_A);
+        // 2^5 == 32
+        assert_eq!(map.state(ID_A).unwrap().skip_intervals, 32);
+    }
+
+    #[test]
+    fn record_failure_returns_true_only_on_transition() {
+        let mut map = CursorMap::new_for_contracts(&[contract(ID_A)]);
+        assert!(!map.record_failure(ID_A));
+        assert!(!map.record_failure(ID_A));
+        assert!(map.record_failure(ID_A), "transition into open state");
+        assert!(!map.record_failure(ID_A), "already open, no new transition");
+    }
+
+    #[test]
+    fn tick_skip_decrements_until_closed() {
+        let mut map = CursorMap::new_for_contracts(&[contract(ID_A)]);
+        for _ in 0..3 {
+            map.record_failure(ID_A);
+        }
+        assert_eq!(map.state(ID_A).unwrap().skip_remaining, 8);
+
+        for _ in 0..8 {
+            assert!(map.tick_skip(ID_A));
+        }
+        assert!(!map.is_skipped(ID_A));
+        assert_eq!(map.state(ID_A).unwrap().skip_remaining, 0);
+    }
+
+    #[test]
+    fn success_resets_breaker_state() {
+        let mut map = CursorMap::new_for_contracts(&[contract(ID_A)]);
+        for _ in 0..3 {
+            map.record_failure(ID_A);
+        }
+        assert!(map.is_skipped(ID_A));
+
+        assert!(map.record_success(ID_A), "recovery should be reported");
+        let state = map.state(ID_A).unwrap();
+        assert_eq!(state.consecutive_failures, 0);
+        assert_eq!(state.skip_intervals, 0);
+        assert_eq!(state.skip_remaining, 0);
+        assert!(!map.is_skipped(ID_A));
+    }
+
+    #[test]
+    fn success_on_healthy_contract_is_noop() {
+        let mut map = CursorMap::new_for_contracts(&[contract(ID_A)]);
+        assert!(!map.record_success(ID_A));
+        assert_eq!(map.state(ID_A).unwrap().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn circuit_breaker_state_persists_via_json() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_breaker.json");
+        let contracts = vec![contract(ID_A)];
+
+        let mut original = CursorMap::new_for_contracts(&contracts);
+        for _ in 0..3 {
+            original.record_failure(ID_A);
+        }
+        original.save_to_file(&tmp).unwrap();
+
+        let loaded = CursorMap::load_from_file(&tmp, &contracts);
+        let state = loaded.state(ID_A).unwrap();
+        assert_eq!(state.consecutive_failures, 3);
+        assert_eq!(state.skip_intervals, 8);
+        assert!(loaded.is_skipped(ID_A));
 
         let _ = std::fs::remove_file(&tmp);
     }
