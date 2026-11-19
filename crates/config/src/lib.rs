@@ -174,9 +174,9 @@ pub enum AlertRule {
     /// converted to stroops during validation); the two are mutually exclusive.
     LargeTransfer {
         #[serde(default)]
-        threshold_stroops: Option<u64>,
-        #[serde(default)]
         threshold_xlm: Option<u64>,
+        #[serde(default)]
+        threshold_stroops: Option<u64>,
     },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
@@ -312,7 +312,33 @@ impl AlertRule {
                     );
                 }
             }
-            AlertRule::TimeWindow { hours_utc, weekdays, .. } => {
+            AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
+                if let Some(wrapped) = wrap_rule {
+                    // Only rule types whose condition can be evaluated from the
+                    // transaction alone are supported here. Types that require
+                    // parameters (function names, thresholds, account IDs) cannot be
+                    // expressed by `wrap_rule: Option<String>`, so reject them at
+                    // validation time rather than silently always-firing (#453).
+                    const SUPPORTED_WRAP_RULES: [&str; 5] = [
+                        "TransactionFailed",
+                        "InsufficientFunds",
+                        "SorobanInvocation",
+                        "LargeTransfer",
+                        "AnyTransaction",
+                    ];
+                    if !SUPPORTED_WRAP_RULES.contains(&wrapped.as_str()) {
+                        bail!(
+                            "contract '{}': TimeWindow wrap_rule '{}' is not supported: \
+                             wrap_rule only accepts rule types that need no parameters \
+                             ({}). Rule types such as FunctionCalled, AdminFunctionCalled, \
+                             HighFee and SourceAccountMatch require parameters that \
+                             wrap_rule cannot express; use them as standalone rules instead.",
+                            contract_label,
+                            wrapped,
+                            SUPPORTED_WRAP_RULES.join(", ")
+                        );
+                    }
+                }
                 let parts: Vec<&str> = hours_utc.split('-').collect();
                 if parts.len() != 2 {
                     bail!(
@@ -727,6 +753,10 @@ pub struct AppConfig {
     /// contract (Issue #346). Per-contract settings take precedence.
     #[serde(default)]
     pub allow_internal_webhook_urls: Option<bool>,
+    /// Run an optional Horizon connectivity probe at startup (Issue #380).
+    /// Warn-only: a failed probe never aborts the poller. Default: false.
+    #[serde(default)]
+    pub horizon_startup_check: bool,
 }
 
 /// Default webhook delivery timeout in seconds (Issue #462).
@@ -861,3 +891,1305 @@ impl AppConfig {
         cfg.validate()?;
         Ok(cfg)
     }
+
+    pub fn validate(&mut self) -> Result<()> {
+        if self.poll_interval_seconds < 5 {
+            bail!("poll_interval_seconds must be >= 5");
+        }
+        if self.poll_interval_seconds > 3600 {
+            bail!("poll_interval_seconds must be <= 3600 (1 hour)");
+        }
+        if self.webhook_timeout_seconds == Some(0) {
+            bail!("webhook_timeout_seconds must be >= 1 when set");
+        }
+        if self.contracts.is_empty() {
+            bail!("at least one [[contracts]] entry is required");
+        }
+        // #256: enforce the hard contract limit with a clear error message.
+        if self.contracts.len() > MAX_CONTRACTS {
+            bail!(
+                "too many contracts: {} configured, maximum is {} \
+                 (reduce the number of [[contracts]] entries)",
+                self.contracts.len(),
+                MAX_CONTRACTS
+            );
+        }
+        // #472: warn (but don't block) when the configured contract count exceeds
+        // 80% of the hard cap. Living in `validate()` means this re-fires on every
+        // validation, including a future hot-reload path, rather than only at startup.
+        let warn_threshold = (MAX_CONTRACTS * 80) / 100;
+        if self.contracts.len() > warn_threshold {
+            tracing::warn!(
+                contracts = self.contracts.len(),
+                max_contracts = MAX_CONTRACTS,
+                warn_threshold,
+                "configured contract count exceeds 80% of MAX_CONTRACTS; \
+                 approaching the hard limit"
+            );
+        }
+        if let Some(true) = self.allow_internal_webhook_urls {
+            for contract in &mut self.contracts {
+                if contract.allow_internal_webhook_urls.is_none() {
+                    contract.allow_internal_webhook_urls = Some(true);
+                }
+            }
+        }
+        for contract in &mut self.contracts {
+            contract.validate()?;
+        }
+        if let Some(path) = &self.cursor_file {
+            validate_cursor_file(path)?;
+        }
+        let mut seen_labels = std::collections::HashSet::new();
+        for contract in &self.contracts {
+            if !seen_labels.insert(&contract.label) {
+                bail!("duplicate contract label '{}'", contract.label);
+            }
+        }
+        // The same contract_id is valid on different networks (mainnet vs testnet),
+        // but not twice on the same network.
+        let mut seen_ids = std::collections::HashSet::new();
+        for contract in &self.contracts {
+            let key = (contract.contract_id.as_str(), contract.network.as_str());
+            if !seen_ids.insert(key) {
+                bail!(
+                    "duplicate contract_id '{}' on network '{}'",
+                    contract.contract_id,
+                    contract.network.as_str()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn env_interpolation_passes_plain_values_through() {
+        assert_eq!(resolve_env_interpolation("plain-secret").unwrap(), "plain-secret");
+        assert_eq!(resolve_env_interpolation("price$5").unwrap(), "price$5");
+    }
+
+    #[test]
+    fn env_interpolation_resolves_braced_var() {
+        std::env::set_var("TXWATCH_TEST_INTERP_SECRET", "s3cret");
+        assert_eq!(
+            resolve_env_interpolation("${TXWATCH_TEST_INTERP_SECRET}").unwrap(),
+            "s3cret"
+        );
+    }
+
+    #[test]
+    fn env_interpolation_rejects_unsupported_patterns() {
+        for bad in ["$VAR", "${VAR:-default}", "prefix-${VAR}", "${}", "${VAR}-suffix"] {
+            let err = resolve_env_interpolation(bad).unwrap_err().to_string();
+            assert!(err.contains("unsupported env var interpolation"), "{bad}: {err}");
+        }
+    }
+
+    fn valid_contract() -> WatchedContract {
+        WatchedContract {
+            label: "Test".into(),
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            network: Network::Testnet,
+            rules: vec![AlertRule::AnyTransaction],
+            webhook_url: "https://example.com/hook".into(),
+            webhook_secret: None,
+            test_horizon_base_url: None,
+            horizon_url: None,
+            max_alerts_per_cycle: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+        }
+    }
+
+    #[test]
+    fn webhook_tls_cert_pem_validation() {
+        let mut c = valid_contract();
+        c.webhook_tls_cert_pem = Some("-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----".into());
+        assert!(c.validate().is_ok());
+
+        let mut invalid_c = valid_contract();
+        invalid_c.webhook_tls_cert_pem = Some("not a pem".into());
+        assert!(invalid_c.validate().is_err());
+    }
+
+    #[test]
+    fn valid_config_passes() {
+        let mut c = valid_contract();
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn webhook_url_rejects_internal_and_loopback_ips_by_default() {
+        for url in [
+            "http://127.0.0.1/hook",
+            "http://localhost:8080/hook",
+            "https://192.168.0.1/hook",
+            "https://10.0.0.1/webhook",
+            "http://[::1]:9000/alert",
+        ] {
+            let mut c = valid_contract();
+            c.webhook_url = url.into();
+            let err = c.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("resolves to localhost or private IP range"),
+                "expected rejection for {url}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn webhook_url_accepts_internal_ips_when_opted_in() {
+        for url in [
+            "http://127.0.0.1/hook",
+            "http://localhost:8080/hook",
+            "https://192.168.0.1/hook",
+            "https://10.0.0.1/webhook",
+            "http://[::1]:9000/alert",
+        ] {
+            let mut c = valid_contract();
+            c.webhook_url = url.into();
+            c.allow_internal_webhook_urls = Some(true);
+            assert!(c.validate().is_ok(), "expected acceptance for {url}");
+        }
+    }
+
+    /// #475: a global `allow_internal_webhook_urls = true` propagates to contracts
+    /// that don't set their own value, while an explicit per-contract `false` is
+    /// preserved and an explicit per-contract `true` stays `true`.
+    #[test]
+    fn global_allow_internal_webhook_urls_propagates_to_contracts() {
+        let mut unset = valid_contract();
+        unset.label = "Unset".into();
+        unset.contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+        unset.webhook_url = "http://127.0.0.1/hook".into();
+        unset.allow_internal_webhook_urls = None;
+
+        let mut explicit_false = valid_contract();
+        explicit_false.label = "ExplicitFalse".into();
+        explicit_false.contract_id =
+            "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+        explicit_false.webhook_url = "https://example.com/hook".into();
+        explicit_false.allow_internal_webhook_urls = Some(false);
+
+        let mut explicit_true = valid_contract();
+        explicit_true.label = "ExplicitTrue".into();
+        explicit_true.contract_id =
+            "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".into();
+        explicit_true.webhook_url = "https://example.com/hook".into();
+        explicit_true.allow_internal_webhook_urls = Some(true);
+
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![unset, explicit_false, explicit_true],
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: None,
+            allow_internal_webhook_urls: Some(true),
+            horizon_startup_check: false,
+        };
+        cfg.validate().unwrap();
+
+        assert_eq!(
+            cfg.contracts[0].allow_internal_webhook_urls,
+            Some(true),
+            "contract without its own value should inherit the global true"
+        );
+        assert_eq!(
+            cfg.contracts[1].allow_internal_webhook_urls,
+            Some(false),
+            "explicit per-contract false must not be overridden by the global true"
+        );
+        assert_eq!(
+            cfg.contracts[2].allow_internal_webhook_urls,
+            Some(true),
+            "explicit per-contract true should stay true"
+        );
+    }
+
+    #[test]
+    fn time_window_rule_validation() {
+        let mut valid_rule = AlertRule::TimeWindow {
+            hours_utc: "09:00-17:00".into(),
+            weekdays: vec!["Mon".into(), "Tue".into(), "Fri".into()],
+            wrap_rule: Some("LargeTransfer".into()),
+        };
+        assert!(valid_rule.validate("test").is_ok());
+
+        let mut bad_hours = AlertRule::TimeWindow {
+            hours_utc: "25:00-17:00".into(),
+            weekdays: vec!["Mon".into()],
+            wrap_rule: None,
+        };
+        assert!(bad_hours.validate("test").is_err());
+
+        let mut bad_weekday = AlertRule::TimeWindow {
+            hours_utc: "09:00-17:00".into(),
+            weekdays: vec!["Funday".into()],
+            wrap_rule: None,
+        };
+        assert!(bad_weekday.validate("test").is_err());
+    }
+
+    /// #453: `wrap_rule` values that `eval_time_window` cannot evaluate must be
+    /// rejected at validation time instead of silently always-firing.
+    #[test]
+    fn time_window_rejects_unsupported_wrap_rule() {
+        for unsupported in [
+            "FunctionCalled",
+            "AdminFunctionCalled",
+            "HighFee",
+            "SourceAccountMatch",
+            "NotARule",
+        ] {
+            let mut rule = AlertRule::TimeWindow {
+                hours_utc: "09:00-17:00".into(),
+                weekdays: vec!["Mon".into()],
+                wrap_rule: Some(unsupported.into()),
+            };
+            let err = rule.validate("test").unwrap_err().to_string();
+            assert!(
+                err.contains("wrap_rule") && err.contains(unsupported),
+                "expected wrap_rule rejection for '{}', got: {}",
+                unsupported,
+                err
+            );
+        }
+    }
+
+    /// #453: every rule type the evaluator actually handles is accepted.
+    #[test]
+    fn time_window_accepts_supported_wrap_rules() {
+        for supported in [
+            "TransactionFailed",
+            "InsufficientFunds",
+            "SorobanInvocation",
+            "LargeTransfer",
+            "AnyTransaction",
+        ] {
+            let mut rule = AlertRule::TimeWindow {
+                hours_utc: "09:00-17:00".into(),
+                weekdays: vec!["Mon".into()],
+                wrap_rule: Some(supported.into()),
+            };
+            assert!(
+                rule.validate("test").is_ok(),
+                "expected '{}' to be accepted as wrap_rule",
+                supported
+            );
+        }
+    }
+
+    /// #268: horizon_url is optional and absent by default.
+    /// #269: max_alerts_per_cycle is optional and defaults to unlimited.
+    #[test]
+    fn max_alerts_per_cycle_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.max_alerts_per_cycle.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    /// #269: the global cap and per-contract override both parse from TOML.
+    #[test]
+    fn max_alerts_per_cycle_is_parsed_globally_and_per_contract() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            max_alerts_per_cycle = 50
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            max_alerts_per_cycle = 5
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.max_alerts_per_cycle, Some(50));
+        assert_eq!(cfg.contracts[0].max_alerts_per_cycle, Some(5));
+    }
+
+    #[test]
+    fn rejects_zero_max_alerts_per_cycle_on_contract() {
+        let mut c = valid_contract();
+        c.max_alerts_per_cycle = Some(0);
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_zero_global_max_alerts_per_cycle() {
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![valid_contract()],
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: Some(0),
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
+    }
+
+    // ── Issue #462: webhook_timeout_seconds ──────────────────────────────────
+
+    #[test]
+    fn webhook_timeout_seconds_defaults_to_15() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.webhook_timeout_seconds, Some(15));
+        assert_eq!(cfg.contracts[0].webhook_timeout_seconds, None);
+    }
+
+    #[test]
+    fn webhook_timeout_seconds_parses_global_and_per_contract() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            webhook_timeout_seconds = 30
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            webhook_timeout_seconds = 45
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.webhook_timeout_seconds, Some(30));
+        assert_eq!(cfg.contracts[0].webhook_timeout_seconds, Some(45));
+    }
+
+    #[test]
+    fn rejects_zero_global_webhook_timeout_seconds() {
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![valid_contract()],
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: None,
+            webhook_timeout_seconds: Some(0),
+            allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_zero_per_contract_webhook_timeout_seconds() {
+        let mut c = valid_contract();
+        c.webhook_timeout_seconds = Some(0);
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
+    }
+
+    #[test]
+    fn horizon_url_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.horizon_url.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    /// #268: horizon_url is parsed from TOML.
+    #[test]
+    fn horizon_url_is_parsed_from_toml() {
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            horizon_url = "https://my-private-horizon.example.com"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            cfg.contracts[0].horizon_url.as_deref(),
+            Some("https://my-private-horizon.example.com")
+        );
+    }
+
+    #[test]
+    fn accepts_valid_https_horizon_url() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("https://my-private-horizon.example.com".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_http_horizon_url_for_local_replica() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("http://127.0.0.1:8000".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_horizon_url_that_is_not_a_url() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("not a url".into());
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("horizon_url"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_horizon_url_with_ftp_scheme() {
+        let mut c = valid_contract();
+        c.horizon_url = Some("ftp://horizon.example.com".into());
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("must use http or https"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_short_contract_id() {
+        let mut c = valid_contract();
+        c.contract_id = "CSHORT".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_contract_id_with_lowercase_letters() {
+        let mut c = valid_contract();
+        c.contract_id = format!("Ca{}", "A".repeat(54));
+        assert_eq!(c.contract_id.len(), 56);
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("A-Z and 2-7"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn rejects_contract_id_with_digits_outside_base32() {
+        let mut c = valid_contract();
+        c.contract_id = format!("C1{}", "A".repeat(54));
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_c_contract_id() {
+        let mut c = valid_contract();
+        c.contract_id = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_bad_webhook_url() {
+        let mut c = valid_contract();
+        c.webhook_url = "ftp://bad".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_webhook_url_with_no_host() {
+        let mut c = valid_contract();
+        c.webhook_url = "https://".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_webhook_url_with_spaces() {
+        let mut c = valid_contract();
+        c.webhook_url = "https://example .com/hook".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_webhook_url_that_is_not_a_url() {
+        let mut c = valid_contract();
+        c.webhook_url = "not-a-url-at-all".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_webhook_url_with_ftp_scheme() {
+        let mut c = valid_contract();
+        c.webhook_url = "ftp://files.example.com/hook".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_valid_http_webhook_url() {
+        let mut c = valid_contract();
+        c.webhook_url = "http://hooks.example.com/my-webhook".into();
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_https_webhook_url_with_path_and_query() {
+        let mut c = valid_contract();
+        c.webhook_url = "https://hooks.example.com/alerts?token=abc123".into();
+        assert!(c.validate().is_ok());
+    }
+
+    // ── Issue #278: mTLS config ──────────────────────────────────────────────
+
+    fn fixture_path(name: &str) -> String {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../notifier/tests/fixtures")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn tls_section_parses_from_toml_with_optional_ca() {
+        let raw = format!(
+            r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[rules]]
+            type = "AnyTransaction"
+            [tls]
+            client_cert = "{}"
+            client_key = "{}"
+            "#,
+            fixture_path("client-cert.pem"),
+            fixture_path("client-key.pem"),
+        );
+        let mut c: WatchedContract = toml::from_str(&raw).unwrap();
+        assert!(c.tls.as_ref().unwrap().ca_cert.is_none());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn tls_rejects_missing_client_cert_file() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: "/nonexistent/client.pem".into(),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_cert"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_rejects_missing_ca_cert_file() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some("/nonexistent/ca.pem".into()),
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.ca_cert"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_rejects_empty_key_path() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: "  ".into(),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_key must not be empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn tls_accepts_existing_files() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some(fixture_path("client-cert.pem")),
+        });
+        assert!(c.validate().is_ok());
+    }
+
+    // ── Issue #279: cursor_file validation ───────────────────────────────────
+
+    fn cursor_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "txwatch-cursor-{}-{}",
+            name,
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn app_config_with_cursor(cursor_file: String) -> AppConfig {
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![valid_contract()],
+            cursor_file: Some(cursor_file),
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
+        }
+    }
+
+    #[test]
+    fn cursor_file_existing_valid_json_is_accepted() {
+        let dir = cursor_test_dir("valid-json");
+        let file = dir.join("cursors.json");
+        fs::write(&file, r#"{"CABC": "123-1"}"#).unwrap();
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        assert!(cfg.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_existing_invalid_json_is_rejected() {
+        let dir = cursor_test_dir("invalid-json");
+        let file = dir.join("cursors.json");
+        fs::write(&file, "{ not json").unwrap();
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("is not valid JSON"), "got: {}", err);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_missing_file_in_existing_dir_is_accepted() {
+        let dir = cursor_test_dir("missing-file");
+        let file = dir.join("not-yet-created.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        assert!(cfg.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_file_missing_directory_is_rejected() {
+        let dir = cursor_test_dir("missing-dir").join("no-such-subdir");
+        let file = dir.join("cursors.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "got: {}", err);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_file_unwritable_directory_fails_with_clear_message() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = cursor_test_dir("readonly-dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let file = dir.join("cursors.json");
+        let mut cfg = app_config_with_cursor(file.to_string_lossy().into_owned());
+        let err = cfg.validate().unwrap_err().to_string();
+        // Restore permissions so cleanup succeeds.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(err.contains("is not writable"), "got: {}", err);
+    }
+
+    /// #438: `label()` for a stroops-configured `LargeTransfer` rule must match
+    /// `large_transfer_label`'s output exactly.
+    #[test]
+    fn large_transfer_label_matches_helper_for_stroops() {
+        let rule = AlertRule::LargeTransfer {
+            threshold_xlm: None,
+            threshold_stroops: Some(5_000_000),
+        };
+        assert_eq!(rule.label(), large_transfer_label(None, Some(5_000_000)));
+        assert_eq!(rule.label(), "LargeTransfer(>=0.5XLM)");
+    }
+
+    #[test]
+    fn insufficient_funds_rule_parses_from_toml() {
+        let rule: AlertRule = toml::from_str("type = \"InsufficientFunds\"").unwrap();
+        assert!(matches!(rule, AlertRule::InsufficientFunds));
+        assert_eq!(rule.label(), "InsufficientFunds");
+    }
+
+    #[test]
+    fn rejects_empty_rules() {
+        let mut c = valid_contract();
+        c.rules = vec![];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_threshold() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: Some(0), threshold_stroops: None }];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_too_large_large_transfer_threshold() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::LargeTransfer { threshold_xlm: Some(MAX_LARGE_TRANSFER_THRESHOLD_XLM + 1), threshold_stroops: None }];
+        let err = c.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("LargeTransfer threshold_xlm must be <="));
+    }
+
+    #[test]
+    fn rejects_empty_function_name() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::FunctionCalled {
+            function_name: "  ".into(),
+        }];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_admin_function_names() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::AdminFunctionCalled {
+            function_names: vec![],
+        }];
+        assert!(c.validate().is_err());
+    }
+
+    /// Issue #18: blank entry in function_names should fail validation.
+    #[test]
+    fn rejects_blank_entry_in_admin_function_names() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::AdminFunctionCalled {
+            function_names: vec!["set_admin".into(), " ".into()],
+        }];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("blank"), "expected 'blank' in error, got: {}", err);
+    }
+
+    /// Issue #18: single valid entry in function_names should pass validation.
+    #[test]
+    fn accepts_single_valid_admin_function_name() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::AdminFunctionCalled {
+            function_names: vec!["set_admin".into()],
+        }];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn admin_function_names_normalised_to_lowercase() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::AdminFunctionCalled {
+            function_names: vec!["Set_Admin".into(), "UPGRADE".into()],
+        }];
+        c.validate().unwrap();
+        if let AlertRule::AdminFunctionCalled { function_names } = &c.rules[0] {
+            assert_eq!(function_names, &["set_admin", "upgrade"]);
+        } else {
+            panic!("expected AdminFunctionCalled");
+        }
+    }
+
+    // ── ContractType ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn contract_type_derives_from_contract_id_prefix() {
+        assert_eq!(
+            ContractType::from_contract_id("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            Some(ContractType::Soroban)
+        );
+        assert_eq!(
+            ContractType::from_contract_id("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            Some(ContractType::Classic)
+        );
+        assert_eq!(ContractType::from_contract_id("XABC"), None);
+        assert_eq!(ContractType::from_contract_id(""), None);
+    }
+
+    #[test]
+    fn contract_type_serializes_as_lowercase() {
+        assert_eq!(serde_json::to_string(&ContractType::Soroban).unwrap(), "\"soroban\"");
+        assert_eq!(serde_json::to_string(&ContractType::Classic).unwrap(), "\"classic\"");
+        assert_eq!(
+            serde_json::from_str::<ContractType>("\"soroban\"").unwrap(),
+            ContractType::Soroban
+        );
+        assert_eq!(
+            serde_json::from_str::<ContractType>("\"classic\"").unwrap(),
+            ContractType::Classic
+        );
+    }
+
+    #[test]
+    fn watched_contract_contract_type_matches_id() {
+        let c = valid_contract();
+        assert_eq!(c.contract_type(), ContractType::Soroban);
+
+        let mut classic = valid_contract();
+        classic.contract_id = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into();
+        assert_eq!(classic.contract_type(), ContractType::Classic);
+    }
+
+    #[test]
+    fn network_urls() {
+        assert!(Network::Mainnet.horizon_base_url().contains("horizon.stellar.org"));
+        assert!(Network::Testnet.horizon_base_url().contains("testnet"));
+        assert!(Network::Futurenet.horizon_base_url().contains("futurenet"));
+    }
+
+    #[test]
+    fn network_display_names() {
+        assert_eq!(Network::Mainnet.display_name(), "Stellar Mainnet");
+        assert_eq!(Network::Testnet.display_name(), "Stellar Testnet");
+        assert_eq!(Network::Futurenet.display_name(), "Stellar Futurenet");
+    }
+
+    #[test]
+    fn network_explorer_urls() {
+        assert!(Network::Mainnet.explorer_base_url().contains("public"));
+        assert!(Network::Testnet.explorer_base_url().contains("testnet"));
+    }
+
+    #[test]
+    fn futurenet_explorer_url_points_to_futurenet_path() {
+        assert_eq!(
+            Network::Futurenet.explorer_base_url(),
+            "https://stellar.expert/explorer/futurenet"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_labels() {
+        let c = valid_contract();
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![c.clone(), c],
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            cursor_file: None,
+            max_alerts_per_cycle: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("duplicate contract label"));
+    }
+
+    fn config_with(contracts: Vec<WatchedContract>) -> AppConfig {
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts,
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
+        }
+    }
+
+    #[test]
+    fn rejects_same_label_with_different_contract_ids() {
+        let first = valid_contract();
+        let mut second = valid_contract();
+        second.contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+        let err = config_with(vec![first, second]).validate().unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate contract label 'Test'"),
+            "error should name the label, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn accepts_same_contract_id_on_different_networks() {
+        let testnet = valid_contract();
+        let mut mainnet = valid_contract();
+        mainnet.label = "Mainnet copy".into();
+        mainnet.network = Network::Mainnet;
+        assert!(config_with(vec![testnet, mainnet]).validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_same_contract_id_on_same_network() {
+        let first = valid_contract();
+        let mut second = valid_contract();
+        second.label = "Other label".into();
+        let err = config_with(vec![first, second]).validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate contract_id"), "got: {}", msg);
+        assert!(msg.contains("CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"), "got: {}", msg);
+        assert!(msg.contains("testnet"), "got: {}", msg);
+    }
+
+    #[test]
+    fn appconfig_validate_rejects_empty_contracts() {
+        let mut cfg = AppConfig {
+            poll_interval_seconds: 10,
+            contracts: vec![],
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            cursor_file: None,
+            max_alerts_per_cycle: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("at least one"),
+            "error should mention 'at least one', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn high_fee_threshold_xlm_normalises_to_stroops() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::HighFee { threshold_stroops: 0, threshold_xlm: Some(1) }];
+        c.validate().unwrap();
+        if let AlertRule::HighFee { threshold_stroops, .. } = &c.rules[0] {
+            assert_eq!(*threshold_stroops, 10_000_000, "1 XLM should become 10_000_000 stroops");
+        } else {
+            panic!("expected HighFee");
+        }
+    }
+
+    #[test]
+    fn high_fee_threshold_xlm_zero_is_rejected() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::HighFee { threshold_stroops: 0, threshold_xlm: Some(0) }];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn high_fee_both_thresholds_is_rejected() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::HighFee { threshold_stroops: 100, threshold_xlm: Some(1) }];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("not both"));
+    }
+
+    #[test]
+    fn high_fee_neither_threshold_is_rejected() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::HighFee { threshold_stroops: 0, threshold_xlm: None }];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn source_account_match_accepts_valid_g_address() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "G".to_string() + &"A".repeat(55),
+        }];
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn source_account_match_rejects_wrong_length() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "G".to_string() + &"A".repeat(54),
+        }];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("SourceAccountMatch"));
+    }
+
+    #[test]
+    fn source_account_match_rejects_wrong_prefix() {
+        let mut c = valid_contract();
+        c.rules = vec![AlertRule::SourceAccountMatch {
+            source_account: "C".to_string() + &"A".repeat(55),
+        }];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn tags_accept_valid_key_values() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([
+            ("team".to_string(), "defi".to_string()),
+            ("severity".to_string(), "high".to_string()),
+        ]));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn tags_accept_exactly_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("k".repeat(64), "v".repeat(64))]));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn tags_reject_empty_key() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("".to_string(), "defi".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag key must not be empty"));
+    }
+
+    #[test]
+    fn tags_reject_blank_value() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("team".to_string(), "   ".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag value must not be empty"));
+    }
+
+    #[test]
+    fn tags_reject_key_over_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("k".repeat(65), "v".to_string())]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag key"));
+        assert!(err.to_string().contains("at most 64 characters"));
+    }
+
+    #[test]
+    fn tags_reject_value_over_64_chars() {
+        let mut c = valid_contract();
+        c.tags = Some(HashMap::from([("team".to_string(), "v".repeat(65))]));
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("tag value"));
+    }
+
+    #[test]
+    fn tags_deserialise_from_toml() {
+        let raw = r#"
+            label = "My Contract"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            tags = { team = "defi", env = "prod", severity = "high" }
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let c: WatchedContract = toml::from_str(raw).unwrap();
+        let tags = c.tags.unwrap();
+        assert_eq!(tags.get("team").map(String::as_str), Some("defi"));
+        assert_eq!(tags.len(), 3);
+    }
+
+    #[test]
+    fn source_account_match_deserialises_from_toml() {
+        let raw = r#"
+            type = "SourceAccountMatch"
+            source_account = "GABC"
+        "#;
+        let rule: AlertRule = toml::from_str(raw).unwrap();
+        assert!(matches!(
+            rule,
+            AlertRule::SourceAccountMatch { ref source_account } if source_account == "GABC"
+        ));
+    }
+
+    #[test]
+    fn rejects_poll_interval_too_low() {
+        for val in 0u64..5 {
+            let mut cfg = AppConfig {
+                poll_interval_seconds: val,
+                contracts: vec![],
+                cursor_file: None,
+                http_pool_max_idle_per_host: None,
+                http_tcp_keepalive_secs: None,
+                http_connection_verbose: None,
+                max_alerts_per_cycle: None,
+                http_user_agent: None,
+                webhook_timeout_seconds: None,
+                allow_internal_webhook_urls: None,
+                horizon_startup_check: false,
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("poll_interval_seconds must be >= 5"),
+                "val={} should be rejected: {}", val, err
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_poll_interval_over_max() {
+        let raw = r#"
+            poll_interval_seconds = 9999
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+        let mut cfg: AppConfig = toml::from_str(raw).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn from_file_returns_err_for_missing_file() {
+        let nonexistent_path = std::path::Path::new("/tmp/txwatch_nonexistent_test_config.toml");
+        let result = AppConfig::from_file(nonexistent_path);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("txwatch_nonexistent_test_config.toml"));
+    }
+
+    #[test]
+    fn from_file_handles_utf8_bom_prefix() {
+        let path = std::env::temp_dir().join("txwatch_utf8_bom_test_config.toml");
+        let raw = r#"
+            poll_interval_seconds = 10
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(raw.as_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let result = AppConfig::from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        let cfg = result.expect("config with a leading UTF-8 BOM should parse");
+        assert_eq!(cfg.poll_interval_seconds, 10);
+    }
+
+    #[test]
+    fn from_file_returns_err_for_wrong_type_field() {
+        let path = std::env::temp_dir().join("txwatch_wrong_type_field_test_config.toml");
+        let raw = r#"
+            poll_interval_seconds = "ten"
+            [[contracts]]
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[contracts.rules]]
+            type = "AnyTransaction"
+        "#;
+
+        std::fs::write(&path, raw).unwrap();
+        let result = AppConfig::from_file(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(result.is_err());
+        // `{:#}` renders the full context chain, including the field path.
+        let error_msg = format!("{:#}", result.unwrap_err());
+        assert!(error_msg.contains("failed to parse config file"));
+        assert!(error_msg.contains("field: poll_interval_seconds"));
+    }
+
+    // ── #256: MaxContractCheck tests ──────────────────────────────────────────
+
+    /// Build an AppConfig with `n` distinct contracts for limit testing.
+    fn cfg_with_n_contracts(n: usize) -> AppConfig {
+        let contracts = (0..n)
+            .map(|i| {
+                // Generate a unique 56-char contract ID starting with 'C'.
+                let suffix = format!("{:0>55}", i); // 55 zero-padded digits
+                let contract_id = format!("C{}", &suffix[..55]);
+                WatchedContract {
+                    label: format!("Contract {}", i),
+                    contract_id,
+                    network: Network::Testnet,
+                    rules: vec![AlertRule::AnyTransaction],
+                    webhook_url: "https://example.com/hook".into(),
+                    webhook_secret: None,
+                    test_horizon_base_url: None,
+                    allow_internal_webhook_urls: None,
+                }
+            })
+            .collect();
+
+        AppConfig {
+            poll_interval_seconds: 10,
+            contracts,
+            cursor_file: None,
+            http_pool_max_idle_per_host: None,
+            http_tcp_keepalive_secs: None,
+            http_connection_verbose: None,
+            max_alerts_per_cycle: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
+        }
+    }
+
+    /// #256: Exactly MAX_CONTRACTS contracts should be accepted.
+    #[test]
+    fn accepts_exactly_max_contracts() {
+        let mut cfg = cfg_with_n_contracts(MAX_CONTRACTS);
+        assert!(
+            cfg.validate().is_ok(),
+            "exactly {} contracts should be valid",
+            MAX_CONTRACTS
+        );
+    }
+
+    /// #256: Exceeding MAX_CONTRACTS must return a clear error.
+    #[test]
+    fn rejects_more_than_max_contracts() {
+        let mut cfg = cfg_with_n_contracts(MAX_CONTRACTS + 1);
+        let err = cfg.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too many contracts"),
+            "error should mention 'too many contracts', got: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&MAX_CONTRACTS.to_string()),
+            "error should mention the limit ({}), got: {}",
+            MAX_CONTRACTS,
+            msg
+        );
+    }
+
+    /// #256: The warn threshold is 80% of MAX_CONTRACTS = 80.
+    /// This test documents the threshold value so it doesn't drift silently.
+    #[test]
+    fn warn_threshold_is_80_percent_of_max_contracts() {
+        let warn_threshold = (MAX_CONTRACTS * 80) / 100;
+        assert_eq!(
+            warn_threshold, 80,
+            "80%% of MAX_CONTRACTS ({}) should be 80",
+            MAX_CONTRACTS
+        );
+    }
+
+    /// #256: A config with exactly MAX_CONTRACTS * 80 / 100 + 1 contracts (81)
+    /// is valid (it should pass validation and only log a warning at startup).
+    #[test]
+    fn accepts_81_contracts_warn_threshold_config_is_valid() {
+        let warn_threshold = (MAX_CONTRACTS * 80) / 100; // 80
+        let mut cfg = cfg_with_n_contracts(warn_threshold + 1); // 81
+        assert!(
+            cfg.validate().is_ok(),
+            "{} contracts should be valid (only a warning is emitted at startup)",
+            warn_threshold + 1
+        );
+    }
+}
