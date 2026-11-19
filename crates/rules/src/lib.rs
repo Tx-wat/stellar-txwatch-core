@@ -422,6 +422,15 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
         AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
             eval_time_window(hours_utc, weekdays, wrap_rule.as_deref(), tx, chrono::Utc::now())?
         }
+
+        AlertRule::LedgerSequenceRange { from, to } => {
+            if from > to {
+                bail!("invalid LedgerSequenceRange: from ({}) > to ({})", from, to);
+            }
+            tx.ledger_sequence
+                .map(|seq| seq >= *from && seq <= *to)
+                .unwrap_or(false)
+        }
     })
 }
 
@@ -1056,6 +1065,107 @@ mod tests {
         let tx = make_tx(true, &[], None);
         let payloads = run(&[AlertRule::TransactionFailed], &tx);
         assert!(payloads.is_empty());
+    }
+
+    // ── Issue #499: LedgerSequenceRange ──────────────────────────────────────
+
+    fn ledger_rule(from: u32, to: u32) -> AlertRule {
+        AlertRule::LedgerSequenceRange { from, to }
+    }
+
+    #[test]
+    fn ledger_sequence_range_fires_inside_range() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(500),
+            ..make_tx(true, &[], None)
+        };
+        let payloads = run(&[ledger_rule(100, 1000)], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_type, "LedgerSequenceRange");
+    }
+
+    #[test]
+    fn ledger_sequence_range_does_not_fire_outside_range() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(50),
+            ..make_tx(true, &[], None)
+        };
+        assert!(run(&[ledger_rule(100, 1000)], &tx).is_empty());
+
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(2000),
+            ..make_tx(true, &[], None)
+        };
+        assert!(run(&[ledger_rule(100, 1000)], &tx).is_empty());
+    }
+
+    #[test]
+    fn ledger_sequence_range_fires_on_boundaries() {
+        for seq in [100u32, 1000u32] {
+            let tx = EnrichedTransaction {
+                ledger_sequence: Some(seq),
+                ..make_tx(true, &[], None)
+            };
+            let payloads = run(&[ledger_rule(100, 1000)], &tx);
+            assert_eq!(payloads.len(), 1, "boundary ledger {} should fire", seq);
+        }
+    }
+
+    #[test]
+    fn ledger_sequence_range_fires_on_single_ledger_range() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(42),
+            ..make_tx(true, &[], None)
+        };
+        assert_eq!(run(&[ledger_rule(42, 42)], &tx).len(), 1);
+    }
+
+    #[test]
+    fn ledger_sequence_range_does_not_fire_when_ledger_missing() {
+        let tx = make_tx(true, &[], None);
+        assert!(run(&[ledger_rule(0, u32::MAX)], &tx).is_empty());
+    }
+
+    #[test]
+    fn ledger_sequence_range_invalid_range_does_not_fire() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(500),
+            ..make_tx(true, &[], None)
+        };
+        // from > to is invalid and must not fire even though 500 is "between" them.
+        assert!(run(&[ledger_rule(1000, 100)], &tx).is_empty());
+    }
+
+    // ── Issue #541: TimeWindow wrapping LargeTransfer ────────────────────────
+
+    #[test]
+    fn time_window_with_large_transfer_wrap_fires_inside_hours() {
+        use chrono::TimeZone;
+        let tx = make_tx(true, &[], Some(200_000_000_000));
+        let monday_morning = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let res = eval_time_window(
+            "09:00-17:00",
+            &["Mon".into()],
+            Some("LargeTransfer"),
+            &tx,
+            monday_morning,
+        ).unwrap();
+        assert!(res, "inside business hours with LargeTransfer match should fire");
+    }
+
+    #[test]
+    fn time_window_with_large_transfer_wrap_does_not_fire_outside_hours() {
+        use chrono::TimeZone;
+        let tx = make_tx(true, &[], Some(200_000_000_000));
+        let monday_evening = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 18, 30, 0).unwrap();
+        let res = eval_time_window(
+            "09:00-17:00",
+            &["Mon".into()],
+            Some("LargeTransfer"),
+            &tx,
+            monday_evening,
+        ).unwrap();
+        assert!(!res, "outside business hours must not fire even if LargeTransfer matches");
     }
 
     #[test]

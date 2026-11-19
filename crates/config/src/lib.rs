@@ -405,6 +405,9 @@ impl AlertRule {
                     format!("TimeWindow({}, [{}])", hours_utc, weekdays.join(", "))
                 }
             }
+            AlertRule::LedgerSequenceRange { from, to } => {
+                format!("LedgerSequenceRange({}..{})", from, to)
+            }
         }
     }
 
@@ -423,6 +426,7 @@ impl AlertRule {
             AlertRule::HighFee { .. } => "HighFee".into(),
             AlertRule::SourceAccountMatch { .. } => "SourceAccountMatch".into(),
             AlertRule::TimeWindow { .. } => "TimeWindow".into(),
+            AlertRule::LedgerSequenceRange { .. } => "LedgerSequenceRange".into(),
         }
     }
 }
@@ -508,6 +512,10 @@ pub struct WatchedContract {
     /// Optional inline PEM-encoded client certificate for webhook mTLS.
     #[serde(default)]
     pub webhook_tls_cert_pem: Option<String>,
+    /// Gzip-compress webhook request bodies (Issue #540). When enabled, the body
+    /// is sent with `Content-Encoding: gzip`. Defaults to `false`.
+    #[serde(default)]
+    pub webhook_compress: bool,
 }
 
 /// Maximum length, in characters, of a tag key or value.
@@ -1010,6 +1018,7 @@ mod tests {
             tags: None,
             tls: None,
             webhook_tls_cert_pem: None,
+            webhook_compress: false,
         }
     }
 
@@ -2120,6 +2129,7 @@ mod tests {
                     webhook_secret: None,
                     test_horizon_base_url: None,
                     allow_internal_webhook_urls: None,
+                    webhook_compress: false,
                 }
             })
             .collect();
