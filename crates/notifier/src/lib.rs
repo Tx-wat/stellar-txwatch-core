@@ -189,6 +189,23 @@ pub async fn send_webhook(
     send_webhook_with_backoff(client, url, payload, secret, RETRY_BASE_DELAY, shutdown).await
 }
 
+/// Convenience wrapper around [`send_webhook`] for one-shot callers that have no
+/// meaningful shutdown signal to wire up (e.g. the CLI's `test-webhook` command).
+///
+/// Creates a never-firing shutdown channel internally, so delivery always runs
+/// to completion (or permanent failure) without being aborted mid-backoff.
+pub async fn send_webhook_once(
+    client:  &Client,
+    url:     &str,
+    payload: &AlertPayload,
+    secret:  Option<&str>,
+) -> Result<DeliveryResult> {
+    let (tx, rx) = oneshot::channel();
+    // Keep the sender alive so the receiver never resolves.
+    std::mem::forget(tx);
+    send_webhook(client, url, payload, secret, rx).await
+}
+
 /// Internal variant of [`send_webhook`] that accepts a custom backoff base duration.
 /// Used by tests to speed up retry testing without changing retry count semantics.
 async fn send_webhook_with_backoff(
