@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use txwatch_config::AppConfig;
+use txwatch_config::{AppConfig, TlsConfig, WatchedContract};
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -36,6 +36,43 @@ fn broken_toml_fixture_fails_with_meaningful_error() {
     assert!(
         msg.contains("threshold_xlm must be > 0"),
         "expected a validation failure, got: {}",
+        msg
+    );
+}
+
+#[test]
+fn validate_rejects_unparseable_tls_pem_files() {
+    // Locate a non-PEM fixture shipped with the notifier crate.
+    let not_a_cert = project_root()
+        .join("crates")
+        .join("notifier")
+        .join("tests")
+        .join("fixtures")
+        .join("not-a-certificate.txt");
+    assert!(
+        not_a_cert.is_file(),
+        "expected non-PEM fixture at {}",
+        not_a_cert.display()
+    );
+
+    let contract = WatchedContract {
+        id: "CTEST".to_string(),
+        tls: Some(TlsConfig {
+            client_cert: Some(not_a_cert.to_string_lossy().into_owned()),
+            client_key: Some(not_a_cert.to_string_lossy().into_owned()),
+            ca_cert: None,
+        }),
+        ..WatchedContract::default()
+    };
+
+    let err = contract
+        .validate()
+        .expect_err("validate() should reject unparseable TLS PEM files");
+    let msg = err.to_string();
+
+    assert!(
+        msg.to_lowercase().contains("tls"),
+        "expected validation error to mention the TLS field, got: {}",
         msg
     );
 }
