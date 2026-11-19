@@ -33,44 +33,6 @@ pub(crate) struct Counters {
     pub interval_alerts: AtomicU64,
 }
 
-// ── Startup connectivity check ────────────────────────────────────────────────
-
-/// Send one `GET /fee_stats` to each unique Horizon base URL and warn (never
-/// error) if any check fails. Never aborts startup — misconfiguration is
-/// surfaced early but the poll loop still runs.
-pub(crate) async fn check_horizon_connectivity(client: &Client, cfg: &AppConfig) {
-    let mut urls: Vec<&str> = cfg
-        .contracts
-        .iter()
-        .map(|c| c.network.horizon_base_url())
-        .collect();
-    urls.sort();
-    urls.dedup();
-
-    for url in urls {
-        let probe = format!("{}/fee_stats", url.trim_end_matches('/'));
-        match client.get(&probe).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                debug!(horizon_url = %url, status = %resp.status(), "Horizon startup check OK");
-            }
-            Ok(resp) => {
-                warn!(
-                    horizon_url = %url,
-                    status = %resp.status(),
-                    "Horizon startup check failed: unexpected status"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    horizon_url = %url,
-                    error = %e,
-                    "Horizon startup check failed: request error"
-                );
-            }
-        }
-    }
-}
-
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Backwards-compatible wrapper: default (non-dry) run with no shutdown signal.
@@ -179,10 +141,15 @@ pub async fn run_with_shutdown(
         );
     }
 
-    // ── #380: optional startup connectivity check (warn-only, never aborts) ───
-    if cfg.horizon_startup_check {
-        check_horizon_connectivity(&client, &cfg).await;
-    }
+    // ── #380/#451: optional startup connectivity check (warn-only, never
+    // aborts). Delegates to the single implementation in `horizon.rs`.
+    let horizon_urls: Vec<String> = cfg
+        .contracts
+        .iter()
+        .map(|c| c.network.horizon_base_url().to_string())
+        .collect();
+    crate::horizon::startup_connectivity_check(&client, &horizon_urls, cfg.horizon_startup_check)
+        .await;
 
     // Spawn a background summary logger that never blocks the poll loop.
     let counters_for_summary = Arc::clone(&counters);

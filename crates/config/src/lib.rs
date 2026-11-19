@@ -312,7 +312,33 @@ impl AlertRule {
                     );
                 }
             }
-            AlertRule::TimeWindow { hours_utc, weekdays, .. } => {
+            AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
+                if let Some(wrapped) = wrap_rule {
+                    // Only rule types whose condition can be evaluated from the
+                    // transaction alone are supported here. Types that require
+                    // parameters (function names, thresholds, account IDs) cannot be
+                    // expressed by `wrap_rule: Option<String>`, so reject them at
+                    // validation time rather than silently always-firing (#453).
+                    const SUPPORTED_WRAP_RULES: [&str; 5] = [
+                        "TransactionFailed",
+                        "InsufficientFunds",
+                        "SorobanInvocation",
+                        "LargeTransfer",
+                        "AnyTransaction",
+                    ];
+                    if !SUPPORTED_WRAP_RULES.contains(&wrapped.as_str()) {
+                        bail!(
+                            "contract '{}': TimeWindow wrap_rule '{}' is not supported: \
+                             wrap_rule only accepts rule types that need no parameters \
+                             ({}). Rule types such as FunctionCalled, AdminFunctionCalled, \
+                             HighFee and SourceAccountMatch require parameters that \
+                             wrap_rule cannot express; use them as standalone rules instead.",
+                            contract_label,
+                            wrapped,
+                            SUPPORTED_WRAP_RULES.join(", ")
+                        );
+                    }
+                }
                 let parts: Vec<&str> = hours_utc.split('-').collect();
                 if parts.len() != 2 {
                     bail!(
@@ -1111,6 +1137,55 @@ mod tests {
             wrap_rule: None,
         };
         assert!(bad_weekday.validate("test").is_err());
+    }
+
+    /// #453: `wrap_rule` values that `eval_time_window` cannot evaluate must be
+    /// rejected at validation time instead of silently always-firing.
+    #[test]
+    fn time_window_rejects_unsupported_wrap_rule() {
+        for unsupported in [
+            "FunctionCalled",
+            "AdminFunctionCalled",
+            "HighFee",
+            "SourceAccountMatch",
+            "NotARule",
+        ] {
+            let mut rule = AlertRule::TimeWindow {
+                hours_utc: "09:00-17:00".into(),
+                weekdays: vec!["Mon".into()],
+                wrap_rule: Some(unsupported.into()),
+            };
+            let err = rule.validate("test").unwrap_err().to_string();
+            assert!(
+                err.contains("wrap_rule") && err.contains(unsupported),
+                "expected wrap_rule rejection for '{}', got: {}",
+                unsupported,
+                err
+            );
+        }
+    }
+
+    /// #453: every rule type the evaluator actually handles is accepted.
+    #[test]
+    fn time_window_accepts_supported_wrap_rules() {
+        for supported in [
+            "TransactionFailed",
+            "InsufficientFunds",
+            "SorobanInvocation",
+            "LargeTransfer",
+            "AnyTransaction",
+        ] {
+            let mut rule = AlertRule::TimeWindow {
+                hours_utc: "09:00-17:00".into(),
+                weekdays: vec!["Mon".into()],
+                wrap_rule: Some(supported.into()),
+            };
+            assert!(
+                rule.validate("test").is_ok(),
+                "expected '{}' to be accepted as wrap_rule",
+                supported
+            );
+        }
     }
 
     /// #268: horizon_url is optional and absent by default.
