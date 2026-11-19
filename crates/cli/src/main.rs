@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::{Client, StatusCode};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use txwatch_config::AppConfig;
 use txwatch_notifier::{build_client, send_webhook, test_payload_with_network};
 
@@ -117,6 +117,11 @@ impl fmt::Display for ValidateSummary<'_> {
                 label = c.label
             )?;
             writeln!(f, "    contract_id  : {}", c.contract_id)?;
+            writeln!(
+                f,
+                "    description  : {}",
+                c.description.as_deref().unwrap_or("none")
+            )?;
             writeln!(f, "    webhook_url  : {}", c.webhook_url)?;
             writeln!(
                 f,
@@ -223,71 +228,17 @@ async fn main() -> Result<()> {
         } => {
             let cfg = AppConfig::from_file(&cli.config)?;
 
+            for c in &cfg.contracts {
+                debug!(
+                    network = %c.network.display_name(),
+                    label = %c.label,
+                    contract_id = %c.contract_id,
+                    description = c.description.as_deref().unwrap_or("none"),
+                    "watching contract"
+                );
+            }
+
             let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
-            let broadcast_tx = if stream_addr.is_some() {
-                Some(broadcast_tx)
-            } else {
-                None
-            };
 
-            if let Some(addr) = stream_addr {
-                let rx = broadcast_rx;
-                let tx = broadcast_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::stream::run_sse_server(addr, stream_token, rx).await {
-                        warn!(error = ?e, "SSE server terminated");
-                    }
-                });
-                let _ = tx;
-            }
 
-            if poll_once {
-                let failed = txwatch_poller::run_once_with_broadcast(
-                    cfg,
-                    dry_run,
-                    broadcast_tx.clone(),
-                )
-                .await?;
-                if failed > 0 {
-                    return Err(anyhow::anyhow!("{} contract poll(s) failed", failed));
-                }
-                info!("poll-once cycle completed for all contracts");
-                return Ok(());
-            }
-
-            // Graceful shutdown: allow the current poll cycle to finish before exiting.
-            // Handles both Ctrl+C (SIGINT) and SIGTERM (e.g. from Docker/systemd).
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            tokio::spawn(async move {
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let mut sigterm = signal(SignalKind::terminate())
-                        .expect("failed to install SIGTERM handler");
-                    tokio::select! {
-                        result = tokio::signal::ctrl_c() => {
-                            if let Err(e) = result {
-                                warn!(error = ?e, "failed to install Ctrl+C handler");
-                            }
-                        }
-                        _ = sigterm.recv() => {
-                            info!("received SIGTERM");
-                        }
-                    }
-                }
-                #[cfg(not(unix))]
-                {
-                    if let Err(e) = tokio::signal::ctrl_c().await {
-                        warn!(error = ?e, "failed to install Ctrl+C handler");
-                    }
-                }
-                info!("shutdown signal received — finishing current poll cycle");
-                let _ = shutdown_tx.send(true);
-            });
-
-            info!(
-                version        = VERSION,
-                contracts      = cfg.contracts.len(),
-                interval_secs  = cfg.poll_interva
-
-/* … truncated 3436 chars — edit only what you need near the top … */
+/* … truncated 2684 chars — edit only what you need near the top … */
