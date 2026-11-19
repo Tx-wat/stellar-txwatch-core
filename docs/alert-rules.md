@@ -89,6 +89,9 @@ Matches when the Soroban `invoke_host_function` operation calls exactly `functio
 
 > **Case sensitivity:** `FunctionCalled` is **case-sensitive**: `function_name = "Withdraw"` never matches a transaction that calls `withdraw`. This is intentional, because Soroban function names are case-sensitive symbols and `Withdraw` and `withdraw` are different functions. `AdminFunctionCalled` is the exception: it is case-insensitive (names are lower-cased in validation and compared in lower case at runtime).
 
+> **Note:** This case-sensitivity asymmetry with `AdminFunctionCalled` is a deliberate design decision, not an oversight. `FunctionCalled` matches the exact symbol as written in the config, while `AdminFunctionCalled` normalises names to lowercase at validation time (in `AlertRule::validate()`). Do not assume a differently-cased `function_name` will match — it silently never fires.
+======
+
 ```toml
 [[contracts.rules]]
 type          = "FunctionCalled"
@@ -99,12 +102,17 @@ function_name = "withdraw"
 
 | Field            | Type     | Required | Description                              |
 |------------------|----------|----------|------------------------------------------|
-| `function_names` | [string] | yes      | Non-empty list of function names to watch |
+| `function_names` | [string] | yes      | Non-empty list of function names to watch (case-insensitive) |
 
 Matches when the invoked function is any entry in `function_names`.
-Unlike `FunctionCalled`, this match is **case-insensitive**.
+Unlike `FunctionCalled`, this match is **case-insensitive**: every entry is lower-cased
+at validation time (in `AlertRule::validate()`) and compared in lower case at runtime, so
+`"Set_Admin"`, `"set_admin"` and `"SET_ADMIN"` all match the same function.
 Equivalent to multiple `FunctionCalled` rules but produces a single
 `AdminFunctionCalled([...])` label in the alert.
+
+> **Note:** This case-insensitivity is a deliberate design decision and is the documented
+> exception to `FunctionCalled`'s case-sensitive matching. The asymmetry is intentional.
 
 ```toml
 [[contracts.rules]]
