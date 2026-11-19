@@ -370,10 +370,14 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
 
         AlertRule::SorobanInvocation => !tx.function_names.is_empty(),
 
-        AlertRule::LargeTransfer { threshold_xlm } => {
-            let threshold_stroops = threshold_xlm
-                .checked_mul(10_000_000)
-                .context("threshold_xlm overflow when converting to stroops")?;
+        AlertRule::LargeTransfer { threshold_xlm, threshold_stroops } => {
+            let threshold = match (threshold_xlm, threshold_stroops) {
+                (Some(xlm), None) => xlm
+                    .checked_mul(10_000_000)
+                    .context("threshold_xlm overflow when converting to stroops")?,
+                (None, Some(stroops)) => *stroops,
+                _ => bail!("LargeTransfer requires exactly one of threshold_xlm or threshold_stroops"),
+            };
             tx.amount_stroops
                 .map(|s| s >= threshold)
                 .unwrap_or(false)
@@ -746,7 +750,7 @@ mod tests {
     #[test]
     fn alert_payload_json_includes_all_documented_fields() {
         let tx = make_tx(true, &["transfer"], Some(150_000_000_000));
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }], &tx);
         assert_eq!(payloads.len(), 1);
 
         let json = serde_json::to_value(&payloads[0]).unwrap();
@@ -915,7 +919,7 @@ mod tests {
     fn rule_label_formats_are_stable() {
         assert_eq!(AlertRule::AnyTransaction.label(), "AnyTransaction");
         assert_eq!(AlertRule::TransactionFailed.label(), "TransactionFailed");
-        assert_eq!(AlertRule::LargeTransfer { threshold_xlm: 10_000 }.label(), "LargeTransfer(>=10000XLM)");
+        assert_eq!(AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }.label(), "LargeTransfer(>=10000XLM)");
         assert_eq!(AlertRule::FunctionCalled { function_name: "withdraw".into() }.label(), "FunctionCalled(withdraw)");
         assert_eq!(AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] }.label(), "AdminFunctionCalled([set_admin, upgrade])");
         assert_eq!(AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }.label(), "HighFee(>=10000 stroops)");

@@ -258,7 +258,7 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
-            horizon_base_url_override: None,
+            test_horizon_base_url: None,
         }
     }
 

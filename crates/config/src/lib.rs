@@ -174,9 +174,9 @@ pub enum AlertRule {
     /// converted to stroops during validation); the two are mutually exclusive.
     LargeTransfer {
         #[serde(default)]
-        threshold_stroops: Option<u64>,
-        #[serde(default)]
         threshold_xlm: Option<u64>,
+        #[serde(default)]
+        threshold_stroops: Option<u64>,
     },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
@@ -1917,6 +1917,7 @@ mod tests {
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
                 max_alerts_per_cycle: None,
+                http_user_agent: None,
                 webhook_timeout_seconds: None,
                 allow_internal_webhook_urls: None,
             };
