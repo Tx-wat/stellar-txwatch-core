@@ -34,6 +34,45 @@ subscriptions, no infrastructure beyond a single Rust binary.
   Your webhook receiver     ← Slack, PagerDuty, custom API, etc.
 ```
 
+### Architecture diagram
+
+```mermaid
+flowchart TD
+    subgraph Network["Stellar Network"]
+        SN[Stellar Network]
+    end
+
+    subgraph Horizon["Horizon REST API"]
+        HZ["Horizon REST API<br/>(testnet / mainnet / futurenet)"]
+    end
+
+    subgraph Crates["txwatch crates"]
+        CLI["txwatch (cli binary)"]
+        CFG["txwatch-config"]
+        POLL["txwatch-poller"]
+        RULES["txwatch-rules"]
+        NOTIF["txwatch-notifier"]
+    end
+
+    subgraph Receiver["Your infrastructure"]
+        WH["Your webhook receiver<br/>(Slack, PagerDuty, custom API, etc.)"]
+    end
+
+    SN --> HZ
+    HZ --> POLL
+    POLL --> RULES
+    RULES --> NOTIF
+    NOTIF --> WH
+
+    CLI --> CFG
+    CLI --> POLL
+    CLI --> RULES
+    CLI --> NOTIF
+    POLL --> CFG
+    POLL --> RULES
+    RULES --> CFG
+```
+
 ---
 
 ## Stellar / Soroban primer

@@ -395,10 +395,19 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
                 function_names.iter().any(|n| n.to_lowercase() == f_lower)
             }),
 
-        AlertRule::HighFee { threshold_stroops, .. } => tx
-            .fee_charged_stroops
-            .map(|f| f >= *threshold_stroops)
-            .unwrap_or(false),
+        AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
+            // `threshold_xlm` is converted to stroops during validation; derive the
+            // effective stroop threshold here so the conversion is exercised at eval time.
+            let effective_stroops = match threshold_xlm {
+                Some(xlm) => xlm
+                    .checked_mul(10_000_000)
+                    .context("threshold_xlm overflow when converting to stroops")?,
+                None => *threshold_stroops,
+            };
+            tx.fee_charged_stroops
+                .map(|f| f >= effective_stroops)
+                .unwrap_or(false)
+        }
 
         AlertRule::SourceAccountMatch { source_account } => {
             tx.source_account.as_deref() == Some(source_account.as_str())
@@ -1166,6 +1175,42 @@ mod tests {
         assert!(payloads[0].rule_triggered.contains("upgrade"));
     }
 
+    // ── Issue #546: AdminFunctionCalled is case-insensitive at eval time ──────
+
+    #[test]
+    fn admin_function_called_matches_case_insensitively_set_admin() {
+        let tx = make_tx(true, &["set_admin"], None);
+        let payloads = run(
+            &[AlertRule::AdminFunctionCalled {
+                function_names: vec!["Set_Admin".into()],
+            }],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "AdminFunctionCalled('Set_Admin') should match invoked 'set_admin'"
+        );
+        assert_eq!(payloads[0].rule_type, "AdminFunctionCalled");
+    }
+
+    #[test]
+    fn admin_function_called_matches_case_insensitively_upgrade() {
+        let tx = make_tx(true, &["upgrade"], None);
+        let payloads = run(
+            &[AlertRule::AdminFunctionCalled {
+                function_names: vec!["UPGRADE".into()],
+            }],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "AdminFunctionCalled('UPGRADE') should match invoked 'upgrade'"
+        );
+        assert_eq!(payloads[0].rule_type, "AdminFunctionCalled");
+    }
+
     #[test]
     fn function_called_does_not_fire_when_function_name_is_none() {
         let tx = make_tx(true, &[], None);
@@ -1333,6 +1378,45 @@ mod tests {
             &tx,
         );
         assert!(payloads.is_empty());
+    }
+
+    // ── Issue #556: HighFee threshold_xlm conversion at eval time ────────────
+
+    #[test]
+    fn high_fee_threshold_xlm_fires_at_converted_stroop_threshold() {
+        let mut tx = make_tx(true, &[], None);
+        // 1 XLM = 10_000_000 stroops — exactly at the converted threshold.
+        tx.fee_charged_stroops = Some(10_000_000);
+        let payloads = run(
+            &[AlertRule::HighFee {
+                threshold_stroops: 0,
+                threshold_xlm:     Some(1),
+            }],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "HighFee(threshold_xlm=1) should fire at 10_000_000 stroops"
+        );
+        assert!(payloads[0].rule_triggered.contains("HighFee"));
+    }
+
+    #[test]
+    fn high_fee_threshold_xlm_does_not_fire_one_stroop_below() {
+        let mut tx = make_tx(true, &[], None);
+        tx.fee_charged_stroops = Some(9_999_999);
+        let payloads = run(
+            &[AlertRule::HighFee {
+                threshold_stroops: 0,
+                threshold_xlm:     Some(1),
+            }],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "HighFee(threshold_xlm=1) should not fire at 9_999_999 stroops"
+        );
     }
 
     // ── SourceAccountMatch (issue #303) ───────────────────────────────────────
