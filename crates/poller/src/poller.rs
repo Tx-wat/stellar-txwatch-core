@@ -5,9 +5,10 @@
 //! the integration tests in `tests/` can drive it directly.
 
 use std::{
+    collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -22,6 +23,68 @@ use crate::circuit_breaker::CircuitBreakerMap;
 use crate::cursor::CursorMap;
 use crate::enrichment::fetch_soroban_details;
 use crate::horizon::HorizonPage;
+
+// ── #543: per-contract alert rate limiting ────────────────────────────────────
+
+/// Token bucket rate limiter for a single contract's outbound alerts.
+///
+/// Capacity is `max_alerts_per_minute`; tokens refill continuously at
+/// `max_alerts_per_minute / 60` per second. State persists across poll cycles.
+pub(crate) struct AlertRateLimiter {
+    capacity: f64,
+    refill_per_sec: f64,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl AlertRateLimiter {
+    pub(crate) fn new(max_alerts_per_minute: u32) -> Self {
+        let capacity = max_alerts_per_minute as f64;
+        Self {
+            capacity,
+            refill_per_sec: capacity / 60.0,
+            tokens: capacity,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Refill based on elapsed time, then try to consume one token.
+    /// Returns `true` if an alert may be sent.
+    pub(crate) fn try_acquire(&mut self) -> bool {
+        self.try_acquire_at(Instant::now())
+    }
+
+    /// Testable variant of [`try_acquire`] with an explicit "now".
+    pub(crate) fn try_acquire_at(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+            self.last_refill = now;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Per-contract limiter map, keyed by contract label. Contracts without a
+/// configured `max_alerts_per_minute` are absent from the map (unlimited).
+pub(crate) type AlertRateLimiters = HashMap<String, AlertRateLimiter>;
+
+fn limiter_for<'a>(
+    limiters: &'a mut AlertRateLimiters,
+    contract: &WatchedContract,
+) -> Option<&'a mut AlertRateLimiter> {
+    let max = contract.max_alerts_per_minute?;
+    Some(
+        limiters
+            .entry(contract.label.clone())
+            .or_insert_with(|| AlertRateLimiter::new(max)),
+    )
+}
 
 // ── Summary counters ──────────────────────────────────────────────────────────
 
@@ -131,6 +194,9 @@ pub async fn run_with_shutdown(
     // #374: per-contract circuit breaker state, keyed by contract label.
     let mut breakers = CircuitBreakerMap::new();
 
+    // #543: per-contract alert rate limiter state, persisted across cycles.
+    let mut limiters = AlertRateLimiters::new();
+
     let interval      = Duration::from_secs(cfg.poll_interval_seconds);
     let summary_every = Duration::from_secs(60);
     let counters      = Arc::new(Counters::default());
@@ -232,9 +298,15 @@ pub async fn run_with_shutdown(
                 continue;
             }
 
-            let result =
-                poll_contract_with_http(&client, contract, &mut cursors, dry_run, &webhook_http)
-                    .await;
+            let result = poll_contract_with_http_limited(
+                &client,
+                contract,
+                &mut cursors,
+                dry_run,
+                &webhook_http,
+                &mut limiters,
+            )
+            .await;
             // #352: count every poll attempt (success or failure) per contract.
             #[cfg(feature = "metrics")]
             crate::metrics::inc_poll_cycles(&contract.label);
@@ -357,6 +429,23 @@ pub(crate) async fn poll_contract_with_http(
     dry_run: bool,
     webhook_http: &txwatch_notifier::WebhookHttpConfig,
 ) -> Result<(u64, u64)> {
+    // Standalone callers get a fresh limiter map; the poll loop uses
+    // `poll_contract_with_http_limited` to persist limiter state across cycles.
+    let mut limiters = AlertRateLimiters::new();
+    poll_contract_with_http_limited(client, contract, cursors, dry_run, webhook_http, &mut limiters)
+        .await
+}
+
+/// Like [`poll_contract_with_http`] but threads the per-contract alert rate
+/// limiter state so token buckets persist across poll cycles (#543).
+pub(crate) async fn poll_contract_with_http_limited(
+    client: &Client,
+    contract: &WatchedContract,
+    cursors: &mut CursorMap,
+    dry_run: bool,
+    webhook_http: &txwatch_notifier::WebhookHttpConfig,
+    limiters: &mut AlertRateLimiters,
+) -> Result<(u64, u64)> {
     let start_time = std::time::Instant::now();
     let cursor = cursors.get(&contract.label).map(|s| s.to_string());
     let page = fetch_page(client, contract, cursor.as_deref()).await?;
@@ -388,6 +477,20 @@ pub(crate) async fn poll_contract_with_http(
             if dry_run {
                 info!(rule = %rule.name, hash = %record.hash, "[dry-run] alert would fire");
             } else {
+                // #543: enforce the per-contract alert rate limit, if configured.
+                if let Some(limiter) = limiter_for(limiters, contract) {
+                    if !limiter.try_acquire() {
+                        warn!(
+                            contract = %contract.label,
+                            rule = %rule.name,
+                            hash = %record.hash,
+                            "alert suppressed by rate limiting"
+                        );
+                        #[cfg(feature = "metrics")]
+                        crate::metrics::inc_alerts_suppressed(&contract.label);
+                        continue;
+                    }
+                }
                 match send_webhook(&contract.webhook_url, &rule, &enriched, &webhook_http).await {
                     Ok(()) => alerts_fired += 1,
                     Err(e) => error!(error = %e, rule = %rule.name, "webhook delivery failed"),
@@ -512,5 +615,54 @@ mod tests {
         }
         // 2^3 = 8 intervals skipped after the third failure.
         assert_eq!(breakers.skip_intervals(label), 8);
+    }
+
+    // ── #543: alert rate limiter ─────────────────────────────────────────────
+
+    #[test]
+    fn limiter_exhausts_after_capacity() {
+        let mut limiter = AlertRateLimiter::new(3);
+        let now = Instant::now();
+        assert!(limiter.try_acquire_at(now));
+        assert!(limiter.try_acquire_at(now));
+        assert!(limiter.try_acquire_at(now));
+        // Bucket empty: further acquisitions at the same instant are denied.
+        assert!(!limiter.try_acquire_at(now));
+        assert!(!limiter.try_acquire_at(now));
+    }
+
+    #[test]
+    fn limiter_refills_over_time() {
+        let mut limiter = AlertRateLimiter::new(60); // 1 token per second
+        let start = Instant::now();
+        for _ in 0..60 {
+            assert!(limiter.try_acquire_at(start));
+        }
+        assert!(!limiter.try_acquire_at(start));
+
+        // After one second, exactly one token is available again.
+        let later = start + Duration::from_secs(1);
+        assert!(limiter.try_acquire_at(later));
+        assert!(!limiter.try_acquire_at(later));
+
+        // Refill is capped at capacity.
+        let much_later = start + Duration::from_secs(3600);
+        for _ in 0..60 {
+            assert!(limiter.try_acquire_at(much_later));
+        }
+        assert!(!limiter.try_acquire_at(much_later));
+    }
+
+    #[test]
+    fn limiter_partial_refill_accumulates() {
+        let mut limiter = AlertRateLimiter::new(60); // 1 token per second
+        let start = Instant::now();
+        for _ in 0..60 {
+            assert!(limiter.try_acquire_at(start));
+        }
+        // Half a second yields half a token — not enough yet.
+        assert!(!limiter.try_acquire_at(start + Duration::from_millis(500)));
+        // Another half second completes the token.
+        assert!(limiter.try_acquire_at(start + Duration::from_secs(1)));
     }
 }

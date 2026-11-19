@@ -443,6 +443,8 @@ fn cursor_advances_after_each_transaction() {
         webhook_url: "https://example.com/hook".into(),
         webhook_secret: None,
         horizon_base_url_override: None,
+        max_alerts_per_minute: None,
+        cursor_alias: None,
     };
 
     let mut cursors = CursorMap::new_for_contracts(&[contract]);
@@ -1027,4 +1029,147 @@ async fn circuit_breaker_recovers_after_successful_response() {
         "expected polling to resume after recovery, but saw only {} Horizon requests",
         tx_requests
     );
+}
+
+/// Issue #543: a busy contract with a low `max_alerts_per_minute` must only
+/// deliver the allowed number of webhooks; the rest are suppressed.
+#[tokio::test]
+async fn rate_limit_suppresses_excess_alerts() {
+    let horizon  = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // A single page with 5 matching transactions.
+    let records: Vec<serde_json::Value> = (0..5)
+        .map(|i| {
+            serde_json::json!({
+                "hash":         format!("busy_tx_{}", i),
+                "created_at":   "2024-06-01T10:00:00Z",
+                "successful":   true,
+                "paging_token": format!("{}", i + 1),
+                "fee_charged":  "100",
+                "envelope_xdr": null,
+                "result_xdr":   null
+            })
+        })
+        .collect();
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": records }
+        })))
+        .up_to_n_times(1)
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/transactions/.*/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    // Only 2 webhooks may be delivered despite 5 matching transactions.
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
+    contract.test_horizon_base_url = Some(horizon.uri());
+    contract.max_alerts_per_minute = Some(2);
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        cursor_file: None,
+        max_alerts_per_cycle: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+
+    let requests = receiver.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "rate limiter should deliver at most 2 webhooks, got {}",
+        requests.len()
+    );
+}
+
+/// Issue #547: when the primary label has no cursor entry but a `cursor_alias`
+/// does, polling resumes from the aliased token instead of restarting at "now".
+#[tokio::test]
+async fn cursor_alias_fallback_resumes_from_aliased_token() {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let horizon  = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    // Expect the poll request to include cursor=4242 (the aliased value).
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions.*cursor=4242.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
+    contract.test_horizon_base_url = Some(horizon.uri());
+    contract.label = "renamed-label".into();
+    contract.cursor_alias = Some("old-label".into());
+
+    let tmp = std::env::temp_dir().join(format!(
+        "txwatch_test_cursor_alias_{}.json",
+        std::process::id()
+    ));
+    // Cursor file only contains the old (aliased) label, not the new one.
+    let mapping = serde_json::json!({ "old-label": "4242" });
+    let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp).unwrap();
+    write!(f, "{}", mapping).unwrap();
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        cursor_file: Some(tmp.to_string_lossy().to_string()),
+        max_alerts_per_cycle: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+
+    let horizon_requests = horizon.received_requests().await.unwrap();
+    assert!(
+        horizon_requests
+            .iter()
+            .any(|r| r.url.as_str().contains("cursor=4242")),
+        "expected polling to resume from aliased cursor=4242, requests: {:?}",
+        horizon_requests.iter().map(|r| r.url.as_str()).collect::<Vec<_>>()
+    );
+    assert!(
+        !horizon_requests
+            .iter()
+            .any(|r| r.url.as_str().contains("cursor=now")),
+        "polling must not restart from 'now' when an alias cursor exists"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
 }

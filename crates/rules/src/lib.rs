@@ -155,6 +155,38 @@ pub struct HorizonTransaction {
     pub memo_type: Option<String>,
     /// Memo value; absent when `memo_type` is `"none"`.
     pub memo: Option<String>,
+    /// Ledger sequence number this transaction was included in.
+    ///
+    /// Some Horizon versions return this as a JSON string rather than an integer,
+    /// so a custom deserializer accepts both forms.
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
+    pub ledger: Option<u32>,
+}
+
+/// Deserialize an `Option<u32>` from either a JSON integer or a string containing
+/// a base-10 integer. Absent or `null` fields yield `None`.
+fn deserialize_optional_u32<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrString {
+        Int(u32),
+        Str(String),
+    }
+
+    match Option::<IntOrString>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(IntOrString::Int(n)) => Ok(Some(n)),
+        Some(IntOrString::Str(s)) => s
+            .trim()
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|e| D::Error::custom(format!("invalid ledger value '{}': {}", s, e))),
+    }
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -1441,6 +1473,29 @@ mod tests {
         let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
         assert!(tx.memo_type.is_none());
         assert!(tx.memo.is_none());
+    }
+
+    // ── Issue #544: ledger field accepts string or integer ───────────────────
+
+    #[test]
+    fn horizon_transaction_ledger_accepts_string_value() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1","ledger":"12345678"}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert_eq!(tx.ledger, Some(12_345_678));
+    }
+
+    #[test]
+    fn horizon_transaction_ledger_accepts_integer_value() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1","ledger":12345678}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert_eq!(tx.ledger, Some(12_345_678));
+    }
+
+    #[test]
+    fn horizon_transaction_ledger_is_none_when_absent() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1"}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert!(tx.ledger.is_none());
     }
 
     /// Issue #65: from_horizon must return Err when created_at is not a valid RFC 3339 timestamp.

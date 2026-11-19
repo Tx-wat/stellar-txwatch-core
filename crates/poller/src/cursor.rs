@@ -193,17 +193,53 @@ impl CursorMap {
         state.is_skipped()
     }
 
+    /// Migrate a cursor entry from a previous label (`alias`) to the contract's
+    /// current primary key (`contract_id`).
+    ///
+    /// If the primary key already has an entry, nothing is migrated and `false`
+    /// is returned. Otherwise, if an entry exists under `alias`, its
+    /// [`ContractState`] is copied to `contract_id`, the alias entry is removed,
+    /// and `true` is returned. This lets polling resume from the saved token
+    /// after a contract label is renamed in config (Issue #547).
+    pub fn migrate_alias(&mut self, contract_id: &str, alias: &str) -> bool {
+        if self.0.contains_key(contract_id) {
+            return false;
+        }
+        match self.0.remove(alias) {
+            Some(state) => {
+                debug!(
+                    contract = %contract_id,
+                    alias = %alias,
+                    token = %state.token,
+                    "migrated cursor entry from renamed contract alias"
+                );
+                self.0.insert(contract_id.to_string(), state);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Load a `CursorMap` from a JSON file.
     ///
     /// If the file cannot be read or parsed, logs a warning/debug message and
     /// returns a fresh map initialised to `"now"` for all supplied contracts.
     /// This matches the existing graceful-degradation behaviour in the poller.
+    ///
+    /// If a contract has no entry under its primary key but has a
+    /// `cursor_alias` configured, the entry stored under the alias is migrated
+    /// to the primary key so polling resumes from the saved token rather than
+    /// restarting from `"now"` (Issue #547).
     pub fn load_from_file(path: &Path, contracts: &[WatchedContract]) -> Self {
         match std::fs::read_to_string(path) {
             Ok(raw) => match serde_json::from_str::<CursorMap>(&raw) {
                 Ok(mut map) => {
-                    // Ensure every configured contract has a cursor entry.
+                    // Ensure every configured contract has a cursor entry,
+                    // migrating from a renamed label's alias when needed.
                     for c in contracts {
+                        if let Some(alias) = c.cursor_alias.as_deref() {
+                            map.migrate_alias(&c.contract_id, alias);
+                        }
                         map.0
                             .entry(c.contract_id.clone())
                             .or_insert_with(ContractState::new);
@@ -259,6 +295,14 @@ mod tests {
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
             horizon_base_url_override: None,
+            cursor_alias: None,
+        }
+    }
+
+    fn contract_with_alias(id: &str, alias: &str) -> WatchedContract {
+        WatchedContract {
+            cursor_alias: Some(alias.to_string()),
+            ..contract(id)
         }
     }
 
@@ -442,6 +486,88 @@ mod tests {
         let mut map = CursorMap::new_for_contracts(&[contract(ID_A)]);
         assert!(!map.record_success(ID_A));
         assert_eq!(map.state(ID_A).unwrap().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn load_migrates_cursor_from_alias() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_alias.json");
+        // File has an entry under the old label, not the contract ID.
+        let partial = serde_json::json!({ "old-label": "4242" });
+        std::fs::write(&tmp, partial.to_string()).unwrap();
+
+        let contracts = vec![contract_with_alias(ID_A, "old-label")];
+        let map = CursorMap::load_from_file(&tmp, &contracts);
+
+        assert_eq!(map.get(ID_A), "4242", "cursor should migrate from alias");
+        assert!(
+            map.state("old-label").is_none(),
+            "alias entry should be removed after migration"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_prefers_primary_key_over_alias() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_alias_primary.json");
+        let partial = serde_json::json!({ ID_A: "111", "old-label": "222" });
+        std::fs::write(&tmp, partial.to_string()).unwrap();
+
+        let contracts = vec![contract_with_alias(ID_A, "old-label")];
+        let map = CursorMap::load_from_file(&tmp, &contracts);
+
+        assert_eq!(map.get(ID_A), "111", "primary key should win over alias");
+        assert_eq!(
+            map.get("old-label"),
+            "222",
+            "alias entry left untouched when primary exists"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_without_alias_entry_starts_at_now() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_alias_missing.json");
+        let partial = serde_json::json!({ "unrelated": "999" });
+        std::fs::write(&tmp, partial.to_string()).unwrap();
+
+        let contracts = vec![contract_with_alias(ID_A, "old-label")];
+        let map = CursorMap::load_from_file(&tmp, &contracts);
+
+        assert_eq!(map.get(ID_A), "now");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn migrate_alias_moves_state_and_removes_alias() {
+        let mut map = CursorMap::default();
+        map.set("old-label", "555");
+        map.record_failure("old-label");
+
+        assert!(map.migrate_alias(ID_A, "old-label"));
+        assert_eq!(map.get(ID_A), "555");
+        assert_eq!(map.state(ID_A).unwrap().consecutive_failures, 1);
+        assert!(map.state("old-label").is_none());
+    }
+
+    #[test]
+    fn migrate_alias_is_noop_when_primary_exists() {
+        let mut map = CursorMap::default();
+        map.set(ID_A, "111");
+        map.set("old-label", "222");
+
+        assert!(!map.migrate_alias(ID_A, "old-label"));
+        assert_eq!(map.get(ID_A), "111");
+        assert_eq!(map.get("old-label"), "222");
+    }
+
+    #[test]
+    fn migrate_alias_returns_false_when_alias_missing() {
+        let mut map = CursorMap::default();
+        assert!(!map.migrate_alias(ID_A, "old-label"));
+        assert_eq!(map.get(ID_A), "now");
     }
 
     #[test]

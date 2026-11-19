@@ -26,6 +26,9 @@ label       = "Mainnet Vault"
 contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 network     = "mainnet"
 webhook_url = "https://hooks.example.com/vault-webhook"
+# max_alerts_per_minute caps how many alerts this contract can emit per minute;
+# excess alerts are suppressed (and logged) by a per-contract token bucket.
+max_alerts_per_minute = 60
 
   [[contracts.rules]]
   type = "AnyTransaction"
@@ -50,6 +53,10 @@ network     = "mainnet"
 # webhook_url can differ per contract — this allows routing alerts to different endpoints
 webhook_url = "https://hooks.example.com/bridge-webhook"
 # webhook_secret = "another-secret-token"
+# cursor_alias: previous label of this contract. If the cursor file has no entry
+# for `label`, it is loaded from `cursor_alias` instead, so renaming a contract
+# does not reset polling to "now". Remove once the rename has been picked up.
+# cursor_alias = "Mainnet Bridge"
 
   [[contracts.rules]]
   type          = "HighFee"
@@ -93,3 +100,16 @@ webhook_url = "https://hooks.example.com/bridge-webhook"
 #              contract_id = "C..."   # 56 chars, starts with 'C'
 #              network     = "testnet"
 #              webhook_url = "https://hooks.example.com/my-webhook"
+#
+# 5) Renaming a contract label
+#    Symptom: after changing `label`, polling restarts from "now" and alerts
+#             for older transactions are missed.
+#    Cause:   the cursor file is keyed by label, so the new label has no entry.
+#    Fix:     set cursor_alias = "<old label>" on the renamed contract so the
+#             existing cursor is migrated. Once the new label has been written
+#             to the cursor file, cursor_alias can be removed.
+#
+# 6) Alert flooding
+#    Symptom: a busy contract with an AnyTransaction rule floods the webhook.
+#    Fix:     set max_alerts_per_minute on that contract (e.g. 60). Alerts over
+#             the limit are suppressed and logged instead of being delivered.

@@ -482,6 +482,16 @@ pub struct WatchedContract {
     /// Optional inline PEM-encoded client certificate for webhook mTLS.
     #[serde(default)]
     pub webhook_tls_cert_pem: Option<String>,
+    /// Maximum webhooks sent for this contract per minute (Issue #543).
+    /// Alerts above the limit are logged and suppressed. Unset means unlimited.
+    #[serde(default)]
+    pub max_alerts_per_minute: Option<u64>,
+    /// Previous label of this contract, used to migrate the persisted cursor when
+    /// a contract is renamed in config (Issue #547). When the cursor file has no
+    /// entry for `label`, the poller falls back to the entry stored under
+    /// `cursor_alias`. Unset means no migration.
+    #[serde(default)]
+    pub cursor_alias: Option<String>,
 }
 
 /// Maximum length, in characters, of a tag key or value.
@@ -604,6 +614,28 @@ impl WatchedContract {
                 "contract '{}': webhook_timeout_seconds must be >= 1 when set",
                 self.label
             );
+        }
+
+        if self.max_alerts_per_minute == Some(0) {
+            bail!(
+                "contract '{}': max_alerts_per_minute must be >= 1 when set",
+                self.label
+            );
+        }
+
+        if let Some(alias) = &self.cursor_alias {
+            if alias.trim().is_empty() {
+                bail!(
+                    "contract '{}': cursor_alias must not be empty when set",
+                    self.label
+                );
+            }
+            if alias == &self.label {
+                bail!(
+                    "contract '{}': cursor_alias must differ from the contract label",
+                    self.label
+                );
+            }
         }
 
         if let Some(horizon_url) = &self.horizon_url {
@@ -980,6 +1012,8 @@ mod tests {
             tags: None,
             tls: None,
             webhook_tls_cert_pem: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
         }
     }
 
@@ -1228,6 +1262,97 @@ mod tests {
         c.webhook_timeout_seconds = Some(0);
         let err = c.validate().unwrap_err();
         assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
+    }
+
+    // ── Issue #543: max_alerts_per_minute ────────────────────────────────────
+
+    #[test]
+    fn max_alerts_per_minute_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.max_alerts_per_minute.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn max_alerts_per_minute_is_parsed_from_toml() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            max_alerts_per_minute = 30
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let c: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(c.max_alerts_per_minute, Some(30));
+    }
+
+    #[test]
+    fn rejects_zero_max_alerts_per_minute() {
+        let mut c = valid_contract();
+        c.max_alerts_per_minute = Some(0);
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("max_alerts_per_minute must be >= 1"),
+            "got: {}",
+            err
+        );
+    }
+
+    // ── Issue #547: cursor_alias ─────────────────────────────────────────────
+
+    #[test]
+    fn cursor_alias_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.cursor_alias.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn cursor_alias_is_parsed_from_toml() {
+        let raw = r#"
+            label = "NewName"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            cursor_alias = "OldName"
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let c: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(c.cursor_alias.as_deref(), Some("OldName"));
+    }
+
+    #[test]
+    fn accepts_cursor_alias_differing_from_label() {
+        let mut c = valid_contract();
+        c.cursor_alias = Some("OldLabel".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_cursor_alias() {
+        let mut c = valid_contract();
+        c.cursor_alias = Some("   ".into());
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cursor_alias must not be empty"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_cursor_alias_equal_to_label() {
+        let mut c = valid_contract();
+        c.cursor_alias = Some(c.label.clone());
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cursor_alias must differ from the contract label"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -2020,6 +2145,8 @@ mod tests {
                     webhook_secret: None,
                     test_horizon_base_url: None,
                     allow_internal_webhook_urls: None,
+                    max_alerts_per_minute: None,
+                    cursor_alias: None,
                 }
             })
             .collect();
