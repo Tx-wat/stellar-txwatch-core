@@ -2,12 +2,15 @@
 #![deny(clippy::unwrap_used)]
 
 use anyhow::{anyhow, bail, Context, Result};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_path_to_error::Deserializer as PathDeserializer;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::{fmt, fs, path::Path};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+use std::{fmt, fs, path::Path, path::PathBuf};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -968,6 +971,172 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+}
+
+// ── Config file watching (Issue #538) ─────────────────────────────────────────
+
+/// Default debounce window for coalescing rapid successive config writes.
+pub const DEFAULT_WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Returns `true` when `event` is a write-like change to `target`.
+///
+/// Only `Create`, `Modify` and `Write` kinds are considered; access, metadata
+/// and removal events are ignored. The event must reference `target` itself
+/// (not a sibling file in the same directory).
+fn is_relevant_event(event: &Event, target: &Path) -> bool {
+    let kind_matches = matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Any
+    );
+    if !kind_matches {
+        return false;
+    }
+    event.paths.iter().any(|p| p == target)
+}
+
+/// Debounces a stream of raw filesystem events into coalesced reload signals.
+///
+/// Each call to `wait_for_reload` blocks until at least one relevant event has
+/// been observed, then keeps draining further relevant events until no new one
+/// arrives within `debounce`. This collapses editor "write + rename" bursts
+/// into a single reload.
+struct Debouncer {
+    debounce: Duration,
+}
+
+impl Debouncer {
+    fn new(debounce: Duration) -> Self {
+        Self { debounce }
+    }
+
+    /// Blocks until a reload should be signalled, or returns `None` if the
+    /// event channel is disconnected (watcher dropped).
+    fn wait_for_reload(&self, rx: &Receiver<Event>, target: &Path) -> Option<()> {
+        // Block indefinitely for the first relevant event.
+        loop {
+            match rx.recv() {
+                Ok(event) => {
+                    if is_relevant_event(&event, target) {
+                        break;
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+        // Coalesce any further relevant events arriving within the window.
+        let deadline = Instant::now() + self.debounce;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok(event) => {
+                    if is_relevant_event(&event, target) {
+                        // Extend the window on each new relevant event.
+                        continue;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Some(())
+    }
+}
+
+/// Handle returned by [`ConfigWatcher::new`].
+///
+/// The underlying `notify` watcher is kept alive inside this handle; dropping
+/// it stops watching. Use [`ConfigWatcher::wait_for_reload`] to block until the
+/// config file changes (debounced), or [`ConfigWatcher::try_recv`] for a
+/// non-blocking poll.
+pub struct ConfigWatcher {
+    _watcher: RecommendedWatcher,
+    rx: Receiver<Event>,
+    target: PathBuf,
+    debouncer: Debouncer,
+}
+
+impl ConfigWatcher {
+    /// Starts watching `config_path` for write events.
+    ///
+    /// The parent directory is watched (rather than the file itself) so that
+    /// editors which replace the file via rename are still detected.
+    pub fn new(config_path: &Path) -> Result<Self> {
+        Self::with_debounce(config_path, DEFAULT_WATCH_DEBOUNCE)
+    }
+
+    /// Like [`ConfigWatcher::new`] but with a custom debounce window.
+    pub fn with_debounce(config_path: &Path, debounce: Duration) -> Result<Self> {
+        let target = config_path
+            .canonicalize()
+            .with_context(|| format!("cannot resolve config path '{}'", config_path.display()))?;
+        let parent = target
+            .parent()
+            .map(Path::to_path_buf)
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            if let Ok(event) = res {
+                // Ignore send errors: the receiver was dropped, so nobody cares.
+                let _ = tx.send(event);
+            }
+        })
+        .with_context(|| {
+            format!(
+                "failed to create config file watcher for '{}'",
+                target.display()
+            )
+        })?;
+
+        watcher
+            .watch(&parent, RecursiveMode::NonRecursive)
+            .with_context(|| {
+                format!(
+                    "failed to watch config directory '{}' for changes",
+                    parent.display()
+                )
+            })?;
+
+        Ok(Self {
+            _watcher: watcher,
+            rx,
+            target,
+            debouncer: Debouncer::new(debounce),
+        })
+    }
+
+    /// Blocks until the config file changes (after debouncing).
+    ///
+    /// Returns `false` if the watcher has been shut down (channel closed).
+    pub fn wait_for_reload(&self) -> bool {
+        self.debouncer
+            .wait_for_reload(&self.rx, &self.target)
+            .is_some()
+    }
+
+    /// Non-blocking check for a pending (debounced) reload.
+    ///
+    /// Returns `true` if a reload should be performed now. Note that this does
+    /// not itself wait out the debounce window; callers that need coalescing
+    /// should prefer [`ConfigWatcher::wait_for_reload`].
+    pub fn try_recv(&self) -> bool {
+        let mut saw_relevant = false;
+        while let Ok(event) = self.rx.try_recv() {
+            if is_relevant_event(&event, &self.target) {
+                saw_relevant = true;
+            }
+        }
+        saw_relevant
+    }
+
+    /// Path of the watched config file (canonicalized).
+    pub fn path(&self) -> &Path {
+        &self.target
     }
 }
 
@@ -2201,5 +2370,99 @@ mod tests {
             "{} contracts should be valid (only a warning is emitted at startup)",
             warn_threshold + 1
         );
+    }
+
+    // ── Issue #538: config file watching ─────────────────────────────────────
+
+    fn write_event(path: &Path) -> Event {
+        Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![path.to_path_buf()],
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn is_relevant_event_filters_by_path_and_kind() {
+        let target = Path::new("/tmp/txwatch/config.toml");
+        let other = Path::new("/tmp/txwatch/other.toml");
+
+        assert!(is_relevant_event(&write_event(target), target));
+        assert!(!is_relevant_event(&write_event(other), target));
+
+        let access = Event {
+            kind: EventKind::Access(notify::event::AccessKind::Any),
+            paths: vec![target.to_path_buf()],
+            attrs: Default::default(),
+        };
+        assert!(!is_relevant_event(&access, target));
+
+        let create = Event {
+            kind: EventKind::Create(notify::event::CreateKind::Any),
+            paths: vec![target.to_path_buf()],
+            attrs: Default::default(),
+        };
+        assert!(is_relevant_event(&create, target));
+    }
+
+    #[test]
+    fn debouncer_coalesces_rapid_events_into_one_reload() {
+        let target = PathBuf::from("/tmp/txwatch/config.toml");
+        let (tx, rx) = mpsc::channel();
+        // Three rapid writes.
+        for _ in 0..3 {
+            tx.send(write_event(&target)).unwrap();
+        }
+        let debouncer = Debouncer::new(Duration::from_millis(50));
+        assert!(debouncer.wait_for_reload(&rx, &target).is_some());
+        // All three events were consumed by the single debounced reload.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn debouncer_ignores_irrelevant_events() {
+        let target = PathBuf::from("/tmp/txwatch/config.toml");
+        let other = PathBuf::from("/tmp/txwatch/other.toml");
+        let (tx, rx) = mpsc::channel();
+        tx.send(write_event(&other)).unwrap();
+        tx.send(write_event(&target)).unwrap();
+        let debouncer = Debouncer::new(Duration::from_millis(50));
+        assert!(debouncer.wait_for_reload(&rx, &target).is_some());
+    }
+
+    #[test]
+    fn debouncer_returns_none_when_channel_closes() {
+        let target = PathBuf::from("/tmp/txwatch/config.toml");
+        let (tx, rx) = mpsc::channel::<Event>();
+        drop(tx);
+        let debouncer = Debouncer::new(Duration::from_millis(50));
+        assert!(debouncer.wait_for_reload(&rx, &target).is_none());
+    }
+
+    #[test]
+    fn config_watcher_errors_on_missing_path() {
+        let missing = std::env::temp_dir().join("txwatch-no-such-config-538.toml");
+        let err = ConfigWatcher::new(&missing).unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("cannot resolve config path"),
+            "got: {:#}",
+            err
+        );
+    }
+
+    #[test]
+    fn config_watcher_detects_write() {
+        let dir = std::env::temp_dir().join(format!("txwatch-watch-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        fs::write(&file, "poll_interval_seconds = 10\n").unwrap();
+
+        let watcher = ConfigWatcher::with_debounce(&file, Duration::from_millis(50)).unwrap();
+        assert_eq!(watcher.path(), file.canonicalize().unwrap());
+
+        fs::write(&file, "poll_interval_seconds = 20\n").unwrap();
+        assert!(watcher.wait_for_reload(), "expected a reload signal");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
