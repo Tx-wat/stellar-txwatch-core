@@ -365,21 +365,28 @@ pub(crate) async fn poll_contract_with_http(
     let mut alerts_fired: u64 = 0;
 
     for record in &page.records {
-        let mut enriched = EnrichedTransaction::from_horizon(record);
-
-        // Fall back to a separate operations fetch when inline ops are missing.
-        if enriched.operations.is_empty() {
+        // Extract enrichment data from inline operations when present,
+        // otherwise fall back to a separate operations fetch.
+        let (function_names, amount_stroops) = if !record.operations.is_empty() {
+            extract_soroban_details(record.operations.clone())
+        } else {
             match fetch_soroban_details(client, contract, &record.hash).await {
-                Ok(details) => enriched.soroban = details,
+                Ok(details) => details,
                 Err(e) => {
                     debug!(error = %e, hash = %record.hash, "soroban details fetch failed");
                     #[cfg(feature = "metrics")]
                     crate::metrics::inc_enrichment_errors();
+                    (Vec::new(), None)
                 }
             }
-        } else {
-            enriched.soroban = extract_soroban_details(&enriched.operations);
-        }
+        };
+
+        let enriched = EnrichedTransaction::from_horizon(
+            record.tx.clone(),
+            function_names,
+            amount_stroops,
+            None,
+        )?;
 
         txs_processed += 1;
 
