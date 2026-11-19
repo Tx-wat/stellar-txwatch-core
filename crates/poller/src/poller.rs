@@ -15,7 +15,7 @@ use reqwest::Client;
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract, MAX_CONTRACTS};
-use txwatch_notifier::send_webhook;
+use txwatch_notifier::{send_webhook, AlertPayload, PayloadContext};
 use txwatch_rules::{evaluate, extract_soroban_details, EnrichedTransaction};
 
 use crate::circuit_breaker::CircuitBreakerMap;
@@ -232,9 +232,16 @@ pub async fn run_with_shutdown(
                 continue;
             }
 
-            let result =
-                poll_contract_with_http(&client, contract, &mut cursors, dry_run, &webhook_http)
-                    .await;
+            let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+            let result = poll_contract_with_http(
+                &client,
+                contract,
+                &mut cursors,
+                dry_run,
+                &webhook_http,
+                shutdown_rx,
+            )
+            .await;
             // #352: count every poll attempt (success or failure) per contract.
             #[cfg(feature = "metrics")]
             crate::metrics::inc_poll_cycles(&contract.label);
@@ -344,7 +351,16 @@ pub(crate) async fn poll_contract(
     cursors: &mut CursorMap,
     dry_run: bool,
 ) -> Result<(u64, u64)> {
-    poll_contract_with_http(client, contract, cursors, dry_run, &txwatch_notifier::WebhookHttpConfig::default()).await
+    let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+    poll_contract_with_http(
+        client,
+        contract,
+        cursors,
+        dry_run,
+        &txwatch_notifier::WebhookHttpConfig::default(),
+        shutdown_rx,
+    )
+    .await
 }
 
 /// Like [`poll_contract`] but threads the shared webhook HTTP settings into
@@ -356,6 +372,7 @@ pub(crate) async fn poll_contract_with_http(
     cursors: &mut CursorMap,
     dry_run: bool,
     webhook_http: &txwatch_notifier::WebhookHttpConfig,
+    shutdown_rx: oneshot::Receiver<()>,
 ) -> Result<(u64, u64)> {
     let start_time = std::time::Instant::now();
     let cursor = cursors.get(&contract.label).map(|s| s.to_string());
@@ -388,9 +405,25 @@ pub(crate) async fn poll_contract_with_http(
             if dry_run {
                 info!(rule = %rule.name, hash = %record.hash, "[dry-run] alert would fire");
             } else {
-                match send_webhook(&contract.webhook_url, &rule, &enriched, &webhook_http).await {
-                    Ok(()) => alerts_fired += 1,
-                    Err(e) => error!(error = %e, rule = %rule.name, "webhook delivery failed"),
+                let payload_ctx = PayloadContext {
+                    contract_label: contract.label.clone(),
+                    contract_id: contract.contract_id.clone(),
+                    network: contract.network.as_str().to_string(),
+                    horizon_base: contract.network.horizon_base_url().to_string(),
+                    explorer_base: contract.network.explorer_base_url().to_string(),
+                };
+                let payload = AlertPayload::new(&payload_ctx, &enriched, rule);
+                match send_webhook(
+                    client,
+                    &contract.webhook_url,
+                    &payload,
+                    contract.webhook_secret.as_deref(),
+                    shutdown_rx,
+                )
+                .await
+                {
+                    Ok(_) => alerts_fired += 1,
+                    Err(e) => error!(error = %e, rule = %rule.label(), "webhook delivery failed"),
                 }
             }
         }
