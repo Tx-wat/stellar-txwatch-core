@@ -22,7 +22,8 @@ hex           = { workspace = true }
 [dev-dependencies]
 wiremock      = "0.6"
 tokio         = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
+tracing-test  = "0.2"
 rcgen         = "0.13"
 tokio-rustls  = "0.26"
 hyper         = { version = "1", features = ["server", "http1"] }
