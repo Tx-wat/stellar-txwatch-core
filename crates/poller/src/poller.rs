@@ -141,18 +141,6 @@ pub async fn run_with_shutdown(
     #[cfg(feature = "metrics")]
     crate::metrics::set_contracts_active(n_contracts);
 
-    // ── #256: warn when approaching the contract limit ────────────────────────
-    let warn_threshold = (MAX_CONTRACTS * 80) / 100; // 80 % of 100 = 80
-    if n_contracts > warn_threshold {
-        warn!(
-            contracts    = n_contracts,
-            limit        = MAX_CONTRACTS,
-            "approaching contract limit: {}/{} contracts configured",
-            n_contracts,
-            MAX_CONTRACTS
-        );
-    }
-
     let contracts_list = cfg.contracts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
     let mut networks: Vec<&str> = cfg.contracts.iter().map(|c| c.network.as_str()).collect();
     networks.sort();

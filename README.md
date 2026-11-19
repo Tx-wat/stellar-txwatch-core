@@ -160,6 +160,29 @@ Optional OpenTelemetry trace export: build with `--features opentelemetry` and s
 
 See [docs/configuration.md](docs/configuration.md) for the full reference. For monitoring contracts on Stellar Futurenet, see [docs/futurenet-guide.md](docs/futurenet-guide.md).
 
+### Network configuration
+
+`stellar-txwatch-core` derives the Horizon base URL from each contract's `network`
+(`mainnet`, `testnet`, or `futurenet`). To point a single contract at a custom
+Horizon endpoint, set the optional per-contract `horizon_url` field — there is no
+top-level `rpc_url` key in this repo's config schema.
+
+```toml
+[[contracts]]
+label       = "My Mainnet Contract"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network     = "mainnet"
+webhook_url = "https://hooks.example.com/my-webhook"
+# Optional: override the network-derived Horizon base URL for this contract only.
+horizon_url = "https://horizon.stellar.org"
+```
+
+> **Note:** Soroban-RPC configuration (e.g. a `SOROBAN_RPC_URLS` map or a
+> `rpc_url`/`<API_KEY>` ValidationCloud endpoint) belongs to the sibling
+> [stellar-txwatch-web](https://github.com/Veritas-Vaults-Network/stellar-txwatch-web)
+> project. `stellar-txwatch-core`'s config file does not accept an `rpc_url` key;
+> use `horizon_url` as shown above instead.
+
 ```toml
 poll_interval_seconds = 10
 

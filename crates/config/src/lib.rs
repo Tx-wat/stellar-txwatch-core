@@ -884,6 +884,19 @@ impl AppConfig {
                 MAX_CONTRACTS
             );
         }
+        // #472: warn (but don't block) when the configured contract count exceeds
+        // 80% of the hard cap. Living in `validate()` means this re-fires on every
+        // validation, including a future hot-reload path, rather than only at startup.
+        let warn_threshold = (MAX_CONTRACTS * 80) / 100;
+        if self.contracts.len() > warn_threshold {
+            tracing::warn!(
+                contracts = self.contracts.len(),
+                max_contracts = MAX_CONTRACTS,
+                warn_threshold,
+                "configured contract count exceeds 80% of MAX_CONTRACTS; \
+                 approaching the hard limit"
+            );
+        }
         if let Some(true) = self.allow_internal_webhook_urls {
             for contract in &mut self.contracts {
                 if contract.allow_internal_webhook_urls.is_none() {
