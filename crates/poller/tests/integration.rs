@@ -965,6 +965,56 @@ async fn circuit_breaker_skips_contract_after_consecutive_failures() {
     );
 }
 
+/// Issue #555: a per-contract `horizon_url` override is honoured by the poller.
+/// The contract points at a mock Horizon server via `horizon_url`; if the
+/// override is used, the mock receives the transactions request.
+#[tokio::test]
+async fn per_contract_horizon_url_override_is_used() {
+    let horizon  = MockServer::start().await;
+    let receiver = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path_regex("/accounts/.*/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(helpers::empty_page()))
+        .mount(&horizon)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&receiver)
+        .await;
+
+    let mut contract = helpers::contract(
+        &format!("{}/hook", receiver.uri()),
+        vec![AlertRule::AnyTransaction],
+    );
+    // Use the per-contract override (not the test-only field).
+    contract.horizon_base_url_override = Some(horizon.uri());
+
+    let cfg = AppConfig {
+        poll_interval_seconds: 1,
+        contracts: vec![contract],
+        cursor_file: None,
+        max_alerts_per_cycle: None,
+        http_pool_max_idle_per_host: None,
+        http_tcp_keepalive_secs: None,
+        http_connection_verbose: None,
+    };
+
+    let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
+
+    let horizon_requests = horizon.received_requests().await.unwrap();
+    assert!(
+        horizon_requests
+            .iter()
+            .any(|r| r.url.path().contains("/transactions")),
+        "expected the mock Horizon (per-contract horizon_url override) to receive a \
+         transactions request, but saw none"
+    );
+}
+
 /// Issue #374: the circuit breaker recovers once Horizon starts responding
 /// successfully again, and polling resumes for the contract.
 #[tokio::test]

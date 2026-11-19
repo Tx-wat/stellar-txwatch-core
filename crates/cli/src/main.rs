@@ -203,6 +203,11 @@ async fn main() -> Result<()> {
             }
             let first_contract = &cfg.contracts[0];
             let payload = test_payload_with_network(&label, &first_contract.network);
+
+            // Prefer the explicit --secret flag, otherwise fall back to the
+            // webhook_secret configured for the first contract.
+            let secret = secret.or_else(|| first_contract.webhook_secret.clone());
+
             let client = build_client(Duration::from_secs(timeout))
                 .context("failed to build HTTP client")?;
 
@@ -210,8 +215,23 @@ async fn main() -> Result<()> {
             send_webhook(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
-            let signing = if secret.is_some() { "signed with HMAC-SHA256" } else { "unsigned" };
-            println!("Test webhook delivered successfully to {} ({})", url, signing);
+
+            match secret.as_deref() {
+                Some(s) => {
+                    let signature = txwatch_notifier::sign_payload(&payload, s);
+                    println!("X-TxWatch-Signature: {}", signature);
+                    println!(
+                        "Test webhook delivered successfully to {} (signed with HMAC-SHA256)",
+                        url
+                    );
+                }
+                None => {
+                    println!(
+                        "Test webhook delivered successfully to {} (unsigned)",
+                        url
+                    );
+                }
+            }
         }
 
         Command::Watch {
