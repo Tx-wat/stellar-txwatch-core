@@ -32,6 +32,19 @@ webhook_url = "https://hooks.example.com/test"
   type = "AnyTransaction"
 "#;
 
+const POLL_INTERVAL_TOO_LARGE_CONFIG: &str = r#"
+poll_interval_seconds = 3601
+
+[[contracts]]
+label       = "Test Contract"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/test"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+
 const MULTI_CONTRACT_CONFIG: &str = r#"
 poll_interval_seconds = 10
 
@@ -190,5 +203,29 @@ fn validate_exits_one_for_invalid_contract_id() {
         status.code(),
         Some(1),
         "expected exit code 1 for config with invalid contract ID"
+    );
+}
+
+#[test]
+fn validate_exits_one_for_poll_interval_above_max() {
+    let dir = env::temp_dir();
+    let path = dir.join("txwatch_poll_interval_too_large_test.toml");
+    fs::write(&path, POLL_INTERVAL_TOO_LARGE_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate"])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1 for config with poll_interval_seconds > 3600"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("poll_interval_seconds"),
+        "expected error message to mention poll_interval_seconds, got: {stderr}"
     );
 }

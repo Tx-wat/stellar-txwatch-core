@@ -39,3 +39,36 @@ fn broken_toml_fixture_fails_with_meaningful_error() {
         msg
     );
 }
+
+#[test]
+fn validated_constructor_rejects_poll_interval_over_3600() {
+    let path = project_root().join("config").join("example.toml");
+    let mut cfg = AppConfig::from_file(&path)
+        .expect("example.toml should parse and validate successfully");
+
+    // Programmatic mutation bypasses validation; the validating constructor
+    // must catch the out-of-range poll interval regardless of construction path.
+    cfg.poll_interval_seconds = 3601;
+
+    let err = AppConfig::validated(cfg)
+        .expect_err("poll_interval_seconds > 3600 must be rejected by validated()");
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains("poll_interval_seconds"),
+        "expected a poll_interval_seconds validation failure, got: {}",
+        msg
+    );
+}
+
+#[test]
+fn validated_constructor_accepts_poll_interval_at_boundary() {
+    let path = project_root().join("config").join("example.toml");
+    let mut cfg = AppConfig::from_file(&path)
+        .expect("example.toml should parse and validate successfully");
+
+    cfg.poll_interval_seconds = 3600;
+
+    AppConfig::validated(cfg)
+        .expect("poll_interval_seconds == 3600 should be accepted by validated()");
+}
