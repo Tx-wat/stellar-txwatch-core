@@ -172,10 +172,15 @@ pub async fn run_with_shutdown(
         );
     }
 
-    // ── #380: optional startup connectivity check (warn-only, never aborts) ───
-    if cfg.horizon_startup_check {
-        check_horizon_connectivity(&client, &cfg).await;
-    }
+    // ── #380/#451: optional startup connectivity check (warn-only, never
+    // aborts). Delegates to the single implementation in `horizon.rs`.
+    let horizon_urls: Vec<String> = cfg
+        .contracts
+        .iter()
+        .map(|c| c.network.horizon_base_url().to_string())
+        .collect();
+    crate::horizon::startup_connectivity_check(&client, &horizon_urls, cfg.horizon_startup_check)
+        .await;
 
     // Spawn a background summary logger that never blocks the poll loop.
     let counters_for_summary = Arc::clone(&counters);
