@@ -142,6 +142,10 @@ enum Command {
         /// Optional bearer token for SSE /stream endpoint authentication
         #[arg(long, env = "TXWATCH_STREAM_TOKEN")]
         stream_token: Option<String>,
+
+        /// Only watch contracts whose label matches one of these (comma-separated)
+        #[arg(long, value_delimiter = ',')]
+        contracts: Option<Vec<String>>,
     },
 
     /// Parse and validate the config file, then print a summary
@@ -494,4 +498,4 @@ async fn main() -> Result<()> {
                 contracts      = cfg.contracts.len(),
                 interval_secs  = cfg.poll_interva
 
-/* … truncated 3436 chars — edit only what you need near the top … */
+/* … truncated 1554 chars — edit only what you need near the top … */
