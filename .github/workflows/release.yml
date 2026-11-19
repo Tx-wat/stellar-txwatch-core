@@ -196,3 +196,8 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+# NOTE: CHANGELOG.md and version bumps are automated by release-please
+# (see .github/workflows/release-please.yml). Merging a release-please PR
+# updates Cargo.toml / CHANGELOG.md and creates the `v*` tag that triggers
+# this workflow.

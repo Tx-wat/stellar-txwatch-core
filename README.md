@@ -34,6 +34,45 @@ subscriptions, no infrastructure beyond a single Rust binary.
   Your webhook receiver     ← Slack, PagerDuty, custom API, etc.
 ```
 
+### Architecture diagram
+
+```mermaid
+flowchart TD
+    subgraph Network["Stellar Network"]
+        SN[Stellar Network]
+    end
+
+    subgraph Horizon["Horizon REST API"]
+        HZ["Horizon REST API<br/>(testnet / mainnet / futurenet)"]
+    end
+
+    subgraph Crates["txwatch crates"]
+        CLI["txwatch (cli binary)"]
+        CFG["txwatch-config"]
+        POLL["txwatch-poller"]
+        RULES["txwatch-rules"]
+        NOTIF["txwatch-notifier"]
+    end
+
+    subgraph Receiver["Your infrastructure"]
+        WH["Your webhook receiver<br/>(Slack, PagerDuty, custom API, etc.)"]
+    end
+
+    SN --> HZ
+    HZ --> POLL
+    POLL --> RULES
+    RULES --> NOTIF
+    NOTIF --> WH
+
+    CLI --> CFG
+    CLI --> POLL
+    CLI --> RULES
+    CLI --> NOTIF
+    POLL --> CFG
+    POLL --> RULES
+    RULES --> CFG
+```
+
 ---
 
 ## Stellar / Soroban primer
@@ -283,9 +322,15 @@ See [docs/alert-rules.md](docs/alert-rules.md) for full details.
   "horizon_link":     "https://horizon-testnet.stellar.org/transactions/abc123...",
   "explorer_link":    "https://stellar.expert/explorer/testnet/tx/abc123...",
   "ledger_sequence":  12345678,
-  "source_account":   "GABC..."
+  "source_account":   "GABC...",
+  "tags":             { "team": "payments", "env": "prod" }
 }
 ```
+
+> **Note:** `tags` is optional and is **omitted entirely** from the JSON body when the
+> contract has no `tags` configured, so existing receivers are unaffected. When present it
+> is a JSON object mapping string keys to string values, copied from the contract's
+> `tags` config and useful for routing and filtering in downstream systems.
 
 **Webhook headers:**
 - `Content-Type: application/json`
@@ -563,6 +608,12 @@ To prevent noisy log output during extended idle periods, TxWatch samples `debug
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+Please do **not** open a public issue for security vulnerabilities. See
+[SECURITY.md](SECURITY.md) for supported versions, the responsible-disclosure
+process, and expected response timelines.
 
 ## License
 

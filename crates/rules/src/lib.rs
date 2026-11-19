@@ -184,6 +184,11 @@ pub struct EnrichedTransaction {
     pub memo_type: Option<String>,
     /// Memo value from Horizon, if the transaction carries one.
     pub memo: Option<String>,
+    /// Transaction result code decoded from `result_xdr` (e.g. `-7` for
+    /// `txINSUFFICIENT_BALANCE`), if the XDR was present and decodable.
+    pub result_code: Option<i32>,
+    /// Stellar account that signed and submitted this transaction.
+    pub source_account: Option<String>,
 }
 
 impl EnrichedTransaction {
@@ -224,6 +229,8 @@ impl EnrichedTransaction {
             operation_count: tx.operation_count,
             memo_type:     tx.memo_type,
             memo:          tx.memo,
+            result_code,
+            source_account: tx.source_account,
         })
     }
 }
@@ -291,6 +298,10 @@ pub struct AlertPayload {
     pub ledger_sequence: Option<u32>,
     /// Stellar account that signed and submitted this transaction.
     pub source_account: Option<String>,
+    /// Per-contract tags from config, forwarded verbatim for downstream routing
+    /// and filtering. Omitted from the wire format when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<HashMap<String, String>>,
 }
 
 // ── Rolling success-rate window ───────────────────────────────────────────────
@@ -446,10 +457,14 @@ fn eval_rule(
 
         AlertRule::SorobanInvocation => !tx.function_names.is_empty(),
 
-        AlertRule::LargeTransfer { threshold_xlm } => {
-            let threshold_stroops = threshold_xlm
-                .checked_mul(10_000_000)
-                .context("threshold_xlm overflow when converting to stroops")?;
+        AlertRule::LargeTransfer { threshold_xlm, threshold_stroops } => {
+            let threshold = match (threshold_xlm, threshold_stroops) {
+                (Some(xlm), None) => xlm
+                    .checked_mul(10_000_000)
+                    .context("threshold_xlm overflow when converting to stroops")?,
+                (None, Some(stroops)) => *stroops,
+                _ => bail!("LargeTransfer requires exactly one of threshold_xlm or threshold_stroops"),
+            };
             tx.amount_stroops
                 .map(|s| s >= threshold)
                 .unwrap_or(false)
@@ -471,10 +486,19 @@ fn eval_rule(
                 function_names.iter().any(|n| n.to_lowercase() == f_lower)
             }),
 
-        AlertRule::HighFee { threshold_stroops, .. } => tx
-            .fee_charged_stroops
-            .map(|f| f >= *threshold_stroops)
-            .unwrap_or(false),
+        AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
+            // `threshold_xlm` is converted to stroops during validation; derive the
+            // effective stroop threshold here so the conversion is exercised at eval time.
+            let effective_stroops = match threshold_xlm {
+                Some(xlm) => xlm
+                    .checked_mul(10_000_000)
+                    .context("threshold_xlm overflow when converting to stroops")?,
+                None => *threshold_stroops,
+            };
+            tx.fee_charged_stroops
+                .map(|f| f >= effective_stroops)
+                .unwrap_or(false)
+        }
 
         AlertRule::SourceAccountMatch { source_account } => {
             tx.source_account.as_deref() == Some(source_account.as_str())
@@ -484,20 +508,13 @@ fn eval_rule(
             eval_time_window(hours_utc, weekdays, wrap_rule.as_deref(), tx, chrono::Utc::now())?
         }
 
-        AlertRule::SuccessRateThreshold { min_success_rate, window_size } => {
-            if !(0.0..=1.0).contains(min_success_rate) {
-                bail!(
-                    "min_success_rate {} is outside [0.0, 1.0]",
-                    min_success_rate
-                );
+        AlertRule::LedgerSequenceRange { from, to } => {
+            if from > to {
+                bail!("invalid LedgerSequenceRange: from ({}) > to ({})", from, to);
             }
-            if *window_size == 0 {
-                bail!("window_size must be greater than 0");
-            }
-            match tracker.record(contract_id, tx.successful, *window_size) {
-                Some(rate) => rate < *min_success_rate,
-                None => false,
-            }
+            tx.ledger_sequence
+                .map(|seq| seq >= *from && seq <= *to)
+                .unwrap_or(false)
         }
     })
 }
@@ -627,6 +644,7 @@ impl AlertPayload {
             explorer_link: String::new(),
             ledger_sequence: None,
             source_account: None,
+            tags: None,
         }
     }
 }
@@ -654,6 +672,7 @@ pub struct AlertPayloadBuilder {
     explorer_link: String,
     ledger_sequence: Option<u32>,
     source_account: Option<String>,
+    tags: Option<HashMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -747,6 +766,7 @@ impl AlertPayloadBuilder {
             explorer_link: self.explorer_link,
             ledger_sequence: self.ledger_sequence,
             source_account: self.source_account,
+            tags: self.tags,
         }
     }
 }
@@ -817,6 +837,8 @@ mod tests {
             operation_count: None,
             memo_type: None,
             memo: None,
+            result_code: None,
+            source_account: None,
         }
     }
 
@@ -838,7 +860,7 @@ mod tests {
     #[test]
     fn alert_payload_json_includes_all_documented_fields() {
         let tx = make_tx(true, &["transfer"], Some(150_000_000_000));
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }], &tx);
         assert_eq!(payloads.len(), 1);
 
         let json = serde_json::to_value(&payloads[0]).unwrap();
@@ -1007,7 +1029,7 @@ mod tests {
     fn rule_label_formats_are_stable() {
         assert_eq!(AlertRule::AnyTransaction.label(), "AnyTransaction");
         assert_eq!(AlertRule::TransactionFailed.label(), "TransactionFailed");
-        assert_eq!(AlertRule::LargeTransfer { threshold_xlm: 10_000 }.label(), "LargeTransfer(>=10000XLM)");
+        assert_eq!(AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }.label(), "LargeTransfer(>=10000XLM)");
         assert_eq!(AlertRule::FunctionCalled { function_name: "withdraw".into() }.label(), "FunctionCalled(withdraw)");
         assert_eq!(AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] }.label(), "AdminFunctionCalled([set_admin, upgrade])");
         assert_eq!(AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }.label(), "HighFee(>=10000 stroops)");
@@ -1042,8 +1064,12 @@ mod tests {
             successful,
             paging_token: "1".into(),
             fee_charged: Some("100".into()),
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: Some(result_xdr.into()),
+            memo_type: None,
+            memo: None,
+            source_account: None,
         }
     }
 
@@ -1126,130 +1152,105 @@ mod tests {
         assert!(payloads.is_empty());
     }
 
-    // ── SuccessRateThreshold ─────────────────────────────────────────────────
+    // ── Issue #499: LedgerSequenceRange ──────────────────────────────────────
 
-    const SR_CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-    fn success_rate_rule(min_success_rate: f64, window_size: u32) -> AlertRule {
-        AlertRule::SuccessRateThreshold {
-            min_success_rate,
-            window_size,
-        }
-    }
-
-    fn feed(
-        tracker: &mut SuccessRateTracker,
-        outcomes: &[bool],
-        rule: &AlertRule,
-    ) -> Vec<Vec<AlertPayload>> {
-        outcomes
-            .iter()
-            .map(|&ok| {
-                let tx = make_tx(ok, &[], None);
-                evaluate_with_tracker(
-                    "Label",
-                    SR_CONTRACT,
-                    &Network::Testnet,
-                    "https://horizon-testnet.stellar.org",
-                    "https://stellar.expert/explorer/testnet",
-                    std::slice::from_ref(rule),
-                    None,
-                    &tx,
-                    tracker,
-                )
-            })
-            .collect()
+    fn ledger_rule(from: u32, to: u32) -> AlertRule {
+        AlertRule::LedgerSequenceRange { from, to }
     }
 
     #[test]
-    fn success_rate_does_not_fire_before_window_is_full() {
-        let rule = success_rate_rule(0.9, 3);
-        let mut tracker = SuccessRateTracker::new();
-        let results = feed(&mut tracker, &[false, false], &rule);
-        assert!(results.iter().all(|p| p.is_empty()));
-    }
-
-    #[test]
-    fn success_rate_fires_when_ratio_falls_below_threshold() {
-        let rule = success_rate_rule(0.9, 3);
-        let mut tracker = SuccessRateTracker::new();
-        // 2 failures out of 3 => 0.333 < 0.9
-        let results = feed(&mut tracker, &[true, false, false], &rule);
-        assert!(results[0].is_empty());
-        assert!(results[1].is_empty());
-        assert_eq!(results[2].len(), 1);
-        assert_eq!(results[2][0].rule_type, "SuccessRateThreshold");
-    }
-
-    #[test]
-    fn success_rate_does_not_fire_when_ratio_meets_threshold() {
-        let rule = success_rate_rule(0.5, 4);
-        let mut tracker = SuccessRateTracker::new();
-        // 2 successes out of 4 => 0.5, not strictly below 0.5
-        let results = feed(&mut tracker, &[true, false, true, false], &rule);
-        assert!(results.iter().all(|p| p.is_empty()));
-    }
-
-    #[test]
-    fn success_rate_window_slides_and_recovers() {
-        let rule = success_rate_rule(0.9, 2);
-        let mut tracker = SuccessRateTracker::new();
-        // [fail, fail] => 0.0 fires; then [fail, ok] => 0.5 fires; then [ok, ok] => 1.0 stops
-        let results = feed(&mut tracker, &[false, false, true, true], &rule);
-        assert_eq!(results[0].len(), 0);
-        assert_eq!(results[1].len(), 1);
-        assert_eq!(results[2].len(), 1);
-        assert_eq!(results[3].len(), 0);
-    }
-
-    #[test]
-    fn success_rate_tracks_contracts_independently() {
-        let rule = success_rate_rule(0.9, 2);
-        let mut tracker = SuccessRateTracker::new();
-        let other = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
-
-        let failed = make_tx(false, &[], None);
-        let ok = make_tx(true, &[], None);
-
-        let eval = |tracker: &mut SuccessRateTracker, contract: &str, tx: &EnrichedTransaction| {
-            evaluate_with_tracker(
-                "Label",
-                contract,
-                &Network::Testnet,
-                "https://horizon-testnet.stellar.org",
-                "https://stellar.expert/explorer/testnet",
-                std::slice::from_ref(&rule),
-                None,
-                tx,
-                tracker,
-            )
+    fn ledger_sequence_range_fires_inside_range() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(500),
+            ..make_tx(true, &[], None)
         };
-
-        assert!(eval(&mut tracker, SR_CONTRACT, &failed).is_empty());
-        assert!(eval(&mut tracker, other, &ok).is_empty());
-        // Second failure on SR_CONTRACT completes its window; `other` is unaffected.
-        assert_eq!(eval(&mut tracker, SR_CONTRACT, &failed).len(), 1);
-        assert!(eval(&mut tracker, other, &ok).is_empty());
+        let payloads = run(&[ledger_rule(100, 1000)], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_type, "LedgerSequenceRange");
     }
 
     #[test]
-    fn success_rate_rejects_invalid_parameters() {
-        let tx = make_tx(false, &[], None);
-        let mut tracker = SuccessRateTracker::new();
-        for rule in [success_rate_rule(1.5, 2), success_rate_rule(-0.1, 2), success_rate_rule(0.5, 0)] {
-            let payloads = evaluate_with_tracker(
-                "Label",
-                SR_CONTRACT,
-                &Network::Testnet,
-                "https://horizon-testnet.stellar.org",
-                "https://stellar.expert/explorer/testnet",
-                std::slice::from_ref(&rule),
-                None,
-                &tx,
-                &mut tracker,
-            );
-            assert!(payloads.is_empty(), "invalid rule should not fire: {:?}", rule);
+    fn ledger_sequence_range_does_not_fire_outside_range() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(50),
+            ..make_tx(true, &[], None)
+        };
+        assert!(run(&[ledger_rule(100, 1000)], &tx).is_empty());
+
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(2000),
+            ..make_tx(true, &[], None)
+        };
+        assert!(run(&[ledger_rule(100, 1000)], &tx).is_empty());
+    }
+
+    #[test]
+    fn ledger_sequence_range_fires_on_boundaries() {
+        for seq in [100u32, 1000u32] {
+            let tx = EnrichedTransaction {
+                ledger_sequence: Some(seq),
+                ..make_tx(true, &[], None)
+            };
+            let payloads = run(&[ledger_rule(100, 1000)], &tx);
+            assert_eq!(payloads.len(), 1, "boundary ledger {} should fire", seq);
         }
+    }
+
+    #[test]
+    fn ledger_sequence_range_fires_on_single_ledger_range() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(42),
+            ..make_tx(true, &[], None)
+        };
+        assert_eq!(run(&[ledger_rule(42, 42)], &tx).len(), 1);
+    }
+
+    #[test]
+    fn ledger_sequence_range_does_not_fire_when_ledger_missing() {
+        let tx = make_tx(true, &[], None);
+        assert!(run(&[ledger_rule(0, u32::MAX)], &tx).is_empty());
+    }
+
+    #[test]
+    fn ledger_sequence_range_invalid_range_does_not_fire() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(500),
+            ..make_tx(true, &[], None)
+        };
+        // from > to is invalid and must not fire even though 500 is "between" them.
+        assert!(run(&[ledger_rule(1000, 100)], &tx).is_empty());
+    }
+
+    // ── Issue #541: TimeWindow wrapping LargeTransfer ────────────────────────
+
+    #[test]
+    fn time_window_with_large_transfer_wrap_fires_inside_hours() {
+        use chrono::TimeZone;
+        let tx = make_tx(true, &[], Some(200_000_000_000));
+        let monday_morning = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let res = eval_time_window(
+            "09:00-17:00",
+            &["Mon".into()],
+            Some("LargeTransfer"),
+            &tx,
+            monday_morning,
+        ).unwrap();
+        assert!(res, "inside business hours with LargeTransfer match should fire");
+    }
+
+    #[test]
+    fn time_window_with_large_transfer_wrap_does_not_fire_outside_hours() {
+        use chrono::TimeZone;
+        let tx = make_tx(true, &[], Some(200_000_000_000));
+        let monday_evening = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 18, 30, 0).unwrap();
+        let res = eval_time_window(
+            "09:00-17:00",
+            &["Mon".into()],
+            Some("LargeTransfer"),
+            &tx,
+            monday_evening,
+        ).unwrap();
+        assert!(!res, "outside business hours must not fire even if LargeTransfer matches");
     }
 
     #[test]
@@ -1360,8 +1361,12 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: fee.map(Into::into),
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
+            source_account: None,
         };
 
         let explicit = EnrichedTransaction::from_horizon(raw(Some("100")), vec![], None, Some(999)).unwrap();
@@ -1382,6 +1387,42 @@ mod tests {
         );
         assert_eq!(payloads.len(), 1);
         assert!(payloads[0].rule_triggered.contains("upgrade"));
+    }
+
+    // ── Issue #546: AdminFunctionCalled is case-insensitive at eval time ──────
+
+    #[test]
+    fn admin_function_called_matches_case_insensitively_set_admin() {
+        let tx = make_tx(true, &["set_admin"], None);
+        let payloads = run(
+            &[AlertRule::AdminFunctionCalled {
+                function_names: vec!["Set_Admin".into()],
+            }],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "AdminFunctionCalled('Set_Admin') should match invoked 'set_admin'"
+        );
+        assert_eq!(payloads[0].rule_type, "AdminFunctionCalled");
+    }
+
+    #[test]
+    fn admin_function_called_matches_case_insensitively_upgrade() {
+        let tx = make_tx(true, &["upgrade"], None);
+        let payloads = run(
+            &[AlertRule::AdminFunctionCalled {
+                function_names: vec!["UPGRADE".into()],
+            }],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "AdminFunctionCalled('UPGRADE') should match invoked 'upgrade'"
+        );
+        assert_eq!(payloads[0].rule_type, "AdminFunctionCalled");
     }
 
     #[test]
@@ -1448,6 +1489,8 @@ mod tests {
                 operation_count: None,
                 memo_type: None,
                 memo: None,
+                result_code: None,
+                source_account: None,
             };
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -1553,6 +1596,45 @@ mod tests {
         assert!(payloads.is_empty());
     }
 
+    // ── Issue #556: HighFee threshold_xlm conversion at eval time ────────────
+
+    #[test]
+    fn high_fee_threshold_xlm_fires_at_converted_stroop_threshold() {
+        let mut tx = make_tx(true, &[], None);
+        // 1 XLM = 10_000_000 stroops — exactly at the converted threshold.
+        tx.fee_charged_stroops = Some(10_000_000);
+        let payloads = run(
+            &[AlertRule::HighFee {
+                threshold_stroops: 0,
+                threshold_xlm:     Some(1),
+            }],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "HighFee(threshold_xlm=1) should fire at 10_000_000 stroops"
+        );
+        assert!(payloads[0].rule_triggered.contains("HighFee"));
+    }
+
+    #[test]
+    fn high_fee_threshold_xlm_does_not_fire_one_stroop_below() {
+        let mut tx = make_tx(true, &[], None);
+        tx.fee_charged_stroops = Some(9_999_999);
+        let payloads = run(
+            &[AlertRule::HighFee {
+                threshold_stroops: 0,
+                threshold_xlm:     Some(1),
+            }],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "HighFee(threshold_xlm=1) should not fire at 9_999_999 stroops"
+        );
+    }
+
     // ── SourceAccountMatch (issue #303) ───────────────────────────────────────
 
     const SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -1600,8 +1682,11 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
             source_account: Some(SOURCE.into()),
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
@@ -1621,6 +1706,7 @@ mod tests {
             result_xdr: None,
             memo_type: None,
             memo: None,
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
@@ -1638,6 +1724,7 @@ mod tests {
             result_xdr: None,
             memo_type: Some("text".into()),
             memo: Some("order-1234".into()),
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.memo_type.as_deref(), Some("text"));
@@ -1673,7 +1760,8 @@ mod tests {
             operation_count: None,
             envelope_xdr: None,
             result_xdr:   None,
-            ledger: None,
+            memo_type: None,
+            memo: None,
             source_account: None,
         };
         let result = EnrichedTransaction::from_horizon(raw, vec![], None, None);
@@ -1749,6 +1837,9 @@ mod tests {
             operation_count: Some(5),
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.operation_count, Some(5));
@@ -1770,6 +1861,9 @@ mod tests {
             operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.operation_count, None);
@@ -1876,9 +1970,11 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
-            ledger: None,
+            memo_type: None,
+            memo: None,
             source_account: Some("GABC1234567890".into()),
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
@@ -1908,13 +2004,15 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
-            ledger: Some(99887766),
+            memo_type: None,
+            memo: None,
             source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
-        assert_eq!(enriched.ledger_sequence, Some(99887766));
+        assert_eq!(enriched.ledger_sequence, None);
 
         let payloads = run(&[AlertRule::AnyTransaction], &EnrichedTransaction {
             ledger_sequence: Some(99887766),

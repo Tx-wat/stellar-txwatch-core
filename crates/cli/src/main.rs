@@ -1,14 +1,90 @@
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use reqwest::{Client, StatusCode};
-use tokio::sync::watch;
+use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
-use txwatch_notifier::{build_client, send_webhook, test_payload_with_network};
+use txwatch_notifier::{build_client, send_webhook_once, test_payload_with_network};
 
 mod stream;
+
+/// Debounce window for config file change events.
+const CONFIG_WATCH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Spawns a background task that watches `path` for modifications and reloads
+/// the config into `shared` on each debounced change. Parse/validation failures
+/// are logged and the previous config is retained. The task exits when
+/// `shutdown_rx` observes `true`.
+fn spawn_config_watcher(
+    path: PathBuf,
+    shared: Arc<RwLock<AppConfig>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        use notify::{Event, EventKind, RecursiveMode, Watcher};
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<()>(16);
+        let mut watcher = match notify::recommended_watcher(move |res: notify::Result<Event>| {
+            if let Ok(event) = res {
+                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                    // Non-blocking send; drop if the channel is full (already pending reload).
+                    let _ = event_tx.try_send(());
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e, "failed to create config file watcher; hot-reload disabled");
+                return;
+            }
+        };
+
+        // Watch the parent directory so atomic-rename saves (common editors) are detected.
+        let watch_target = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let Err(e) = watcher.watch(&watch_target, RecursiveMode::NonRecursive) {
+            warn!(error = %e, path = %watch_target.display(), "failed to watch config directory; hot-reload disabled");
+            return;
+        }
+
+        info!(path = %path.display(), "config file watcher started");
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("config file watcher shutting down");
+                        break;
+                    }
+                }
+                evt = event_rx.recv() => {
+                    if evt.is_none() {
+                        break;
+                    }
+                    // Debounce: drain any additional events that arrive within the window.
+                    tokio::time::sleep(CONFIG_WATCH_DEBOUNCE).await;
+                    while event_rx.try_recv().is_ok() {}
+
+                    match AppConfig::from_file(&path) {
+                        Ok(new_cfg) => {
+                            let mut guard = shared.write().await;
+                            *guard = new_cfg;
+                            info!(path = %path.display(), "config reloaded");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, path = %path.display(), "config reload failed; keeping previous config");
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -28,6 +104,10 @@ const VERSION: &str = concat!(
     about   = "Stellar Soroban contract monitor & webhook alert engine"
 )]
 struct Cli {
+    /// Print version information and exit
+    #[arg(short = 'V', long = "version", action = clap::ArgAction::Version)]
+    version: Option<bool>,
+
     /// Path to the TOML config file [env: TXWATCH_CONFIG]
     #[arg(short, long, env = "TXWATCH_CONFIG", default_value = "config/example.toml")]
     config: PathBuf,
@@ -304,7 +384,7 @@ async fn main() -> Result<()> {
                 .context("failed to build HTTP client")?;
 
             info!(url = %url, timeout_secs = timeout, "sending test webhook");
-            send_webhook(&client, &url, &payload, secret.as_deref())
+            send_webhook_once(&client, &url, &payload, secret.as_deref())
                 .await
                 .with_context(|| format!("test webhook to '{}' failed", url))?;
             let signing = if secret.is_some() { "signed with HMAC-SHA256" } else { "unsigned" };
@@ -372,6 +452,15 @@ async fn main() -> Result<()> {
             // Graceful shutdown: allow the current poll cycle to finish before exiting.
             // Handles both Ctrl+C (SIGINT) and SIGTERM (e.g. from Docker/systemd).
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+            // Hot-reload: watch the config file and swap the active config on change.
+            let shared_cfg = Arc::new(RwLock::new(cfg));
+            spawn_config_watcher(
+                cli.config.clone(),
+                Arc::clone(&shared_cfg),
+                shutdown_rx.clone(),
+            );
+
             tokio::spawn(async move {
                 #[cfg(unix)]
                 {
@@ -399,6 +488,7 @@ async fn main() -> Result<()> {
                 let _ = shutdown_tx.send(true);
             });
 
+            let cfg = shared_cfg.read().await.clone();
             info!(
                 version        = VERSION,
                 contracts      = cfg.contracts.len(),

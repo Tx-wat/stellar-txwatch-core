@@ -10,7 +10,7 @@ most common configuration errors.
 | --- | --- | --- |
 | `poll_interval_seconds` | integer | How often the poller checks for new transactions. |
 | `horizon_url` | string (optional) | Base URL of the Horizon server to poll. Defaults to the public Horizon endpoint for the network. |
-| `horizon_startup_check` | boolean (optional) | When `true`, verify Horizon connectivity at startup and fail fast if it is unreachable (default: `false`). |
+| `horizon_startup_check` | boolean (optional) | When `true`, probe Horizon connectivity once at startup. The check is warn-only: failures are logged and never abort startup (default: `false`). |
 | `http_user_agent` | string (optional) | Custom HTTP User-Agent header for Horizon requests (default: `txwatch/<version>`). |
 | `webhook_timeout_seconds` | integer (optional) | Timeout for each webhook delivery attempt, in seconds (default: `15`). Applies to all webhook deliveries, including contracts using TLS or pinned-certificate clients. |
 | `max_alerts_per_cycle` | integer (optional) | Upper bound on the number of alerts dispatched per polling cycle (default: `100`). |
