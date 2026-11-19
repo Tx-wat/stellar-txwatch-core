@@ -28,6 +28,10 @@ const VERSION: &str = concat!(
     about   = "Stellar Soroban contract monitor & webhook alert engine"
 )]
 struct Cli {
+    /// Print version information and exit
+    #[arg(short = 'V', long = "version", action = clap::ArgAction::Version)]
+    version: Option<bool>,
+
     /// Path to the TOML config file [env: TXWATCH_CONFIG]
     #[arg(short, long, env = "TXWATCH_CONFIG", default_value = "config/example.toml")]
     config: PathBuf,

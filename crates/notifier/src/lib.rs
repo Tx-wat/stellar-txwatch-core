@@ -5,11 +5,14 @@
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use hex;
 use hmac::{Hmac, Mac};
 use reqwest::{Certificate, Client, Identity};
 use sha2::Sha256;
 use std::fs;
+use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
@@ -189,6 +192,22 @@ pub async fn send_webhook(
     send_webhook_with_backoff(client, url, payload, secret, RETRY_BASE_DELAY, shutdown).await
 }
 
+/// Like [`send_webhook`], but gzip-compresses the request body and sets
+/// `Content-Encoding: gzip` when `compress` is `true` (Issue #540).
+pub async fn send_webhook_with_compression(
+    client:   &Client,
+    url:      &str,
+    payload:  &AlertPayload,
+    secret:   Option<&str>,
+    compress: bool,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    send_webhook_with_backoff_opts(
+        client, url, payload, secret, compress, RETRY_BASE_DELAY, shutdown,
+    )
+    .await
+}
+
 /// Internal variant of [`send_webhook`] that accepts a custom backoff base duration.
 /// Used by tests to speed up retry testing without changing retry count semantics.
 async fn send_webhook_with_backoff(
@@ -196,6 +215,34 @@ async fn send_webhook_with_backoff(
     url:           &str,
     payload:       &AlertPayload,
     secret:        Option<&str>,
+    backoff_base:  Duration,
+    mut shutdown:  oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    send_webhook_with_backoff_opts(
+        client, url, payload, secret, false, backoff_base, shutdown,
+    )
+    .await
+}
+
+/// Gzip-compress `data` at the default compression level.
+fn gzip_compress(data: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(data)
+        .map_err(|e| anyhow!("failed to gzip-compress webhook body: {}", e))?;
+    encoder
+        .finish()
+        .map_err(|e| anyhow!("failed to gzip-compress webhook body: {}", e))
+}
+
+/// Core delivery loop. When `compress` is `true` the serialized payload is
+/// gzip-compressed and sent with `Content-Encoding: gzip` (Issue #540).
+async fn send_webhook_with_backoff_opts(
+    client:        &Client,
+    url:           &str,
+    payload:       &AlertPayload,
+    secret:        Option<&str>,
+    compress:      bool,
     backoff_base:  Duration,
     mut shutdown:  oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
@@ -207,7 +254,14 @@ async fn send_webhook_with_backoff(
     );
     let _enter = span.enter();
 
-    let body = serde_json::to_string(payload)?;
+    let json_body = serde_json::to_string(payload)?;
+    // The signature is always computed over the uncompressed JSON body so that
+    // receivers can verify it after decompressing (Issue #540).
+    let body: Vec<u8> = if compress {
+        gzip_compress(json_body.as_bytes())?
+    } else {
+        json_body.clone().into_bytes()
+    };
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 1..=MAX_RETRIES {
@@ -228,10 +282,14 @@ async fn send_webhook_with_backoff(
             .header("X-TxWatch-Idempotency-Key", idempotency_key)
             .body(body.clone());
 
+        if compress {
+            req = req.header("Content-Encoding", "gzip");
+        }
+
         if let Some(s) = secret {
             let mut mac = Hmac::<Sha256>::new_from_slice(s.as_bytes())
                 .expect("HMAC accepts any key length");
-            mac.update(body.as_bytes());
+            mac.update(json_body.as_bytes());
             let sig = hex::encode(mac.finalize().into_bytes());
             req = req.header("X-TxWatch-Signature", format!("sha256={}", sig));
         }
@@ -415,6 +473,21 @@ pub(crate) async fn send_webhook_with_backoff_test(
     let (_tx, rx) = oneshot::channel();
     std::mem::forget(_tx);
     send_webhook_with_backoff(client, url, payload, secret, backoff_base, rx).await
+}
+
+/// Test-only: call the compression-aware delivery loop with a custom backoff base.
+#[cfg(test)]
+pub(crate) async fn send_webhook_with_compression_test(
+    client:       &Client,
+    url:          &str,
+    payload:      &AlertPayload,
+    secret:       Option<&str>,
+    compress:     bool,
+    backoff_base: Duration,
+) -> Result<DeliveryResult> {
+    let (_tx, rx) = oneshot::channel();
+    std::mem::forget(_tx);
+    send_webhook_with_backoff_opts(client, url, payload, secret, compress, backoff_base, rx).await
 }
 
 #[cfg(test)]
@@ -959,6 +1032,92 @@ mod tests {
         let url    = format!("{}/hook", server.uri());
         let result = send_webhook(&client, &url, &sample_payload(), None, dummy_shutdown()).await;
         assert!(result.is_ok());
+    }
+
+    /// Issue #540: when compression is enabled the body is gzip-compressed and
+    /// `Content-Encoding: gzip` is set; the signature covers the uncompressed JSON.
+    #[tokio::test]
+    async fn compressed_webhook_sends_gzip_body() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .and(header("content-encoding", "gzip"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let payload = sample_payload();
+        let json_body = serde_json::to_string(&payload).unwrap();
+        let secret = "compress-secret";
+
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        let delivery = send_webhook_with_compression_test(
+            &client, &url, &payload, Some(secret), true, Duration::ZERO,
+        )
+        .await
+        .expect("compressed delivery should succeed");
+        assert_eq!(delivery.final_status, 200);
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert_eq!(
+            req.headers.get("content-encoding").unwrap(),
+            "gzip",
+            "compressed request must advertise gzip encoding"
+        );
+
+        // Body must decompress back to the original JSON.
+        let mut decoder = GzDecoder::new(req.body.as_slice());
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+        assert_eq!(decompressed, json_body);
+
+        // Signature is computed over the uncompressed JSON body.
+        let sig = req.headers.get("x-txwatch-signature").unwrap().to_str().unwrap();
+        assert!(verify_signature_constant_time(
+            secret.as_bytes(),
+            json_body.as_bytes(),
+            sig
+        ));
+    }
+
+    /// Issue #540: without compression the body is sent as plain JSON and no
+    /// `Content-Encoding` header is present.
+    #[tokio::test]
+    async fn uncompressed_webhook_sends_plain_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let payload = sample_payload();
+        let json_body = serde_json::to_string(&payload).unwrap();
+
+        let client = build_client().unwrap();
+        let url = format!("{}/hook", server.uri());
+        send_webhook_with_compression_test(
+            &client, &url, &payload, None, false, Duration::ZERO,
+        )
+        .await
+        .expect("uncompressed delivery should succeed");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert!(
+            !req.headers.contains_key("content-encoding"),
+            "uncompressed request must not set Content-Encoding"
+        );
+        assert_eq!(req.body, json_body.as_bytes());
     }
 
     #[tokio::test]
