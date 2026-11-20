@@ -32,6 +32,19 @@ webhook_url = "https://hooks.example.com/test"
   type = "AnyTransaction"
 "#;
 
+const POLL_INTERVAL_TOO_LARGE_CONFIG: &str = r#"
+poll_interval_seconds = 3601
+
+[[contracts]]
+label       = "Test Contract"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/test"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+
 const MULTI_CONTRACT_CONFIG: &str = r#"
 poll_interval_seconds = 10
 
