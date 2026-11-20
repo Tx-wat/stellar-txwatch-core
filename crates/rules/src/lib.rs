@@ -155,6 +155,38 @@ pub struct HorizonTransaction {
     pub memo_type: Option<String>,
     /// Memo value; absent when `memo_type` is `"none"`.
     pub memo: Option<String>,
+    /// Ledger sequence number this transaction was included in.
+    ///
+    /// Some Horizon versions return this as a JSON string rather than an integer,
+    /// so a custom deserializer accepts both forms.
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
+    pub ledger: Option<u32>,
+}
+
+/// Deserialize an `Option<u32>` from either a JSON integer or a string containing
+/// a base-10 integer. Absent or `null` fields yield `None`.
+fn deserialize_optional_u32<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrString {
+        Int(u32),
+        Str(String),
+    }
+
+    match Option::<IntOrString>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(IntOrString::Int(n)) => Ok(Some(n)),
+        Some(IntOrString::Str(s)) => s
+            .trim()
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|e| D::Error::custom(format!("invalid ledger value '{}': {}", s, e))),
+    }
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -591,17 +623,23 @@ impl AlertPayload {
             contract_id: ctx.contract_id.to_string(),
             contract_type: ContractType::from_contract_id(ctx.contract_id),
             network: ctx.network.to_string(),
-            rule_type: rule_type(rule),
-            rule_triggered: rule_label(rule),
+            rule_type: rule.rule_type(),
+            rule_triggered: rule.label(),
             transaction_hash: tx.hash.clone(),
             function_name: tx.function_names.first().cloned(),
             function_names: tx.function_names.clone(),
             amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+            amount_stroops: tx.amount_stroops,
             fee_charged_stroops: tx.fee_charged_stroops,
+            operation_count: tx.operation_count,
+            memo_type: tx.memo_type.clone(),
+            memo: tx.memo.clone(),
             timestamp: tx.timestamp.timestamp(),
             timestamp_iso: tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             horizon_link: format!("{}/transactions/{}", horizon_base, tx.hash),
             explorer_link: format!("{}/tx/{}", explorer_base, tx.hash),
+            ledger_sequence: tx.ledger_sequence,
+            source_account: tx.source_account.clone(),
             tags: ctx.tags.cloned(),
         }
     }
@@ -817,6 +855,58 @@ mod tests {
         ).unwrap();
         assert!(!res_sunday, "Sunday should be suppressed");
     }
+
+    // ── Issue #454: wrap_rule must not always fire ───────────────────────────
+
+    /// Issue #454: for every `AlertRule` variant name used as a `wrap_rule`, a
+    /// transaction crafted NOT to match that rule's condition must yield
+    /// `Ok(false)` from `eval_time_window` — not the always-true fallthrough.
+    #[test]
+    fn time_window_wrap_rule_does_not_fire_when_inner_rule_does_not_match() {
+        use chrono::TimeZone;
+
+        // A transaction that matches none of the wrapped rule conditions:
+        // successful, no functions, no amount, no fee, no source account,
+        // no result code.
+        let tx = make_tx(true, &[], None);
+
+        // A time that is inside the window so the window itself does not
+        // short-circuit to false — we want to exercise the wrap_rule matcher.
+        let inside = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+
+        let variants = [
+            "AnyTransaction",
+            "TransactionFailed",
+            "InsufficientFunds",
+            "SorobanInvocation",
+            "LargeTransfer",
+            "FunctionCalled",
+            "AdminFunctionCalled",
+            "HighFee",
+            "SourceAccountMatch",
+        ];
+
+        for variant in variants {
+            // AnyTransaction always matches by definition, so skip it here.
+            if variant == "AnyTransaction" {
+                continue;
+            }
+            let result = eval_time_window(
+                "09:00-17:00",
+                &[],
+                Some(variant),
+                &tx,
+                inside,
+            )
+            .unwrap_or_else(|e| panic!("eval_time_window errored for {}: {}", variant, e));
+            assert!(
+                !result,
+                "wrap_rule {:?} fired for a non-matching transaction (should be false)",
+                variant
+            );
+        }
+    }
+
     use txwatch_config::{AlertRule, Network};
 
     fn make_tx(
@@ -877,11 +967,17 @@ mod tests {
             "function_name",
             "function_names",
             "amount_xlm",
+            "amount_stroops",
             "fee_charged_stroops",
+            "operation_count",
+            "memo_type",
+            "memo",
             "timestamp",
             "timestamp_iso",
             "horizon_link",
             "explorer_link",
+            "ledger_sequence",
+            "source_account",
         ];
         for field in documented {
             assert!(object.contains_key(field), "missing documented field: {}", field);
@@ -958,6 +1054,88 @@ mod tests {
         let payloads = run(&[AlertRule::AnyTransaction], &tx);
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].rule_triggered, "AnyTransaction");
+    }
+
+    /// Issue #444: every README-documented payload field round-trips through
+    /// `AlertPayload::new()` for a fully-populated `EnrichedTransaction`.
+    #[test]
+    fn alert_payload_new_populates_all_documented_fields() {
+        let ctx = PayloadContext {
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: "https://stellar.expert/explorer/testnet",
+            tags: None,
+        };
+        let mut tx = make_tx(true, &["transfer", "withdraw"], Some(150_000_000_000));
+        tx.fee_charged_stroops = Some(500);
+        tx.operation_count = Some(3);
+        tx.memo_type = Some("text".into());
+        tx.memo = Some("order-1234".into());
+        tx.ledger_sequence = Some(99887766);
+        tx.source_account = Some("GABC1234567890".into());
+
+        let payload = AlertPayload::new(&ctx, &tx, &AlertRule::AnyTransaction);
+
+        assert_eq!(payload.label, "Label");
+        assert_eq!(payload.contract_id, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(payload.contract_type, ContractType::Soroban);
+        assert_eq!(payload.network, "testnet");
+        assert_eq!(payload.rule_type, "AnyTransaction");
+        assert_eq!(payload.rule_triggered, "AnyTransaction");
+        assert_eq!(payload.transaction_hash, "abc123");
+        assert_eq!(payload.function_name.as_deref(), Some("transfer"));
+        assert_eq!(payload.function_names, vec!["transfer", "withdraw"]);
+        assert_eq!(payload.amount_xlm, Some(15_000));
+        assert_eq!(payload.amount_stroops, Some(150_000_000_000));
+        assert_eq!(payload.fee_charged_stroops, Some(500));
+        assert_eq!(payload.operation_count, Some(3));
+        assert_eq!(payload.memo_type.as_deref(), Some("text"));
+        assert_eq!(payload.memo.as_deref(), Some("order-1234"));
+        assert_eq!(payload.timestamp, tx.timestamp.timestamp());
+        assert_eq!(payload.timestamp_iso, "2024-01-15T12:00:00Z");
+        assert_eq!(
+            payload.horizon_link,
+            "https://horizon-testnet.stellar.org/transactions/abc123"
+        );
+        assert_eq!(
+            payload.explorer_link,
+            "https://stellar.expert/explorer/testnet/tx/abc123"
+        );
+        assert_eq!(payload.ledger_sequence, Some(99887766));
+        assert_eq!(payload.source_account.as_deref(), Some("GABC1234567890"));
+
+        // The serialized JSON must contain every documented field.
+        let json = serde_json::to_value(&payload).unwrap();
+        let object = json.as_object().unwrap();
+        let documented = [
+            "label",
+            "contract_id",
+            "contract_type",
+            "network",
+            "rule_type",
+            "rule_triggered",
+            "transaction_hash",
+            "function_name",
+            "function_names",
+            "amount_xlm",
+            "amount_stroops",
+            "fee_charged_stroops",
+            "operation_count",
+            "memo_type",
+            "memo",
+            "timestamp",
+            "timestamp_iso",
+            "horizon_link",
+            "explorer_link",
+            "ledger_sequence",
+            "source_account",
+        ];
+        for field in documented {
+            assert!(object.contains_key(field), "missing documented field: {}", field);
+        }
+        assert_eq!(object.len(), documented.len(), "undocumented fields present: {:?}", object.keys());
     }
 
     #[test]
@@ -1746,6 +1924,29 @@ mod tests {
         let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
         assert!(tx.memo_type.is_none());
         assert!(tx.memo.is_none());
+    }
+
+    // ── Issue #544: ledger field accepts string or integer ───────────────────
+
+    #[test]
+    fn horizon_transaction_ledger_accepts_string_value() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1","ledger":"12345678"}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert_eq!(tx.ledger, Some(12_345_678));
+    }
+
+    #[test]
+    fn horizon_transaction_ledger_accepts_integer_value() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1","ledger":12345678}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert_eq!(tx.ledger, Some(12_345_678));
+    }
+
+    #[test]
+    fn horizon_transaction_ledger_is_none_when_absent() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1"}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert!(tx.ledger.is_none());
     }
 
     /// Issue #65: from_horizon must return Err when created_at is not a valid RFC 3339 timestamp.

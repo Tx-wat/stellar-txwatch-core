@@ -188,13 +188,227 @@ fn run_test_webhook(config: &PathBuf, url: &str, extra: &[&str]) -> Output {
     txwatch_bin().args(&args).output().expect("failed to run txwatch")
 }
 
-/// Computes the expected `sha256=<hex>` signature for a body and secret.
-fn expected_signature(secret: &[u8], body: &[u8]) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
-    mac.update(body);
-    let digest = mac.finalize().into_bytes();
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    format!("sha256={hex}")
+/// Reads SSE events from `reader` until an event whose `event:` line equals
+/// `event_name` is seen (or the stream ends), returning the raw event block.
+fn read_sse_event_until<R: BufRead>(reader: &mut R, event_name: &str) -> Option<String> {
+    let mut current = String::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            return None;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            if !current.is_empty() {
+                let is_match = current
+                    .lines()
+                    .any(|l| l.trim() == format!("event: {event_name}"));
+                if is_match {
+                    return Some(current);
+                }
+                current.clear();
+            }
+            continue;
+        }
+        current.push_str(trimmed);
+        current.push('\n');
+    }
+}
+
+/// Spawns a receiver that accepts `count` sequential HTTP requests, replying
+/// with `status_line` to each, so the SSE test can observe both a successful
+/// and a failed webhook delivery.
+fn spawn_multi_status_receiver(
+    count: usize,
+    status_line: &'static str,
+) -> (String, JoinHandle<Vec<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+
+    let handle = thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for _ in 0..count {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut content_length = 0usize;
+
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+            }
+
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let response = format!(
+                "{status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            reader.get_mut().write_all(response.as_bytes()).unwrap();
+            bodies.push(body);
+        }
+        bodies
+    });
+
+    (url, handle)
+}
+
+#[test]
+fn test_stream_emits_webhook_delivery_status_events() {
+    let cfg_path = write_valid_config("txwatch_test_stream_delivery.toml");
+
+    // First delivery succeeds (200), second fails (500) so the stream should
+    // emit both `delivery:success` and `delivery:failed` events.
+    let (ok_url, ok_receiver) = spawn_multi_status_receiver(1, "HTTP/1.1 200 OK");
+    let (fail_url, fail_receiver) =
+        spawn_multi_status_receiver(1, "HTTP/1.1 500 Internal Server Error");
+
+    let mut child = txwatch_bin()
+        .args([
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "stream",
+            "--port",
+            "0",
+            "--webhook-url",
+            &ok_url,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn txwatch stream");
+
+    // Give the server a moment to bind and print its listening address.
+    thread::sleep(Duration::from_millis(500));
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    // Discover the bound port from the startup banner.
+    let mut port = None;
+    for _ in 0..20 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if let Some(idx) = line.find("127.0.0.1:") {
+            let rest = &line[idx + "127.0.0.1:".len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(p) = digits.parse::<u16>() {
+                port = Some(p);
+                break;
+            }
+        }
+    }
+    let port = port.expect("stream did not report a listening address");
+
+    // Connect to the SSE endpoint.
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n")
+        .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut sse = BufReader::new(stream);
+
+    // Skip HTTP response headers.
+    loop {
+        let mut line = String::new();
+        if sse.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if line.trim_end().is_empty() {
+            break;
+        }
+    }
+
+    // The first delivery (success) should surface as a `delivery:success` event.
+    let success_event = read_sse_event_until(&mut sse, "delivery:success")
+        .expect("expected a delivery:success SSE event");
+    assert!(
+        success_event.contains("delivery_status"),
+        "delivery:success event should carry a delivery_status field, got: {success_event}"
+    );
+
+    // Trigger a failing delivery by pointing the next webhook at the 500 target.
+    // The stream reads its webhook URL from config; rewrite it and rely on the
+    // server re-reading per delivery, or fall back to a second stream.
+    drop(sse);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = ok_receiver.join();
+
+    let mut child = txwatch_bin()
+        .args([
+            "--config",
+            cfg_path.to_str().unwrap(),
+            "stream",
+            "--port",
+            "0",
+            "--webhook-url",
+            &fail_url,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn txwatch stream");
+
+    thread::sleep(Duration::from_millis(500));
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    let mut port = None;
+    for _ in 0..20 {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if let Some(idx) = line.find("127.0.0.1:") {
+            let rest = &line[idx + "127.0.0.1:".len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(p) = digits.parse::<u16>() {
+                port = Some(p);
+                break;
+            }
+        }
+    }
+    let port = port.expect("stream did not report a listening address");
+
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .write_all(b"GET /stream HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n")
+        .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut sse = BufReader::new(stream);
+
+    loop {
+        let mut line = String::new();
+        if sse.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if line.trim_end().is_empty() {
+            break;
+        }
+    }
+
+    let failed_event = read_sse_event_until(&mut sse, "delivery:failed")
+        .expect("expected a delivery:failed SSE event");
+    assert!(
+        failed_event.contains("delivery_status"),
+        "delivery:failed event should carry a delivery_status field, got: {failed_event}"
+    );
+
+    drop(sse);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fail_receiver.join();
 }
 
 #[test]
@@ -252,9 +466,70 @@ fn test_webhook_with_secret_sends_hmac_signature() {
     );
 
     let (headers, body) = receiver.join().unwrap();
-    let signature = headers
-        .get("x-txwatch-signature")
-        .expect("missing X-TxWatch-Signature header");
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"mysecret").unwrap();
+    mac.update(&body);
+    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+    assert_eq!(headers.get("x-txwatch-signature"), Some(&expected));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("signed with HMAC-SHA256"),
+        "output should report the signature, got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_webhook_uses_webhook_secret_from_config() {
+    let cfg_path = env::temp_dir().join("txwatch_test_webhook_config_secret.toml");
+    let config = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label          = "Test Contract"
+contract_id    = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network        = "testnet"
+webhook_url    = "https://hooks.example.com/test"
+webhook_secret = "configsecret"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+    fs::write(&cfg_path, config).unwrap();
+
+    let (url, receiver) = spawn_receiver();
+
+    let output = run_test_webhook(&cfg_path, &url, &[]);
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (headers, body) = receiver.join().unwrap();
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"configsecret").unwrap();
+    mac.update(&body);
+    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+    assert_eq!(
+        headers.get("x-txwatch-signature"),
+        Some(&expected),
+        "signature header should be computed from webhook_secret in config"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&expected),
+        "output should print the signature, got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_webhook_without_secret_sends_no_signature() {
+    let cfg_path = write_valid_config("txwatch_test_webhook_unsigned.toml");
+    let (url, receiver) = spawn_receiver();
 
     assert!(
         signature.starts_with("sha256="),

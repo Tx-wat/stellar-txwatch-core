@@ -176,8 +176,13 @@ impl Default for HttpClientSettings {
 
 impl HttpClientSettings {
     /// Apply the shared pool/keepalive/user-agent/timeout options to a builder.
+    ///
+    /// Redirects are always disabled (Issue #455): following a `3xx` could send
+    /// the signed payload to an internal address, bypassing the SSRF guard that
+    /// `WatchedContract::validate()` applies to the original webhook URL only.
     fn apply(&self, mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         builder = builder
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(self.timeout)
             .user_agent(self.user_agent.clone())
             .pool_max_idle_per_host(self.pool_max_idle_per_host);
@@ -259,6 +264,26 @@ pub fn build_pinned_cert_client_with_settings(
         .map_err(|e| anyhow!("failed to build TLS pinned client: {}", e))
 }
 
+/// Compute the `X-TxWatch-Signature` header value for `body` using `secret`.
+///
+/// Returns `sha256=<hex>` where `<hex>` is the HMAC-SHA256 of `body`. Shared by
+/// [`send_webhook`] and the CLI `test-webhook` path (Issue #554).
+pub fn sign_payload(secret: &str, body: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts any key length");
+    mac.update(body);
+    format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Returns `true` when an alert with `rule_type` should be delivered given the
+/// contract's `webhook_rule_filter` (Issue #553).
+///
+/// An empty filter means "deliver all". Otherwise the alert's `rule_type` must
+/// appear in the filter list.
+pub fn rule_matches_filter(rule_type: &str, filter: &[String]) -> bool {
+    filter.is_empty() || filter.iter().any(|f| f == rule_type)
+}
+
 /// POST `payload` to `url`, retrying up to `MAX_RETRIES` times with
 /// exponential backoff (2 s → 4 s → 8 s). Logs each attempt.
 ///
@@ -268,6 +293,10 @@ pub fn build_pinned_cert_client_with_settings(
 /// Delivery semantics: HTTP 2xx = success. The response body is logged at
 /// debug level but is otherwise ignored — a 200 OK with an error body is
 /// still treated as a successful delivery (#24).
+///
+/// Redirects are never followed (Issue #455): a `3xx` response is treated as a
+/// delivery failure, so a redirect cannot smuggle the signed payload to an
+/// internal address that the SSRF guard would otherwise reject.
 ///
 /// Graceful shutdown (#260): If `shutdown` fires during a retry backoff wait,
 /// the delivery is aborted and returns an error. In-flight HTTP requests
@@ -380,10 +409,7 @@ async fn send_webhook_with_backoff_opts(
         }
 
         if let Some(s) = secret {
-            let mut mac = Hmac::<Sha256>::new_from_slice(s.as_bytes())
-                .expect("HMAC accepts any key length");
-            mac.update(json_body.as_bytes());
-            let sig = hex::encode(mac.finalize().into_bytes());
+            let sig = sign_payload(s, body.as_bytes());
             req = req.header("X-TxWatch-Signature", format!("sha256={}", sig));
         }
 
@@ -414,14 +440,26 @@ async fn send_webhook_with_backoff_opts(
             Ok(resp) => {
                 let status = resp.status();
                 span.record("status", status.as_u16());
-                warn!(
-                    timestamp = %ts,
-                    attempt   = attempt,
-                    url       = %url,
-                    status    = %status,
-                    "webhook attempt failed with HTTP error"
-                );
-                last_err = Some(anyhow!("HTTP {}", status));
+                if status.is_redirection() {
+                    // Issue #455: never follow redirects — treat as a failure.
+                    warn!(
+                        timestamp = %ts,
+                        attempt   = attempt,
+                        url       = %url,
+                        status    = %status,
+                        "webhook attempt failed: redirect responses are not followed"
+                    );
+                    last_err = Some(anyhow!("HTTP {} (redirect not followed)", status));
+                } else {
+                    warn!(
+                        timestamp = %ts,
+                        attempt   = attempt,
+                        url       = %url,
+                        status    = %status,
+                        "webhook attempt failed with HTTP error"
+                    );
+                    last_err = Some(anyhow!("HTTP {}", status));
+                }
             }
             Err(e) => {
                 warn!(
@@ -1181,6 +1219,42 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("shutdown") || msg.contains("aborted") || msg.contains("retry"),
             "expected shutdown-related error, got: {}", msg);
+    }
+
+    /// Issue #553: an empty filter delivers every rule type.
+    #[test]
+    fn empty_filter_matches_all_rule_types() {
+        let filter: Vec<String> = vec![];
+        assert!(rule_matches_filter("AnyTransaction", &filter));
+        assert!(rule_matches_filter("LargeTransfer", &filter));
+        assert!(rule_matches_filter("TestWebhook", &filter));
+    }
+
+    /// Issue #553: a matching rule type is delivered.
+    #[test]
+    fn filter_matches_listed_rule_type() {
+        let filter = vec!["LargeTransfer".to_string(), "AnyTransaction".to_string()];
+        assert!(rule_matches_filter("LargeTransfer", &filter));
+        assert!(rule_matches_filter("AnyTransaction", &filter));
+    }
+
+    /// Issue #553: a non-matching rule type is filtered out.
+    #[test]
+    fn filter_rejects_unlisted_rule_type() {
+        let filter = vec!["LargeTransfer".to_string()];
+        assert!(!rule_matches_filter("AnyTransaction", &filter));
+        assert!(!rule_matches_filter("TestWebhook", &filter));
+    }
+
+    /// Issue #554: sign_payload produces the same signature as send_webhook.
+    #[test]
+    fn sign_payload_matches_expected_hmac() {
+        let secret = "test-secret";
+        let body = b"{\"hello\":\"world\"}";
+        let sig = sign_payload(secret, body);
+        assert!(sig.starts_with("sha256="));
+        assert!(verify_signature_constant_time(secret.as_bytes(), body, &sig));
+        assert!(!verify_signature_constant_time(b"wrong", body, &sig));
     }
 
     /// Issue #13: test_payload produces a structurally valid AlertPayload.

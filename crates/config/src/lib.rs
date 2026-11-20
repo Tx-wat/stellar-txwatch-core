@@ -470,6 +470,50 @@ impl TlsConfig {
                 );
             }
         }
+
+        // #457: actually parse the PEM material so `validate` catches garbage,
+        // expired, or mismatched cert/key pairs instead of deferring the failure
+        // to webhook delivery time. This mirrors `build_tls_client` in the notifier.
+        let cert_bytes = fs::read(&self.client_cert).with_context(|| {
+            format!(
+                "contract '{}': tls.client_cert file '{}' cannot be read",
+                contract_label, self.client_cert
+            )
+        })?;
+        let key_bytes = fs::read(&self.client_key).with_context(|| {
+            format!(
+                "contract '{}': tls.client_key file '{}' cannot be read",
+                contract_label, self.client_key
+            )
+        })?;
+        reqwest::Identity::from_pkcs8_pem(&cert_bytes, &key_bytes).map_err(|e| {
+            anyhow!(
+                "contract '{}': tls.client_cert '{}' / tls.client_key '{}' are not a valid \
+                 PKCS#8 PEM certificate/key pair: {}",
+                contract_label,
+                self.client_cert,
+                self.client_key,
+                e
+            )
+        })?;
+
+        if let Some(ca) = &self.ca_cert {
+            let ca_bytes = fs::read(ca).with_context(|| {
+                format!(
+                    "contract '{}': tls.ca_cert file '{}' cannot be read",
+                    contract_label, ca
+                )
+            })?;
+            reqwest::Certificate::from_pem(&ca_bytes).map_err(|e| {
+                anyhow!(
+                    "contract '{}': tls.ca_cert file '{}' is not a valid PEM-encoded certificate: {}",
+                    contract_label,
+                    ca,
+                    e
+                )
+            })?;
+        }
+
         Ok(())
     }
 }
@@ -515,6 +559,12 @@ pub struct WatchedContract {
     /// Optional inline PEM-encoded client certificate for webhook mTLS.
     #[serde(default)]
     pub webhook_tls_cert_pem: Option<String>,
+    /// Optional allow-list of rule types whose alerts are delivered to this
+    /// contract's webhook (Issue #553). Entries are matched against
+    /// `AlertRule::rule_type()` (e.g. `"LargeTransfer"`, `"HighFee"`).
+    /// An empty list (the default) means every rule type is delivered.
+    #[serde(default)]
+    pub webhook_rule_filter: Vec<String>,
     /// Gzip-compress webhook request bodies (Issue #540). When enabled, the body
     /// is sent with `Content-Encoding: gzip`. Defaults to `false`.
     #[serde(default)]
@@ -643,6 +693,28 @@ impl WatchedContract {
             );
         }
 
+        if self.max_alerts_per_minute == Some(0) {
+            bail!(
+                "contract '{}': max_alerts_per_minute must be >= 1 when set",
+                self.label
+            );
+        }
+
+        if let Some(alias) = &self.cursor_alias {
+            if alias.trim().is_empty() {
+                bail!(
+                    "contract '{}': cursor_alias must not be empty when set",
+                    self.label
+                );
+            }
+            if alias == &self.label {
+                bail!(
+                    "contract '{}': cursor_alias must differ from the contract label",
+                    self.label
+                );
+            }
+        }
+
         if let Some(horizon_url) = &self.horizon_url {
             let parsed_horizon = Url::parse(horizon_url).map_err(|e| {
                 anyhow!(
@@ -692,12 +764,38 @@ impl WatchedContract {
             if pem.trim().is_empty() {
                 bail!("contract '{}': webhook_tls_cert_pem must not be empty", self.label);
             }
-            if !pem.contains("-----BEGIN CERTIFICATE-----") || !pem.contains("-----END CERTIFICATE-----") {
-                bail!("contract '{}': webhook_tls_cert_pem is not a valid PEM-encoded certificate", self.label);
+            // #458: actually parse the PEM/DER rather than only checking for the
+            // BEGIN/END markers, so `validate` catches invalid certificates before
+            // `build_pinned_cert_client` fails at webhook-send time.
+            reqwest::Certificate::from_pem(pem.as_bytes()).map_err(|e| {
+                anyhow!(
+                    "contract '{}': webhook_tls_cert_pem is not a valid PEM-encoded certificate: {}",
+                    self.label,
+                    e
+                )
+            })?;
+        }
+
+        for rule_type in &self.webhook_rule_filter {
+            if rule_type.trim().is_empty() {
+                bail!(
+                    "contract '{}': webhook_rule_filter entries must not be empty",
+                    self.label
+                );
             }
         }
 
         Ok(())
+    }
+
+    /// Returns `true` when alerts for `rule_type` should be delivered to this
+    /// contract's webhook (Issue #553). An empty filter delivers everything.
+    pub fn webhook_accepts_rule_type(&self, rule_type: &str) -> bool {
+        self.webhook_rule_filter.is_empty()
+            || self
+                .webhook_rule_filter
+                .iter()
+                .any(|allowed| allowed == rule_type)
     }
 }
 
@@ -1187,6 +1285,7 @@ mod tests {
             tags: None,
             tls: None,
             webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
             webhook_compress: false,
         }
     }
@@ -1490,6 +1589,97 @@ mod tests {
         assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
     }
 
+    // ── Issue #543: max_alerts_per_minute ────────────────────────────────────
+
+    #[test]
+    fn max_alerts_per_minute_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.max_alerts_per_minute.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn max_alerts_per_minute_is_parsed_from_toml() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            max_alerts_per_minute = 30
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let c: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(c.max_alerts_per_minute, Some(30));
+    }
+
+    #[test]
+    fn rejects_zero_max_alerts_per_minute() {
+        let mut c = valid_contract();
+        c.max_alerts_per_minute = Some(0);
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("max_alerts_per_minute must be >= 1"),
+            "got: {}",
+            err
+        );
+    }
+
+    // ── Issue #547: cursor_alias ─────────────────────────────────────────────
+
+    #[test]
+    fn cursor_alias_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.cursor_alias.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn cursor_alias_is_parsed_from_toml() {
+        let raw = r#"
+            label = "NewName"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            cursor_alias = "OldName"
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let c: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(c.cursor_alias.as_deref(), Some("OldName"));
+    }
+
+    #[test]
+    fn accepts_cursor_alias_differing_from_label() {
+        let mut c = valid_contract();
+        c.cursor_alias = Some("OldLabel".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_cursor_alias() {
+        let mut c = valid_contract();
+        c.cursor_alias = Some("   ".into());
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cursor_alias must not be empty"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_cursor_alias_equal_to_label() {
+        let mut c = valid_contract();
+        c.cursor_alias = Some(c.label.clone());
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cursor_alias must differ from the contract label"),
+            "got: {}",
+            err
+        );
+    }
+
     #[test]
     fn horizon_url_defaults_to_none() {
         let mut c = valid_contract();
@@ -1516,6 +1706,76 @@ mod tests {
             cfg.contracts[0].horizon_url.as_deref(),
             Some("https://my-private-horizon.example.com")
         );
+    }
+
+    // ── Issue #553: webhook_rule_filter ──────────────────────────────────────
+
+    #[test]
+    fn webhook_rule_filter_defaults_to_empty() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let mut c: WatchedContract = toml::from_str(raw).unwrap();
+        assert!(c.webhook_rule_filter.is_empty());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn webhook_rule_filter_parses_from_toml() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            webhook_rule_filter = ["LargeTransfer", "HighFee"]
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let mut c: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(c.webhook_rule_filter, vec!["LargeTransfer", "HighFee"]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_webhook_rule_filter_accepts_all_rule_types() {
+        let c = valid_contract();
+        assert!(c.webhook_accepts_rule_type("AnyTransaction"));
+        assert!(c.webhook_accepts_rule_type("LargeTransfer"));
+        assert!(c.webhook_accepts_rule_type("HighFee"));
+    }
+
+    #[test]
+    fn webhook_rule_filter_only_accepts_listed_rule_types() {
+        let mut c = valid_contract();
+        c.webhook_rule_filter = vec!["LargeTransfer".into()];
+        assert!(c.webhook_accepts_rule_type("LargeTransfer"));
+        assert!(!c.webhook_accepts_rule_type("HighFee"));
+        assert!(!c.webhook_accepts_rule_type("AnyTransaction"));
+    }
+
+    #[test]
+    fn webhook_rule_filter_matches_rule_type_labels() {
+        let mut c = valid_contract();
+        c.rules = vec![
+            AlertRule::LargeTransfer { threshold_xlm: Some(100), threshold_stroops: None },
+            AlertRule::HighFee { threshold_stroops: 100, threshold_xlm: None },
+        ];
+        c.webhook_rule_filter = vec![c.rules[1].rule_type()];
+        assert!(!c.webhook_accepts_rule_type(&c.rules[0].rule_type()));
+        assert!(c.webhook_accepts_rule_type(&c.rules[1].rule_type()));
+    }
+
+    #[test]
+    fn rejects_blank_webhook_rule_filter_entry() {
+        let mut c = valid_contract();
+        c.webhook_rule_filter = vec!["  ".into()];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("webhook_rule_filter"), "got: {}", err);
     }
 
     #[test]
@@ -1704,6 +1964,48 @@ mod tests {
             ca_cert: Some(fixture_path("client-cert.pem")),
         });
         assert!(c.validate().is_ok());
+    }
+
+    /// #457: a cert file that exists but is not a parseable PEM certificate must
+    /// be rejected by `validate`, not deferred to webhook delivery time.
+    #[test]
+    fn tls_rejects_unparseable_client_cert() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("not-a-certificate.txt"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_cert"), "got: {}", err);
+    }
+
+    /// #457: a key file that exists but is not a parseable PKCS#8 PEM key must be
+    /// rejected by `validate`.
+    #[test]
+    fn tls_rejects_unparseable_client_key() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("not-a-certificate.txt"),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_key"), "got: {}", err);
+    }
+
+    /// #457: a `ca_cert` file that exists but is not a parseable PEM certificate
+    /// must be rejected by `validate`.
+    #[test]
+    fn tls_rejects_unparseable_ca_cert() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some(fixture_path("not-a-certificate.txt")),
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.ca_cert"), "got: {}", err);
     }
 
     // ── Issue #279: cursor_file validation ───────────────────────────────────
@@ -2297,7 +2599,14 @@ mod tests {
                     webhook_url: "https://example.com/hook".into(),
                     webhook_secret: None,
                     test_horizon_base_url: None,
+                    horizon_url: None,
+                    max_alerts_per_cycle: None,
+                    webhook_timeout_seconds: None,
                     allow_internal_webhook_urls: None,
+                    tags: None,
+                    tls: None,
+                    webhook_tls_cert_pem: None,
+                    webhook_rule_filter: Vec::new(),
                     webhook_compress: false,
                 }
             })

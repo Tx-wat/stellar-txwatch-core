@@ -9,6 +9,8 @@ contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 network     = "testnet"
 webhook_url = "https://hooks.example.com/my-webhook"
 # webhook_secret = "my-secret-token"   # optional: HMAC-SHA256 signature sent as X-TxWatch-Signature header
+# horizon_url = "https://horizon-testnet.stellar.org"   # optional: per-contract Horizon URL override (defaults to the network's public Horizon)
+# webhook_rule_filter = ["LargeTransfer", "TransactionFailed"]   # optional: only deliver alerts whose rule_type is in this list; empty list (default) delivers all rule types
 
   [[contracts.rules]]
   type          = "LargeTransfer"
@@ -32,6 +34,8 @@ label       = "Mainnet Vault"
 contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 network     = "mainnet"
 webhook_url = "https://hooks.example.com/vault-webhook"
+# horizon_url = "https://my-private-horizon.example.com"   # optional: per-contract Horizon URL override
+# webhook_rule_filter = []   # optional: empty list delivers all rule types (default)
 
   [[contracts.rules]]
   type = "AnyTransaction"
@@ -56,6 +60,8 @@ network     = "mainnet"
 # webhook_url can differ per contract — this allows routing alerts to different endpoints
 webhook_url = "https://hooks.example.com/bridge-webhook"
 # webhook_secret = "another-secret-token"
+# horizon_url = "https://horizon.stellar.org"   # optional: per-contract Horizon URL override
+# webhook_rule_filter = ["HighFee"]   # optional: only deliver HighFee alerts to this webhook
 
   [[contracts.rules]]
   type          = "HighFee"
@@ -99,3 +105,10 @@ webhook_url = "https://hooks.example.com/bridge-webhook"
 #              contract_id = "C..."   # 56 chars, starts with 'C'
 #              network     = "testnet"
 #              webhook_url = "https://hooks.example.com/my-webhook"
+#
+# 5) Invalid webhook_rule_filter entries
+#    Wrong:  webhook_rule_filter = ["LargeTransfer", "NotARule"]
+#    Error:  unknown rule type "NotARule" in webhook_rule_filter
+#    Fix:    use only valid rule types, e.g. LargeTransfer, AdminFunctionCalled,
+#            TransactionFailed, AnyTransaction, FunctionCalled, HighFee
+#            (an empty list delivers all rule types)
