@@ -3,6 +3,7 @@
 //! Exposes eight counters:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
+//! - `txwatch_alerts_suppressed_total`  — total alerts suppressed by the per-cycle cap (labelled by `contract`)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
 //! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
 //! - `txwatch_poll_cycles_total`        — total poll cycles per contract (labelled by `contract`)
@@ -46,6 +47,18 @@ fn alerts_total() -> &'static IntCounter {
             "Total alert payloads sent (rules matched)"
         )
         .expect("register txwatch_alerts_total")
+    })
+}
+
+fn alerts_suppressed_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_alerts_suppressed_total",
+            "Total alerts suppressed because max_alerts_per_cycle was reached (see issue #570)",
+            &["contract"]
+        )
+        .expect("register txwatch_alerts_suppressed_total")
     })
 }
 
@@ -106,6 +119,17 @@ fn circuit_breaker_open_total() -> &'static IntCounter {
     })
 }
 
+fn horizon_rate_limits_total() -> &'static IntCounter {
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter!(
+            "txwatch_horizon_rate_limits_total",
+            "Total Horizon 429 Too Many Requests responses (see issue #574)"
+        )
+        .expect("register txwatch_horizon_rate_limits_total")
+    })
+}
+
 fn poll_cycles_total() -> &'static IntCounterVec {
     static C: OnceLock<IntCounterVec> = OnceLock::new();
     C.get_or_init(|| {
@@ -140,6 +164,16 @@ pub fn inc_alerts(n: u64) {
     alerts_total().inc_by(n);
 }
 
+/// Increment the `txwatch_alerts_suppressed_total` counter for `contract` by `n`.
+///
+/// Call this whenever one or more alerts are dropped because the per-cycle
+/// `max_alerts_per_cycle` cap was reached (issue #570).
+pub fn inc_alerts_suppressed(contract: &str, n: u64) {
+    alerts_suppressed_total()
+        .with_label_values(&[contract])
+        .inc_by(n);
+}
+
 /// Increment the `txwatch_webhook_failures_total` counter by 1.
 pub fn inc_webhook_failures() {
     webhook_failures_total().inc();
@@ -170,6 +204,14 @@ pub fn inc_cursor_save_failures() {
 /// state after consecutive Horizon failures (issue #374).
 pub fn inc_circuit_breaker_open() {
     circuit_breaker_open_total().inc();
+}
+
+/// Increment the `txwatch_horizon_rate_limits_total` counter by 1.
+///
+/// Call this whenever Horizon responds with HTTP 429 Too Many Requests so that
+/// rate limiting is observable separately from other errors (issue #574).
+pub fn inc_horizon_rate_limits() {
+    horizon_rate_limits_total().inc();
 }
 
 /// Increment the `txwatch_poll_cycles_total` counter for `contract` by 1.

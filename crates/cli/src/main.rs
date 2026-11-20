@@ -292,6 +292,11 @@ impl fmt::Display for ValidateSummary<'_> {
                 label = c.label
             )?;
             writeln!(f, "    contract_id  : {}", c.contract_id)?;
+            writeln!(
+                f,
+                "    description  : {}",
+                c.description.as_deref().unwrap_or("none")
+            )?;
             writeln!(f, "    webhook_url  : {}", c.webhook_url)?;
             writeln!(
                 f,
