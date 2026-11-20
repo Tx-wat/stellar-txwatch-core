@@ -258,6 +258,52 @@ fn test_webhook_with_secret_sends_hmac_signature() {
 }
 
 #[test]
+fn test_webhook_uses_webhook_secret_from_config() {
+    let cfg_path = env::temp_dir().join("txwatch_test_webhook_config_secret.toml");
+    let config = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+label          = "Test Contract"
+contract_id    = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network        = "testnet"
+webhook_url    = "https://hooks.example.com/test"
+webhook_secret = "configsecret"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+    fs::write(&cfg_path, config).unwrap();
+
+    let (url, receiver) = spawn_receiver();
+
+    let output = run_test_webhook(&cfg_path, &url, &[]);
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (headers, body) = receiver.join().unwrap();
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"configsecret").unwrap();
+    mac.update(&body);
+    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+    assert_eq!(
+        headers.get("x-txwatch-signature"),
+        Some(&expected),
+        "signature header should be computed from webhook_secret in config"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&expected),
+        "output should print the signature, got: {}",
+        stdout
+    );
+}
+
+#[test]
 fn test_webhook_without_secret_sends_no_signature() {
     let cfg_path = write_valid_config("txwatch_test_webhook_unsigned.toml");
     let (url, receiver) = spawn_receiver();

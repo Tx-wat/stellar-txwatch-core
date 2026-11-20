@@ -515,6 +515,12 @@ pub struct WatchedContract {
     /// Optional inline PEM-encoded client certificate for webhook mTLS.
     #[serde(default)]
     pub webhook_tls_cert_pem: Option<String>,
+    /// Optional allow-list of rule types whose alerts are delivered to this
+    /// contract's webhook (Issue #553). Entries are matched against
+    /// `AlertRule::rule_type()` (e.g. `"LargeTransfer"`, `"HighFee"`).
+    /// An empty list (the default) means every rule type is delivered.
+    #[serde(default)]
+    pub webhook_rule_filter: Vec<String>,
     /// Gzip-compress webhook request bodies (Issue #540). When enabled, the body
     /// is sent with `Content-Encoding: gzip`. Defaults to `false`.
     #[serde(default)]
@@ -704,7 +710,26 @@ impl WatchedContract {
             })?;
         }
 
+        for rule_type in &self.webhook_rule_filter {
+            if rule_type.trim().is_empty() {
+                bail!(
+                    "contract '{}': webhook_rule_filter entries must not be empty",
+                    self.label
+                );
+            }
+        }
+
         Ok(())
+    }
+
+    /// Returns `true` when alerts for `rule_type` should be delivered to this
+    /// contract's webhook (Issue #553). An empty filter delivers everything.
+    pub fn webhook_accepts_rule_type(&self, rule_type: &str) -> bool {
+        self.webhook_rule_filter.is_empty()
+            || self
+                .webhook_rule_filter
+                .iter()
+                .any(|allowed| allowed == rule_type)
     }
 }
 
@@ -1194,6 +1219,7 @@ mod tests {
             tags: None,
             tls: None,
             webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
             webhook_compress: false,
         }
     }
@@ -1523,6 +1549,76 @@ mod tests {
             cfg.contracts[0].horizon_url.as_deref(),
             Some("https://my-private-horizon.example.com")
         );
+    }
+
+    // ── Issue #553: webhook_rule_filter ──────────────────────────────────────
+
+    #[test]
+    fn webhook_rule_filter_defaults_to_empty() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let mut c: WatchedContract = toml::from_str(raw).unwrap();
+        assert!(c.webhook_rule_filter.is_empty());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn webhook_rule_filter_parses_from_toml() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            webhook_rule_filter = ["LargeTransfer", "HighFee"]
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let mut c: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(c.webhook_rule_filter, vec!["LargeTransfer", "HighFee"]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_webhook_rule_filter_accepts_all_rule_types() {
+        let c = valid_contract();
+        assert!(c.webhook_accepts_rule_type("AnyTransaction"));
+        assert!(c.webhook_accepts_rule_type("LargeTransfer"));
+        assert!(c.webhook_accepts_rule_type("HighFee"));
+    }
+
+    #[test]
+    fn webhook_rule_filter_only_accepts_listed_rule_types() {
+        let mut c = valid_contract();
+        c.webhook_rule_filter = vec!["LargeTransfer".into()];
+        assert!(c.webhook_accepts_rule_type("LargeTransfer"));
+        assert!(!c.webhook_accepts_rule_type("HighFee"));
+        assert!(!c.webhook_accepts_rule_type("AnyTransaction"));
+    }
+
+    #[test]
+    fn webhook_rule_filter_matches_rule_type_labels() {
+        let mut c = valid_contract();
+        c.rules = vec![
+            AlertRule::LargeTransfer { threshold_xlm: Some(100), threshold_stroops: None },
+            AlertRule::HighFee { threshold_stroops: 100, threshold_xlm: None },
+        ];
+        c.webhook_rule_filter = vec![c.rules[1].rule_type()];
+        assert!(!c.webhook_accepts_rule_type(&c.rules[0].rule_type()));
+        assert!(c.webhook_accepts_rule_type(&c.rules[1].rule_type()));
+    }
+
+    #[test]
+    fn rejects_blank_webhook_rule_filter_entry() {
+        let mut c = valid_contract();
+        c.webhook_rule_filter = vec!["  ".into()];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("webhook_rule_filter"), "got: {}", err);
     }
 
     #[test]
@@ -2304,7 +2400,14 @@ mod tests {
                     webhook_url: "https://example.com/hook".into(),
                     webhook_secret: None,
                     test_horizon_base_url: None,
+                    horizon_url: None,
+                    max_alerts_per_cycle: None,
+                    webhook_timeout_seconds: None,
                     allow_internal_webhook_urls: None,
+                    tags: None,
+                    tls: None,
+                    webhook_tls_cert_pem: None,
+                    webhook_rule_filter: Vec::new(),
                     webhook_compress: false,
                 }
             })
