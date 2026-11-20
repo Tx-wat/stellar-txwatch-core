@@ -65,6 +65,9 @@ impl AccountKind {
 /// when the `join=operations` query parameter is used.
 #[derive(Deserialize)]
 pub(crate) struct HorizonTransactionWithOps {
+    /// The transaction record. `source_account` is captured on
+    /// `HorizonTransaction` itself (via `#[serde(rename = "source_account")]`),
+    /// and `#[serde(flatten)]` passes it through unchanged here.
     #[serde(flatten)]
     pub tx: HorizonTransaction,
     /// Inline operations embedded by Horizon when `join=operations` is used.
@@ -129,6 +132,24 @@ pub(crate) async fn fetch_soroban_details(
     let result = client.get(&url).send().await?.error_for_status()?.json().await;
     observe_horizon_latency("operations", started);
     result
+}
+
+// ── Horizon URL resolution ────────────────────────────────────────────────────
+
+/// Resolve the effective Horizon base URL for a contract.
+///
+/// A per-contract `horizon_url` override takes precedence over the network
+/// default so that users with private Horizon nodes can point individual
+/// contracts at their own endpoint. When no override is set (or it is blank),
+/// `network_default` is used.
+pub(crate) fn resolve_horizon_url<'a>(
+    contract_override: Option<&'a str>,
+    network_default: &'a str,
+) -> &'a str {
+    match contract_override {
+        Some(url) if !url.trim().is_empty() => url,
+        _ => network_default,
+    }
 }
 
 // ── Startup connectivity check ────────────────────────────────────────────────
@@ -240,5 +261,44 @@ mod tests {
         let client = reqwest::Client::new();
         // Unreachable URL is fine because the check is disabled.
         startup_connectivity_check(&client, &["http://127.0.0.1:1".to_string()], false).await;
+    }
+
+    #[test]
+    fn resolve_prefers_contract_override() {
+        let resolved = resolve_horizon_url(
+            Some("https://private-horizon.example.com"),
+            "https://horizon-testnet.stellar.org",
+        );
+        assert_eq!(resolved, "https://private-horizon.example.com");
+    }
+
+    #[test]
+    fn resolve_falls_back_to_network_default() {
+        let resolved = resolve_horizon_url(None, "https://horizon-testnet.stellar.org");
+        assert_eq!(resolved, "https://horizon-testnet.stellar.org");
+    }
+
+    #[test]
+    fn resolve_ignores_blank_override() {
+        let resolved = resolve_horizon_url(Some("   "), "https://horizon-testnet.stellar.org");
+        assert_eq!(resolved, "https://horizon-testnet.stellar.org");
+    }
+
+    #[test]
+    fn transaction_with_ops_deserialises_source_account() {
+        // `source_account` lives on `HorizonTransaction` and must survive the
+        // `#[serde(flatten)]` in `HorizonTransactionWithOps`.
+        let json = r#"{
+            "id": "abc",
+            "hash": "deadbeef",
+            "source_account": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            "successful": true,
+            "operations": []
+        }"#;
+        let parsed: HorizonTransactionWithOps = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.tx.source_account.as_deref(),
+            Some("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+        );
     }
 }

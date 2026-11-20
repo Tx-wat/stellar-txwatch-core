@@ -3,7 +3,6 @@ name    = "txwatch-config"
 version = "0.1.0"
 license = "Apache-2.0"
 edition = "2021"
-license   = "Apache-2.0"
 publish   = false
 
 [dependencies]
@@ -13,5 +12,6 @@ toml    = { workspace = true }
 anyhow  = { workspace = true }
 serde_path_to_error = "0.1"
 url     = "2"
+notify  = "6"
 
 [dev-dependencies]
