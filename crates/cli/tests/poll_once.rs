@@ -33,6 +33,151 @@ fn poll_once_still_validates_config_and_exits_one_when_invalid() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_once_counts_partial_failures() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let account_ok = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    let account_bad = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    // Healthy Horizon: empty transaction page.
+    let horizon_ok = MockServer::start().await;
+    let empty_page = serde_json::json!({
+        "_links": {},
+        "_embedded": { "records": [] }
+    });
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{}/transactions", account_ok)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(empty_page))
+        .mount(&horizon_ok)
+        .await;
+
+    // Broken Horizon: always 500.
+    let horizon_bad = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{}/transactions", account_bad)))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&horizon_bad)
+        .await;
+
+    let config_path = env::temp_dir().join(format!(
+        "txwatch_poll_once_partial_{}.toml",
+        std::process::id()
+    ));
+    let config = format!(
+        r#"
+horizon_url = "{ok}"
+
+[[rules]]
+name = "ok"
+account = "{account_ok}"
+
+[[rules]]
+name = "bad"
+account = "{account_bad}"
+test_horizon_base_url = "{bad}"
+"#,
+        ok = horizon_ok.uri(),
+        bad = horizon_bad.uri(),
+        account_ok = account_ok,
+        account_bad = account_bad,
+    );
+    fs::write(&config_path, &config).unwrap();
+
+    let cfg = txwatch_core::config::AppConfig::load(&config_path)
+        .expect("config should load");
+    let failed = txwatch_poller::run_once(cfg, true)
+        .await
+        .expect("run_once should not error on partial failure");
+    let _ = fs::remove_file(&config_path);
+
+    assert_eq!(failed, 1, "exactly one contract should be reported failed");
+}
+
+#[test]
+fn poll_once_exits_non_zero_on_partial_failure() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let account_ok = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+    let account_bad = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let (ok_uri, bad_uri) = rt.block_on(async {
+        let horizon_ok = MockServer::start().await;
+        let empty_page = serde_json::json!({
+            "_links": {},
+            "_embedded": { "records": [] }
+        });
+        Mock::given(method("GET"))
+            .and(path(format!("/accounts/{}/transactions", account_ok)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page))
+            .mount(&horizon_ok)
+            .await;
+
+        let horizon_bad = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/accounts/{}/transactions", account_bad)))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&horizon_bad)
+            .await;
+
+        (horizon_ok.uri(), horizon_bad.uri())
+    });
+
+    let config_path = env::temp_dir().join(format!(
+        "txwatch_poll_once_cli_partial_{}.toml",
+        std::process::id()
+    ));
+    let config = format!(
+        r#"
+horizon_url = "{ok}"
+
+[[rules]]
+name = "ok"
+account = "{account_ok}"
+
+[[rules]]
+name = "bad"
+account = "{account_bad}"
+test_horizon_base_url = "{bad}"
+"#,
+        ok = ok_uri,
+        bad = bad_uri,
+        account_ok = account_ok,
+        account_bad = account_bad,
+    );
+    fs::write(&config_path, &config).unwrap();
+
+    let output = txwatch_bin()
+        .arg("--config")
+        .arg(&config_path)
+        .args(["watch", "--poll-once"])
+        .output()
+        .expect("failed to run txwatch");
+    let _ = fs::remove_file(&config_path);
+
+    let code = output.status.code();
+    assert!(
+        code.is_some() && code != Some(0),
+        "expected non-zero exit on partial failure, got {:?}\nstderr:\n{}",
+        code,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("1 contract poll(s) failed"),
+        "stderr should mention the failed contract count, got:\n{}",
+        stderr
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_receives_alert_fired_end_to_end() {
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
