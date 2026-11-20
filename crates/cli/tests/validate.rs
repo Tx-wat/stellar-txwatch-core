@@ -32,6 +32,19 @@ webhook_url = "https://hooks.example.com/test"
   type = "AnyTransaction"
 "#;
 
+const POLL_INTERVAL_TOO_LARGE_CONFIG: &str = r#"
+poll_interval_seconds = 3601
+
+[[contracts]]
+label       = "Test Contract"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network     = "testnet"
+webhook_url = "https://hooks.example.com/test"
+
+  [[contracts.rules]]
+  type = "AnyTransaction"
+"#;
+
 const MULTI_CONTRACT_CONFIG: &str = r#"
 poll_interval_seconds = 10
 
@@ -190,6 +203,37 @@ fn validate_exits_one_for_invalid_contract_id() {
         status.code(),
         Some(1),
         "expected exit code 1 for config with invalid contract ID"
+    );
+}
+
+#[test]
+fn validate_example_config_is_valid() {
+    // Resolve the repository root from this crate's manifest directory so the
+    // test works regardless of the current working directory.
+    let example_config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("config")
+        .join("example.toml");
+
+    assert!(
+        example_config.exists(),
+        "expected example config at {}",
+        example_config.display()
+    );
+
+    let output = txwatch_bin()
+        .args(["--config", example_config.to_str().unwrap(), "validate"])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "expected exit code 0 for config/example.toml, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 
