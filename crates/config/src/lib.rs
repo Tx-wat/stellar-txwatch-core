@@ -30,10 +30,13 @@ pub fn format_xlm(stroops: u64) -> String {
 }
 
 /// Human-readable `LargeTransfer` label, e.g. `"LargeTransfer(>=10000XLM)"`.
+/// Stroop thresholds show both units: `"LargeTransfer(>=5000000 stroops / 0.5 XLM)"`.
 pub fn large_transfer_label(threshold_xlm: Option<u64>, threshold_stroops: Option<u64>) -> String {
     match (threshold_xlm, threshold_stroops) {
         (Some(xlm), None) => format!("LargeTransfer(>={}XLM)", xlm),
-        (None, Some(stroops)) => format!("LargeTransfer(>={}XLM)", format_xlm(stroops)),
+        (None, Some(stroops)) => {
+            format!("LargeTransfer(>={} stroops / {} XLM)", stroops, format_xlm(stroops))
+        }
         _ => "LargeTransfer".into(),
     }
 }
@@ -2113,7 +2116,31 @@ mod tests {
             threshold_stroops: Some(5_000_000),
         };
         assert_eq!(rule.label(), large_transfer_label(None, Some(5_000_000)));
-        assert_eq!(rule.label(), "LargeTransfer(>=0.5XLM)");
+        assert_eq!(rule.label(), "LargeTransfer(>=5000000 stroops / 0.5 XLM)");
+    }
+
+    /// #572: stroop labels show both the raw stroop value and the XLM equivalent.
+    #[test]
+    fn large_transfer_label_shows_stroops_and_xlm() {
+        assert_eq!(
+            large_transfer_label(None, Some(5_000_000)),
+            "LargeTransfer(>=5000000 stroops / 0.5 XLM)"
+        );
+        assert_eq!(
+            large_transfer_label(None, Some(10_000_000)),
+            "LargeTransfer(>=10000000 stroops / 1 XLM)"
+        );
+        assert_eq!(
+            large_transfer_label(None, Some(1)),
+            "LargeTransfer(>=1 stroops / 0.0000001 XLM)"
+        );
+    }
+
+    /// #572: XLM-configured thresholds keep the original label format.
+    #[test]
+    fn large_transfer_label_xlm_format_unchanged() {
+        assert_eq!(large_transfer_label(Some(10_000), None), "LargeTransfer(>=10000XLM)");
+        assert_eq!(large_transfer_label(None, None), "LargeTransfer");
     }
 
     #[test]

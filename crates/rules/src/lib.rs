@@ -1719,7 +1719,7 @@ mod tests {
             &tx,
         );
         assert_eq!(payloads.len(), 1);
-        assert_eq!(payloads[0].rule_triggered, "LargeTransfer(>=0.5XLM)");
+        assert_eq!(payloads[0].rule_triggered, "LargeTransfer(>=5000000 stroops / 0.5 XLM)");
     }
 
     #[test]
@@ -1846,8 +1846,24 @@ mod tests {
     }
 
     #[test]
-    fn source_account_match_does_not_fire_when_source_account_is_missing() {
+    fn source_account_match_does_not_fire_when_absent() {
         let tx = make_tx(true, &[], None);
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn source_account_match_does_not_fire_on_empty_string_source_account() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some(String::new());
+        let payloads = run(&[source_rule(SOURCE)], &tx);
+        assert!(payloads.is_empty());
+    }
+
+    #[test]
+    fn source_account_match_does_not_fire_on_whitespace_only_source_account() {
+        let mut tx = make_tx(true, &[], None);
+        tx.source_account = Some("   \t\n".into());
         let payloads = run(&[source_rule(SOURCE)], &tx);
         assert!(payloads.is_empty());
     }

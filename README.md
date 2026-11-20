@@ -290,7 +290,7 @@ webhook_url = "https://hooks.example.com/my-webhook"
 |---|---|
 | `AnyTransaction` | Any transaction touches the contract |
 | `TransactionFailed` | A transaction fails (`successful = false`) |
-| `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM, or ≥ `threshold_stroops` stroops (exactly one) |
+| `LargeTransfer` | Payment amount ≥ `threshold_xlm` XLM, or ≥ `threshold_stroops` stroops (exactly one). Stroop rules are labelled `LargeTransfer(>=5000000 stroops / 0.5 XLM)` |
 | `FunctionCalled` | A specific Soroban function is invoked |
 | `AdminFunctionCalled` | Any function in a named list is invoked |
 | `HighFee` | Transaction fee exceeds configured threshold |
@@ -547,6 +547,7 @@ Metrics registered:
 | `txwatch_webhook_failures_total` | Total permanent webhook delivery failures (after all retries) |
 | `txwatch_enrichment_errors_total` | Transactions skipped because enrichment failed (e.g. an unparseable `created_at`). The cursor still advances past them, so they are not retried. |
 | `txwatch_config_reload_total` | Total config loads and reloads (starts at 1 at startup; hot-reload support #227) |
+| `txwatch_config_reload_errors_total` | Total hot-reloads rejected because the new config failed to parse or validate (previous config stays active) |
 
 To start the `/metrics` endpoint, call `txwatch_poller::serve_metrics(addr)` before `run_with`.
 The endpoint serves the standard Prometheus text exposition format and can be scraped by any
