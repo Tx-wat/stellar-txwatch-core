@@ -202,6 +202,8 @@ pub enum AlertRule {
         #[serde(default)]
         wrap_rule: Option<String>,
     },
+    /// Fires when the transaction's ledger sequence is within `from..=to` (Issue #499).
+    LedgerSequenceRange { from: u32, to: u32 },
 }
 
 impl AlertRule {
@@ -369,6 +371,14 @@ impl AlertRule {
                             day
                         );
                     }
+                }
+            }
+            AlertRule::LedgerSequenceRange { from, to } => {
+                if from > to {
+                    bail!(
+                        "contract '{}': LedgerSequenceRange: from ({}) must be <= to ({})",
+                        contract_label, from, to
+                    );
                 }
             }
         }
@@ -884,7 +894,12 @@ impl AppConfig {
     fn resolve_env_vars(&mut self) -> Result<()> {
         for contract in &mut self.contracts {
             if let Some(secret) = &contract.webhook_secret {
-                contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
+                let resolved = resolve_env_interpolation(secret)?;
+                if let Some(var) = secret.strip_prefix("${").and_then(|v| v.strip_suffix('}')) {
+                    // Log only the variable name, never the resolved value.
+                    tracing::debug!("webhook secret loaded from env var {}", var);
+                }
+                contract.webhook_secret = Some(resolved);
             }
             contract.webhook_url = resolve_env_interpolation(&contract.webhook_url)?;
         }
@@ -2464,5 +2479,37 @@ mod tests {
         assert!(watcher.wait_for_reload(), "expected a reload signal");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Clone, Default)]
+    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer { self.clone() }
+    }
+
+    #[test]
+    fn webhook_secret_env_var_is_logged_by_name_only() {
+        std::env::set_var("TXWATCH_TEST_LOG_SECRET", "super-secret-value");
+        let buf = BufWriter::default();
+        let sub = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .finish();
+        let mut c = valid_contract();
+        c.webhook_secret = Some("${TXWATCH_TEST_LOG_SECRET}".into());
+        let mut cfg = config_with(vec![c]);
+        tracing::subscriber::with_default(sub, || cfg.resolve_env_vars().unwrap());
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("webhook secret loaded from env var TXWATCH_TEST_LOG_SECRET"), "got: {out}");
+        assert!(!out.contains("super-secret-value"), "secret leaked: {out}");
     }
 }

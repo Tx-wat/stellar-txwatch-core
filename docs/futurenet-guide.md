@@ -46,3 +46,4 @@ Friendbot credits the target account with test lumens (XLM) immediately.
   - **Recovery**: Delete the cursor file (or start with `--from-beginning` / fresh cursor) after each network reset.
 - **Contract Redeployment**: After a reset, contracts must be redeployed to new contract IDs, requiring an update to your `config.toml`.
 - **Latency & Availability**: Futurenet nodes may have variable availability during protocol upgrade testing.
+- **Startup warning**: When any contract uses `network = "futurenet"`, the Horizon connectivity check (`horizon_startup_check`) logs a warning that Futurenet is unstable and suggests using testnet for development.

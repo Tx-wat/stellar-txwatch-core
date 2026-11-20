@@ -39,6 +39,12 @@ pub(crate) async fn check_horizon_connectivity(client: &Client, cfg: &AppConfig)
     urls.dedup();
 
     for url in urls {
+        if url.contains("futurenet") {
+            warn!(
+                horizon_url = %url,
+                "Futurenet is unstable and is reset periodically; use testnet for development"
+            );
+        }
         let probe = format!("{}/fee_stats", url.trim_end_matches('/'));
         match client.get(&probe).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -270,6 +276,7 @@ pub async fn run_with_shutdown(
                     #[cfg(feature = "metrics")]
                     {
                         crate::metrics::inc_transactions(txs);
+                        crate::metrics::inc_transactions_per_contract(&contract.label, txs);
                         crate::metrics::inc_alerts(alerts);
                     }
                 }

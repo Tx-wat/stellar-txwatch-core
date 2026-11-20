@@ -542,6 +542,7 @@ Metrics registered:
 | Counter | Description |
 |---|---|
 | `txwatch_transactions_total` | Total Stellar transactions processed across all watched contracts |
+| `txwatch_transactions_per_contract` | Transactions processed, labelled by `contract`. Use it to find high-activity contracts. |
 | `txwatch_alerts_total` | Total alert payloads sent (rules matched) |
 | `txwatch_webhook_failures_total` | Total permanent webhook delivery failures (after all retries) |
 | `txwatch_enrichment_errors_total` | Transactions skipped because enrichment failed (e.g. an unparseable `created_at`). The cursor still advances past them, so they are not retried. |

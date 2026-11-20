@@ -13,5 +13,7 @@ anyhow  = { workspace = true }
 serde_path_to_error = "0.1"
 url     = "2"
 notify  = "6"
+tracing = "0.1"
 
 [dev-dependencies]
+tracing-subscriber = "0.3"

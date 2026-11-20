@@ -2,6 +2,7 @@
 //!
 //! Exposes seven counters:
 //! - `txwatch_transactions_total`       — total transactions processed
+//! - `txwatch_transactions_per_contract` — transactions processed, labelled by `contract`
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
 //! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
@@ -115,6 +116,23 @@ fn poll_cycles_total() -> &'static IntCounterVec {
         )
         .expect("register txwatch_poll_cycles_total")
     })
+}
+
+fn transactions_per_contract() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_transactions_per_contract",
+            "Total Stellar transactions processed, per watched contract",
+            &["contract"]
+        )
+        .expect("register txwatch_transactions_per_contract")
+    })
+}
+
+/// Increment `txwatch_transactions_per_contract{contract=label}` by `n`.
+pub fn inc_transactions_per_contract(label: &str, n: u64) {
+    transactions_per_contract().with_label_values(&[label]).inc_by(n);
 }
 
 /// Increment the `txwatch_transactions_total` counter by `n`.
