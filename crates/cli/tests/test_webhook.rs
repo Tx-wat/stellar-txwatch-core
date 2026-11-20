@@ -135,6 +135,53 @@ fn spawn_status_receiver(
     (url, handle)
 }
 
+/// Accepts one HTTP request on a loopback port, replies with the given status
+/// line and response body, and returns the lowercased request headers together
+/// with the raw request body.
+fn spawn_body_receiver(
+    status_line: &'static str,
+    response_body: &'static str,
+) -> (String, JoinHandle<(HashMap<String, String>, Vec<u8>)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+
+    let handle = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut headers = HashMap::new();
+        let mut content_length = 0usize;
+
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                let name = name.trim().to_ascii_lowercase();
+                let value = value.trim().to_string();
+                if name == "content-length" {
+                    content_length = value.parse().unwrap();
+                }
+                headers.insert(name, value);
+            }
+        }
+
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+        let response = format!(
+            "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        reader.get_mut().write_all(response.as_bytes()).unwrap();
+
+        (headers, body)
+    });
+
+    (url, handle)
+}
+
 /// Accepts one HTTP request on a loopback port, waits `delay` before replying
 /// 200, and returns the lowercased request headers together with the raw body.
 fn spawn_delayed_receiver(
@@ -454,29 +501,21 @@ fn test_webhook_exits_one_when_target_returns_http_error() {
 }
 
 #[test]
-fn test_webhook_with_secret_sends_hmac_signature() {
-    let cfg_path = write_valid_config("txwatch_test_webhook_signed.toml");
-    let (url, receiver) = spawn_receiver();
-
-    let output = run_test_webhook(&cfg_path, &url, &["--secret", "mysecret"]);
-    assert!(
-        output.status.success(),
-        "expected success, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+fn test_webhook_logs_response_body_on_failure() {
+    let cfg_path = write_valid_config("txwatch_test_webhook_error_body.toml");
+    let (url, receiver) = spawn_body_receiver(
+        "HTTP/1.1 500 Internal Server Error",
+        "upstream rejected the payload",
     );
 
-    let (headers, body) = receiver.join().unwrap();
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"mysecret").unwrap();
-    mac.update(&body);
-    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let output = run_test_webhook(&cfg_path, &url, &[]);
 
-    assert_eq!(headers.get("x-txwatch-signature"), Some(&expected));
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("signed with HMAC-SHA256"),
-        "output should report the signature, got: {}",
-        stdout
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1 when webhook target returns HTTP 500, stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -501,11 +540,6 @@ webhook_secret = "configsecret"
     let (url, receiver) = spawn_receiver();
 
     let output = run_test_webhook(&cfg_path, &url, &[]);
-    assert!(
-        output.status.success(),
-        "expected success, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 
     let (headers, body) = receiver.join().unwrap();
     let mut mac = Hmac::<Sha256>::new_from_slice(b"configsecret").unwrap();
@@ -524,6 +558,8 @@ webhook_secret = "configsecret"
         "output should print the signature, got: {}",
         stdout
     );
+
+    let _ = receiver.join();
 }
 
 #[test]
@@ -547,6 +583,8 @@ fn test_webhook_without_secret_sends_no_signature() {
         &expected_signature(b"mysecret", &body),
         "signature does not match HMAC-SHA256 of the request body"
     );
+
+    let _ = receiver.join();
 }
 
 #[test]

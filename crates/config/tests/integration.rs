@@ -127,6 +127,59 @@ fn write_config(dir: &TempDir, contents: &str) -> PathBuf {
     path
 }
 
+/// Build a valid 56-character base32 contract ID (Stellar strkey format).
+///
+/// The ID starts with the `C` version byte and is padded with `A` characters
+/// (base32 value 0) so that every generated ID is syntactically valid.
+fn contract_id(index: usize) -> String {
+    // Encode the index into the trailing characters so IDs stay unique while
+    // remaining valid base32 (A-Z, 2-7).
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut suffix = [b'A'; 8];
+    let mut n = index;
+    for slot in suffix.iter_mut().rev() {
+        *slot = alphabet[n % alphabet.len()];
+        n /= alphabet.len();
+    }
+    let suffix = std::str::from_utf8(&suffix).expect("base32 suffix is valid utf8");
+    format!("C{}{}", "A".repeat(47), suffix)
+}
+
+fn cfg_with_n_contracts(n: usize) -> String {
+    let mut cfg = String::from("poll_interval_seconds = 10\n");
+    for i in 0..n {
+        cfg.push_str(&format!(
+            "\n[[contracts]]\nid = \"{}\"\nthreshold_xlm = 100\n",
+            contract_id(i)
+        ));
+    }
+    cfg
+}
+
+#[test]
+fn accepts_exactly_max_contracts() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let path = write_config(&dir, &cfg_with_n_contracts(100));
+
+    let cfg = AppConfig::from_file(&path)
+        .expect("config with exactly MAX_CONTRACTS (100) should validate");
+    assert_eq!(cfg.contracts.len(), 100);
+}
+
+#[test]
+fn contract_at_index_99_is_valid() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let path = write_config(&dir, &cfg_with_n_contracts(100));
+
+    let cfg = AppConfig::from_file(&path)
+        .expect("config with exactly MAX_CONTRACTS (100) should validate");
+
+    let last = cfg.contracts.last().expect("config should contain contracts");
+    assert_eq!(last.id, contract_id(99));
+    assert_eq!(last.id.len(), 56, "contract ID must be 56 characters");
+    assert!(last.id.starts_with('C'), "contract ID must start with 'C'");
+}
+
 #[test]
 fn watcher_emits_reload_on_write() {
     let dir = TempDir::new().expect("failed to create temp dir");
