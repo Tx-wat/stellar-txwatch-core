@@ -176,8 +176,13 @@ impl Default for HttpClientSettings {
 
 impl HttpClientSettings {
     /// Apply the shared pool/keepalive/user-agent/timeout options to a builder.
+    ///
+    /// Redirects are always disabled (Issue #455): following a `3xx` could send
+    /// the signed payload to an internal address, bypassing the SSRF guard that
+    /// `WatchedContract::validate()` applies to the original webhook URL only.
     fn apply(&self, mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         builder = builder
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(self.timeout)
             .user_agent(self.user_agent.clone())
             .pool_max_idle_per_host(self.pool_max_idle_per_host);
@@ -288,6 +293,10 @@ pub fn rule_matches_filter(rule_type: &str, filter: &[String]) -> bool {
 /// Delivery semantics: HTTP 2xx = success. The response body is logged at
 /// debug level but is otherwise ignored — a 200 OK with an error body is
 /// still treated as a successful delivery (#24).
+///
+/// Redirects are never followed (Issue #455): a `3xx` response is treated as a
+/// delivery failure, so a redirect cannot smuggle the signed payload to an
+/// internal address that the SSRF guard would otherwise reject.
 ///
 /// Graceful shutdown (#260): If `shutdown` fires during a retry backoff wait,
 /// the delivery is aborted and returns an error. In-flight HTTP requests
@@ -431,14 +440,26 @@ async fn send_webhook_with_backoff_opts(
             Ok(resp) => {
                 let status = resp.status();
                 span.record("status", status.as_u16());
-                warn!(
-                    timestamp = %ts,
-                    attempt   = attempt,
-                    url       = %url,
-                    status    = %status,
-                    "webhook attempt failed with HTTP error"
-                );
-                last_err = Some(anyhow!("HTTP {}", status));
+                if status.is_redirection() {
+                    // Issue #455: never follow redirects — treat as a failure.
+                    warn!(
+                        timestamp = %ts,
+                        attempt   = attempt,
+                        url       = %url,
+                        status    = %status,
+                        "webhook attempt failed: redirect responses are not followed"
+                    );
+                    last_err = Some(anyhow!("HTTP {} (redirect not followed)", status));
+                } else {
+                    warn!(
+                        timestamp = %ts,
+                        attempt   = attempt,
+                        url       = %url,
+                        status    = %status,
+                        "webhook attempt failed with HTTP error"
+                    );
+                    last_err = Some(anyhow!("HTTP {}", status));
+                }
             }
             Err(e) => {
                 warn!(

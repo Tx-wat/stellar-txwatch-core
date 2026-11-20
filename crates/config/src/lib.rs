@@ -470,6 +470,50 @@ impl TlsConfig {
                 );
             }
         }
+
+        // #457: actually parse the PEM material so `validate` catches garbage,
+        // expired, or mismatched cert/key pairs instead of deferring the failure
+        // to webhook delivery time. This mirrors `build_tls_client` in the notifier.
+        let cert_bytes = fs::read(&self.client_cert).with_context(|| {
+            format!(
+                "contract '{}': tls.client_cert file '{}' cannot be read",
+                contract_label, self.client_cert
+            )
+        })?;
+        let key_bytes = fs::read(&self.client_key).with_context(|| {
+            format!(
+                "contract '{}': tls.client_key file '{}' cannot be read",
+                contract_label, self.client_key
+            )
+        })?;
+        reqwest::Identity::from_pkcs8_pem(&cert_bytes, &key_bytes).map_err(|e| {
+            anyhow!(
+                "contract '{}': tls.client_cert '{}' / tls.client_key '{}' are not a valid \
+                 PKCS#8 PEM certificate/key pair: {}",
+                contract_label,
+                self.client_cert,
+                self.client_key,
+                e
+            )
+        })?;
+
+        if let Some(ca) = &self.ca_cert {
+            let ca_bytes = fs::read(ca).with_context(|| {
+                format!(
+                    "contract '{}': tls.ca_cert file '{}' cannot be read",
+                    contract_label, ca
+                )
+            })?;
+            reqwest::Certificate::from_pem(&ca_bytes).map_err(|e| {
+                anyhow!(
+                    "contract '{}': tls.ca_cert file '{}' is not a valid PEM-encoded certificate: {}",
+                    contract_label,
+                    ca,
+                    e
+                )
+            })?;
+        }
+
         Ok(())
     }
 }
@@ -1807,6 +1851,48 @@ mod tests {
             ca_cert: Some(fixture_path("client-cert.pem")),
         });
         assert!(c.validate().is_ok());
+    }
+
+    /// #457: a cert file that exists but is not a parseable PEM certificate must
+    /// be rejected by `validate`, not deferred to webhook delivery time.
+    #[test]
+    fn tls_rejects_unparseable_client_cert() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("not-a-certificate.txt"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_cert"), "got: {}", err);
+    }
+
+    /// #457: a key file that exists but is not a parseable PKCS#8 PEM key must be
+    /// rejected by `validate`.
+    #[test]
+    fn tls_rejects_unparseable_client_key() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("not-a-certificate.txt"),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_key"), "got: {}", err);
+    }
+
+    /// #457: a `ca_cert` file that exists but is not a parseable PEM certificate
+    /// must be rejected by `validate`.
+    #[test]
+    fn tls_rejects_unparseable_ca_cert() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some(fixture_path("not-a-certificate.txt")),
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.ca_cert"), "got: {}", err);
     }
 
     // ── Issue #279: cursor_file validation ───────────────────────────────────

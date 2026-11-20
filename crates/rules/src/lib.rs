@@ -591,17 +591,23 @@ impl AlertPayload {
             contract_id: ctx.contract_id.to_string(),
             contract_type: ContractType::from_contract_id(ctx.contract_id),
             network: ctx.network.to_string(),
-            rule_type: rule_type(rule),
-            rule_triggered: rule_label(rule),
+            rule_type: rule.rule_type(),
+            rule_triggered: rule.label(),
             transaction_hash: tx.hash.clone(),
             function_name: tx.function_names.first().cloned(),
             function_names: tx.function_names.clone(),
             amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+            amount_stroops: tx.amount_stroops,
             fee_charged_stroops: tx.fee_charged_stroops,
+            operation_count: tx.operation_count,
+            memo_type: tx.memo_type.clone(),
+            memo: tx.memo.clone(),
             timestamp: tx.timestamp.timestamp(),
             timestamp_iso: tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             horizon_link: format!("{}/transactions/{}", horizon_base, tx.hash),
             explorer_link: format!("{}/tx/{}", explorer_base, tx.hash),
+            ledger_sequence: tx.ledger_sequence,
+            source_account: tx.source_account.clone(),
             tags: ctx.tags.cloned(),
         }
     }
@@ -929,11 +935,17 @@ mod tests {
             "function_name",
             "function_names",
             "amount_xlm",
+            "amount_stroops",
             "fee_charged_stroops",
+            "operation_count",
+            "memo_type",
+            "memo",
             "timestamp",
             "timestamp_iso",
             "horizon_link",
             "explorer_link",
+            "ledger_sequence",
+            "source_account",
         ];
         for field in documented {
             assert!(object.contains_key(field), "missing documented field: {}", field);
@@ -1010,6 +1022,88 @@ mod tests {
         let payloads = run(&[AlertRule::AnyTransaction], &tx);
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].rule_triggered, "AnyTransaction");
+    }
+
+    /// Issue #444: every README-documented payload field round-trips through
+    /// `AlertPayload::new()` for a fully-populated `EnrichedTransaction`.
+    #[test]
+    fn alert_payload_new_populates_all_documented_fields() {
+        let ctx = PayloadContext {
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: "https://stellar.expert/explorer/testnet",
+            tags: None,
+        };
+        let mut tx = make_tx(true, &["transfer", "withdraw"], Some(150_000_000_000));
+        tx.fee_charged_stroops = Some(500);
+        tx.operation_count = Some(3);
+        tx.memo_type = Some("text".into());
+        tx.memo = Some("order-1234".into());
+        tx.ledger_sequence = Some(99887766);
+        tx.source_account = Some("GABC1234567890".into());
+
+        let payload = AlertPayload::new(&ctx, &tx, &AlertRule::AnyTransaction);
+
+        assert_eq!(payload.label, "Label");
+        assert_eq!(payload.contract_id, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(payload.contract_type, ContractType::Soroban);
+        assert_eq!(payload.network, "testnet");
+        assert_eq!(payload.rule_type, "AnyTransaction");
+        assert_eq!(payload.rule_triggered, "AnyTransaction");
+        assert_eq!(payload.transaction_hash, "abc123");
+        assert_eq!(payload.function_name.as_deref(), Some("transfer"));
+        assert_eq!(payload.function_names, vec!["transfer", "withdraw"]);
+        assert_eq!(payload.amount_xlm, Some(15_000));
+        assert_eq!(payload.amount_stroops, Some(150_000_000_000));
+        assert_eq!(payload.fee_charged_stroops, Some(500));
+        assert_eq!(payload.operation_count, Some(3));
+        assert_eq!(payload.memo_type.as_deref(), Some("text"));
+        assert_eq!(payload.memo.as_deref(), Some("order-1234"));
+        assert_eq!(payload.timestamp, tx.timestamp.timestamp());
+        assert_eq!(payload.timestamp_iso, "2024-01-15T12:00:00Z");
+        assert_eq!(
+            payload.horizon_link,
+            "https://horizon-testnet.stellar.org/transactions/abc123"
+        );
+        assert_eq!(
+            payload.explorer_link,
+            "https://stellar.expert/explorer/testnet/tx/abc123"
+        );
+        assert_eq!(payload.ledger_sequence, Some(99887766));
+        assert_eq!(payload.source_account.as_deref(), Some("GABC1234567890"));
+
+        // The serialized JSON must contain every documented field.
+        let json = serde_json::to_value(&payload).unwrap();
+        let object = json.as_object().unwrap();
+        let documented = [
+            "label",
+            "contract_id",
+            "contract_type",
+            "network",
+            "rule_type",
+            "rule_triggered",
+            "transaction_hash",
+            "function_name",
+            "function_names",
+            "amount_xlm",
+            "amount_stroops",
+            "fee_charged_stroops",
+            "operation_count",
+            "memo_type",
+            "memo",
+            "timestamp",
+            "timestamp_iso",
+            "horizon_link",
+            "explorer_link",
+            "ledger_sequence",
+            "source_account",
+        ];
+        for field in documented {
+            assert!(object.contains_key(field), "missing documented field: {}", field);
+        }
+        assert_eq!(object.len(), documented.len(), "undocumented fields present: {:?}", object.keys());
     }
 
     #[test]
