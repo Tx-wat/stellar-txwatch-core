@@ -268,3 +268,48 @@ The webhook payload includes two rule-related fields:
 | `SourceAccountMatch` | `"SourceAccountMatch"` |
 | `SuccessRateThreshold` | `"SuccessRateThreshold"` |
 | `TimeWindow` | `"TimeWindow"` |
+
+## SSE event types (`/stream`)
+
+The `/stream` endpoint emits [Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html).
+Each event has an `event:` type and a JSON `data:` payload.
+
+| Event type        | Description                                                        |
+|-------------------|--------------------------------------------------------------------|
+| `alert`           | An alert rule matched; payload is the webhook payload (see above)  |
+| `delivery:success`| A webhook delivery for an alert succeeded                          |
+| `delivery:failed` | A webhook delivery for an alert failed (after any retries)         |
+
+### `alert`
+
+Emitted when a rule matches a transaction. The `data` payload is identical to the
+[webhook payload](#webhook-payload-fields) described above.
+
+```
+event: alert
+data: {"label":"my-contract","contract_id":"C...","rule_type":"LargeTransfer",...}
+```
+
+### `delivery:success` / `delivery:failed`
+
+Emitted after the webhook delivery for an alert completes. Both events carry a
+`delivery_status` field identifying the outcome, plus the alert's `transaction_hash`
+and `rule_type` so consumers can correlate the delivery with the originating `alert` event.
+
+| Field             | Type   | Description                                                    |
+|-------------------|--------|----------------------------------------------------------------|
+| `delivery_status` | string | `"success"` or `"failed"`                                      |
+| `transaction_hash`| string | Stellar transaction hash of the alert being delivered          |
+| `rule_type`       | string | Stable rule variant that produced the alert (see above)        |
+| `attempts`        | u32    | Number of delivery attempts made (including retries)           |
+| `error`           | string/null | Failure reason; `null` on success                         |
+
+```
+event: delivery:success
+data: {"delivery_status":"success","transaction_hash":"abc...","rule_type":"LargeTransfer","attempts":1,"error":null}
+```
+
+```
+event: delivery:failed
+data: {"delivery_status":"failed","transaction_hash":"abc...","rule_type":"LargeTransfer","attempts":3,"error":"connection refused"}
+```

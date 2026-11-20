@@ -13,6 +13,7 @@ fuzz_target!(|created_at: &str| {
         fee_charged: None,
         envelope_xdr: None,
         result_xdr: None,
+        ledger: None,
     };
     let _ = EnrichedTransaction::from_horizon(tx, vec![], None, None);
 });
