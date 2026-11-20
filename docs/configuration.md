@@ -4,6 +4,9 @@ TxWatch is configured with a TOML file (see `config/example.toml` for a full
 working example). This page documents the available options and how to fix the
 most common configuration errors.
 
+> Environment variables (such as `TXWATCH_CONFIG`, `RUST_LOG`, and `OTEL_*`)
+> are documented separately in [environment-variables.md](environment-variables.md).
+
 ## Top-level options
 
 | Key | Type | Description |
