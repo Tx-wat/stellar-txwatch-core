@@ -19,7 +19,7 @@ fn build_sse_event(msg: &str) -> String {
         "idempotency_key": idempotency_key,
         "data": msg,
     });
-    format!("data: {}\n\n", payload)
+    format!("event: alert\ndata: {}\n\n", payload)
 }
 
 /// Derives the idempotency key from an alert message.
@@ -141,6 +141,14 @@ mod tests {
         assert!(event.contains("\"idempotency_key\":\"C123:abc:large_transfer\""));
     }
 
+    #[test]
+    fn sse_event_has_alert_type_and_single_data_line() {
+        let event = build_sse_event(r#"{"contract_id":"C1"}"#);
+        assert!(event.starts_with("event: alert\ndata: "));
+        assert!(event.ends_with("\n\n"));
+        assert_eq!(event.matches("data: ").count(), 1);
+    }
+
     #[tokio::test]
     async fn sse_server_streams_alerts_with_auth() {
         let (tx, rx) = broadcast::channel(16);
@@ -170,5 +178,14 @@ mod tests {
         let resp = String::from_utf8_lossy(&buf[..n]);
         assert!(resp.contains("200 OK"));
         assert!(resp.contains("text/event-stream"));
+
+        // The alert itself arrives as an `event: alert` frame (may be in the same read).
+        let mut full = resp.to_string();
+        if !full.contains("event: alert") {
+            let n = client.read(&mut buf).await.unwrap();
+            full.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        assert!(full.contains("event: alert\ndata: "));
+        assert!(full.contains("idempotency_key"));
     }
 }
