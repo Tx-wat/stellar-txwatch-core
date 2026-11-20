@@ -210,11 +210,15 @@ This ensures all contributors and CI builds use the exact same dependency versio
 
 ## How to add a new `AlertRule` type
 
-Follow these steps in order. Each step is in a different file.
+Adding a new alert rule touches the config crate (the enum, validation, and
+label/type metadata) and the rules crate (evaluation). Follow these steps in
+order. Each step is in a different file.
 
 ### Step 1 — Declare the variant (`crates/config/src/lib.rs`)
 
-Add your variant to the `AlertRule` enum:
+Add your variant to the `AlertRule` enum. Use `#[serde(rename_all = "snake_case")]`
+style naming consistent with the existing variants (e.g. `FunctionCall`,
+`LargeTransfer`, `FailedTransaction`):
 
 ```rust
 pub enum AlertRule {
@@ -225,7 +229,9 @@ pub enum AlertRule {
 
 ### Step 2 — Validate the new fields (`crates/config/src/lib.rs`)
 
-Add a match arm in `AlertRule::validate()`:
+Add a match arm in `AlertRule::validate()`. Validation runs at startup via
+`txwatch --config <file> validate`, so reject bad config early with a clear
+message that names the contract label:
 
 ```rust
 AlertRule::MyNewRule { my_field } => {
@@ -235,9 +241,35 @@ AlertRule::MyNewRule { my_field } => {
 }
 ```
 
-### Step 3 — Evaluate the rule (`crates/rules/src/lib.rs`)
+### Step 3 — Provide `label()` and `rule_type()` (`crates/config/src/lib.rs`)
 
-Add a match arm in `eval_rule()`:
+Every variant must return a human-readable `label()` (used in webhook payloads
+and logs) and a stable `rule_type()` string (used for filtering and the
+`wrap_rule` matcher). Keep `rule_type()` values stable — they are part of the
+public config/notification surface:
+
+```rust
+impl AlertRule {
+    pub fn label(&self) -> String {
+        match self {
+            // ... existing arms ...
+            AlertRule::MyNewRule { my_field } => format!("MyNewRule({my_field})"),
+        }
+    }
+
+    pub fn rule_type(&self) -> &'static str {
+        match self {
+            // ... existing arms ...
+            AlertRule::MyNewRule { .. } => "MyNewRule",
+        }
+    }
+}
+```
+
+### Step 4 — Evaluate the rule (`crates/rules/src/lib.rs`)
+
+Add a match arm in `eval_rule()` that returns `Ok(true)` when the transaction
+matches:
 
 ```rust
 AlertRule::MyNewRule { my_field } => {
@@ -246,10 +278,11 @@ AlertRule::MyNewRule { my_field } => {
 ```
 
 > Note: Adding a new `AlertRule` variant requires updating both `eval_rule()` and
-> `AlertRule::label()` in `crates/config/src/lib.rs`. Rust's exhaustive matching helps
-> catch missing arms, but both functions must remain in sync for new variants.
+> `AlertRule::label()` / `rule_type()` in `crates/config/src/lib.rs`. Rust's
+> exhaustive matching helps catch missing arms, but these functions must remain
+> in sync for new variants.
 
-### Step 3b — Handle the `wrap_rule` matcher (`crates/rules/src/lib.rs`)
+### Step 5 — Handle the `wrap_rule` matcher (`crates/rules/src/lib.rs`)
 
 `eval_rule()` is **not** the only evaluation path. `eval_time_window()` also
 matches on the wrapped rule's type name via `TimeWindow.wrap_rule`
@@ -258,152 +291,60 @@ has a `_ => Ok(true)` catch-all, so a new rule type that is not handled there
 will **silently always fire** for every transaction inside the time window
 (see issue #453).
 
-For every new variant, do one of the following:
-
-1. **Add a matching arm** to the `wrap_rule` match in `eval_time_window()`:
-
-   ```rust
-   match wrapped {
-       // ... existing arms ...
-       "MyNewRule" => Ok(/* the same condition as eval_rule() */),
-       _ => Ok(true),
-   }
-   ```
-
-   Note that `wrap_rule` only carries a bare type name, so if the rule's
-   condition depends on its own parameters (e.g. a function name), you cannot
-   express it here without threading those parameters through — in that case
-   use option 2.
-
-2. **Reject it at config-validation time**: add the rule type to the
-   `TimeWindow` arm of `AlertRule::validate()` in `crates/config/src/lib.rs`
-   so that configuring it as a `wrap_rule` value fails with a clear error
-   instead of falling through to always-true:
-
-   ```rust
-   AlertRule::TimeWindow { wrap_rule, .. } => {
-       if let Some(wrapped) = wrap_rule {
-           if !SUPPORTED_WRAP_RULES.contains(&wrapped.as_str()) {
-               bail!("TimeWindow wrap_rule '{}' is not supported", wrapped);
-           }
-       }
-   }
-   ```
-
-Whichever option you choose, add a test covering the `wrap_rule` path for the
-new rule type.
-
-### Step 4 — Label the rule (`crates/config/src/lib.rs`)
-
-Add a match arm in `AlertRule::label()` and `AlertRule::rule_type()`:
+For every new variant, add a matching arm to the `wrap_rule` match in
+`eval_time_window()` that delegates to the same logic as `eval_rule()`:
 
 ```rust
-// In label():
-AlertRule::MyNewRule { my_field } => format!("MyNewRule({})", my_field),
-
-// In rule_type():
-AlertRule::MyNewRule { .. } => "MyNewRule".into(),
+match wrapped {
+    // ... existing arms ...
+    "MyNewRule" => Ok(/* the same predicate as eval_rule */),
+    _ => Ok(true),
+}
 ```
 
-### Step 5 — Add to the TOML config format
+### Step 6 — Add tests
 
-Users configure it like:
+Add unit tests next to the code under test:
 
-```toml
-[[contracts.rules]]
-type     = "MyNewRule"
-my_field = "some_value"
-```
+- **Config tests** (`crates/config/src/lib.rs` or `crates/config/tests/`):
+  deserialize a TOML snippet containing the new variant, assert `validate()`
+  accepts valid input and rejects invalid input, and assert `label()` /
+  `rule_type()` return the expected values.
+- **Rule tests** (`crates/rules/src/lib.rs`): build a `Transaction` that should
+  match and one that should not, and assert `eval_rule()` returns the expected
+  result. If the rule can be wrapped in a `TimeWindow`, add a test covering the
+  `wrap_rule` path too.
 
-### Step 6 — Write tests
-
-Add unit tests in `crates/rules/src/lib.rs` and optionally an integration
-test in `crates/poller/tests/integration.rs`.
-
-### Step 7 — Document it
-
-`docs/alert-rules.md` has two distinct places that must be updated for every
-new rule. Do both:
-
-1. **Add a `### RuleName` section to `docs/alert-rules.md`** describing the
-   rule, its fields, and a TOML example:
-
-   ````markdown
-   ### MyNewRule
-
-   Fires when ... .
-
-   | Field | Type | Required | Description |
-   |-------|------|----------|-------------|
-   | `my_field` | string | yes | ... |
-
-   ```toml
-   [[contracts.rules]]
-   type     = "MyNewRule"
-   my_field = "some_value"
-   ```
-   ````
-
-2. **Add a row to the "Stable rule_type values" → Rule type table in
-   `docs/alert-rules.md`** mapping the rule name to its `rule_type` string
-   (the value returned by `AlertRule::rule_type()`):
-
-   ```markdown
-   | `MyNewRule` | `MyNewRule` |
-   ```
-=======
-
-## Architecture Decision Records (ADRs)
-
-Key architectural decisions are documented in `docs/adr/`:
-- [ADR 001: Advance Cursor Before Transaction Enrichment](docs/adr/001-cursor-advance-before-enrichment.md)
-
----
-
-## Code style
+Run the relevant crates before opening a PR:
 
 ```bash
-cargo fmt          # format
-cargo clippy -- -D warnings   # lint (must pass clean)
+cargo test -p txwatch-config
+cargo test -p txwatch-rules
 ```
 
-## Commit style
+### Reference examples
 
-Use [Conventional Commits](https://www.conventionalcommits.org/):
+Use the existing rules as templates — they cover the common shapes:
 
-```
-feat(rules): add MyNewRule evaluation
-fix(config): reject empty contract labels
-test(poller): add integration test for MyNewRule
-docs: document MyNewRule in alert-rules.md
-```
-
-## PR checklist
-
-- [ ] `cargo test` passes
-- [ ] `cargo clippy -- -D warnings` passes
-- [ ] `cargo fmt` applied
-- [ ] New rule documented in `docs/alert-rules.md`: a `### RuleName` prose section **and** a row in the "Stable rule_type values" → Rule type table
-- [ ] CONTRIBUTING.md updated if the contribution process changed
-- [ ] CHANGELOG.md entry added under `## [Unreleased]` in the matching section: `### Added`, `### Changed`, `### Fixed` or `### Removed` (see [Keep a Changelog](https://keepachangelog.com/en/1.0.0/))
+| Rule | Shape |
+|------|-------|
+| `FunctionCall` | matches on `function_name` |
+| `LargeTransfer` | matches on amount threshold |
+| `FailedTransaction` | matches on transaction status |
 
 ---
 
-## Releasing
+## Checklist: adding a new `AlertRule`
 
-Releases are cut by pushing a version tag. The `Release` workflow
-(`.github/workflows/release.yml`) then runs the test suite, builds the Linux
-x86_64 `txwatch` binary, and creates a GitHub Release.
+Copy this into your PR description and tick each item:
 
-1. Move the entries under `## [Unreleased]` in `CHANGELOG.md` into a new
-   `## [X.Y.Z] - YYYY-MM-DD` section, and leave `## [Unreleased]` empty.
-2. Merge that change to `main`.
-3. Tag the commit and push the tag:
-
-   ```bash
-   git tag vX.Y.Z
-   git push origin vX.Y.Z
-   ```
-
-The release notes are the body of the `## [X.Y.Z]` section. The workflow fails
-if that section is missing or empty, so fill it in before tagging.
+- [ ] Added the variant to the `AlertRule` enum in `crates/config/src/lib.rs`
+- [ ] Added a validation arm in `AlertRule::validate()` with a clear error message
+- [ ] Updated `AlertRule::label()` for the new variant
+- [ ] Updated `AlertRule::rule_type()` with a stable string
+- [ ] Added an `eval_rule()` match arm in `crates/rules/src/lib.rs`
+- [ ] Added a `wrap_rule` arm in `eval_time_window()` (or confirmed it is not wrappable)
+- [ ] Added config tests (deserialize, validate, label/rule_type)
+- [ ] Added rule tests (matching and non-matching transactions)
+- [ ] Updated `config/example.toml` if the rule is worth demonstrating
+- [ ] `cargo test --workspace` and `cargo clippy -- -D warnings` pass
