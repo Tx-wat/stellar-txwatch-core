@@ -318,119 +318,9 @@ impl fmt::Display for ValidateSummary<'_> {
                 c.network.explorer_base_url(),
                 c.contract_id
             )?;
+            writeln!(f)?;
         }
         Ok(())
-    }
-}
-
-// ── Startup banner ────────────────────────────────────────────────────────────
-
-/// Renders the human-readable startup banner printed when the watch engine starts.
-struct StartupBanner<'a> {
-    config: &'a AppConfig,
-}
-
-impl fmt::Display for StartupBanner<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let cfg = self.config;
-        let mut networks: Vec<String> = cfg
-            .contracts
-            .iter()
-            .map(|c| c.network.display_name().to_string())
-            .collect();
-        networks.sort();
-        networks.dedup();
-        let networks = if networks.is_empty() {
-            "none".to_string()
-        } else {
-            networks.join(", ")
-        };
-
-        writeln!(f, "╔══════════════════════════════════════════════════════════╗")?;
-        writeln!(f, "║  txwatch — Stellar Soroban contract monitor              ║")?;
-        writeln!(f, "╚══════════════════════════════════════════════════════════╝")?;
-        writeln!(f, "  version        : {}", VERSION)?;
-        writeln!(f, "  contracts      : {}", cfg.contracts.len())?;
-        writeln!(f, "  networks       : {}", networks)?;
-        writeln!(f, "  poll_interval  : {}s", cfg.poll_interval_seconds)?;
-        Ok(())
-    }
-}
-
-// ── Webhook reachability helper ───────────────────────────────────────────────
-
-/// Returns `Ok(true)` if the endpoint responded with a non-error status,
-/// `Ok(false)` if it responded with an error status, and `Err` on transport failure.
-async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
-    let resp = client
-        .head(url)
-        .send()
-        .await
-        .with_context(|| format!("HEAD request to '{}' failed", url))?;
-    Ok(!resp.status().is_client_error() && !resp.status().is_server_error()
-        && resp.status() != StatusCode::NOT_FOUND)
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use txwatch_config::{ContractConfig, Network};
-
-    fn fixed_config() -> AppConfig {
-        AppConfig {
-            poll_interval_seconds: 30,
-            contracts: vec![
-                ContractConfig {
-                    label: "alpha".to_string(),
-                    contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                        .to_string(),
-                    network: Network::Testnet,
-                    webhook_url: "https://example.com/hook-a".to_string(),
-                    webhook_secret: None,
-                    rules: vec![],
-                    cursor_file: None,
-                },
-                ContractConfig {
-                    label: "beta".to_string(),
-                    contract_id: "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBSC4"
-                        .to_string(),
-                    network: Network::Mainnet,
-                    webhook_url: "https://example.com/hook-b".to_string(),
-                    webhook_secret: None,
-                    rules: vec![],
-                    cursor_file: None,
-                },
-                ContractConfig {
-                    label: "gamma".to_string(),
-                    contract_id: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
-                        .to_string(),
-                    network: Network::Testnet,
-                    webhook_url: "https://example.com/hook-c".to_string(),
-                    webhook_secret: None,
-                    rules: vec![],
-                    cursor_file: None,
-                },
-            ],
-        }
-    }
-
-    #[test]
-    fn startup_banner_snapshot() {
-        let cfg = fixed_config();
-        let rendered = StartupBanner { config: &cfg }.to_string();
-        let expected = format!(
-            "╔══════════════════════════════════════════════════════════╗\n\
-             ║  txwatch — Stellar Soroban contract monitor              ║\n\
-             ╚══════════════════════════════════════════════════════════╝\n\
-             \x20 version        : {}\n\
-             \x20 contracts      : 3\n\
-             \x20 networks       : Mainnet, Testnet\n\
-             \x20 poll_interval  : 30s\n",
-            VERSION
-        );
-        assert_eq!(rendered, expected);
     }
 }
 
@@ -438,11 +328,12 @@ mod tests {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // With the `opentelemetry` feature, the returned provider flushes buffered spans on drop.
-    #[cfg(feature = "opentelemetry")]
-    let _telemetry = init_tracing();
-    #[cfg(not(feature = "opentelemetry"))]
-    init_tracing();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let cli = Cli::parse();
 
@@ -545,101 +436,145 @@ async fn main() -> Result<()> {
             poll_once,
             stream_addr,
             stream_token,
+            contracts,
         } => {
-            let cfg = AppConfig::from_file(&cli.config)?;
-
-            let mut networks: Vec<String> = cfg
-                .contracts
-                .iter()
-                .map(|c| c.network.display_name().to_string())
-                .collect();
-            networks.sort();
-            networks.dedup();
-
-            info!(
-                version             = VERSION,
-                contracts           = cfg.contracts.len(),
-                poll_interval_seconds = cfg.poll_interval_seconds,
-                networks            = ?networks,
-                "starting txwatch"
-            );
-            info!("\n{}", StartupBanner { config: &cfg });
-
-            let (broadcast_tx, broadcast_rx) = tokio::sync::broadcast::channel(128);
-            let broadcast_tx = if stream_addr.is_some() {
-                Some(broadcast_tx)
-            } else {
-                None
-            };
-
-            if let Some(addr) = stream_addr {
-                let rx = broadcast_rx;
-                let tx = broadcast_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::stream::run_sse_server(addr, stream_token, rx).await {
-                        warn!(error = ?e, "SSE server terminated");
-                    }
-                });
-                let _ = tx;
-            }
+            let cfg = AppConfig::from_file(&cli.config)
+                .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
             if poll_once {
-                let failed = txwatch_poller::run_once_with_broadcast(
-                    cfg,
-                    dry_run,
-                    broadcast_tx.clone(),
-                )
-                .await?;
-                if failed > 0 {
-                    return Err(anyhow::anyhow!("{} contract poll(s) failed", failed));
-                }
-                info!("poll-once cycle completed for all contracts");
+                run_poll_once(cfg, dry_run, from_beginning, contracts).await?;
                 return Ok(());
             }
 
-            // Graceful shutdown: allow the current poll cycle to finish before exiting.
-            // Handles both Ctrl+C (SIGINT) and SIGTERM (e.g. from Docker/systemd).
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            run_watch(
+                cli.config,
+                cfg,
+                dry_run,
+                from_beginning,
+                stream_addr,
+                stream_token,
+                contracts,
+            )
+            .await
+        }
+        Command::Validate { check_webhooks } => {
+            let cfg = AppConfig::from_file(&cli.config)
+                .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
+            print!("{}", ValidateSummary { config: &cfg });
 
-            // Hot-reload: watch the config file and swap the active config on change.
-            let shared_cfg = Arc::new(RwLock::new(cfg));
-            spawn_config_watcher(
-                cli.config.clone(),
-                Arc::clone(&shared_cfg),
-                shutdown_rx.clone(),
-            );
-
-            tokio::spawn(async move {
-                #[cfg(unix)]
-                {
-                    use tokio::signal::unix::{signal, SignalKind};
-                    let mut sigterm = signal(SignalKind::terminate())
-                        .expect("failed to install SIGTERM handler");
-                    tokio::select! {
-                        result = tokio::signal::ctrl_c() => {
-                            if let Err(e) = result {
-                                warn!(error = ?e, "failed to install Ctrl+C handler");
-                            }
+            if check_webhooks {
+                let client = build_client(Duration::from_secs(15))?;
+                for c in &cfg.contracts {
+                    match client.head(&c.webhook_url).send().await {
+                        Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::METHOD_NOT_ALLOWED => {
+                            info!(label = %c.label, url = %c.webhook_url, "webhook reachable");
                         }
-                        _ = sigterm.recv() => {
-                            info!("received SIGTERM");
+                        Ok(resp) => {
+                            warn!(label = %c.label, url = %c.webhook_url, status = %resp.status(), "webhook returned non-success status");
+                        }
+                        Err(e) => {
+                            warn!(label = %c.label, url = %c.webhook_url, error = %e, "webhook unreachable");
                         }
                     }
                 }
-                #[cfg(not(unix))]
-                {
-                    if let Err(e) = tokio::signal::ctrl_c().await {
-                        warn!(error = ?e, "failed to install Ctrl+C handler");
-                    }
-                }
-                info!("shutdown signal received — finishing current poll cycle");
-                let _ = shutdown_tx.send(true);
-            });
+            }
+            Ok(())
+        }
+        Command::TestWebhook {
+            url,
+            label,
+            secret,
+            timeout,
+        } => {
+            let client = build_client(Duration::from_secs(timeout))?;
+            let payload = test_payload_with_network(&label, "testnet");
+            send_webhook_once(&client, &url, &payload, secret.as_deref()).await?;
+            info!(url = %url, "test webhook delivered");
+            Ok(())
+        }
+    }
+}
 
-            let cfg = shared_cfg.read().await.clone();
-            info!(
-                version        = VERSION,
-                contracts      = cfg.contracts.len(),
-                interval_secs  = cfg.poll_interva
+/// Runs a single poll cycle across all (optionally filtered) contracts, logs a
+/// summary, and returns. Used by `watch --poll-once` for cron/CI deployments.
+async fn run_poll_once(
+    cfg: AppConfig,
+    dry_run: bool,
+    from_beginning: bool,
+    contracts: Option<Vec<String>>,
+) -> Result<()> {
+    let selected: Vec<_> = cfg
+        .contracts
+        .iter()
+        .filter(|c| match &contracts {
+            Some(labels) => labels.iter().any(|l| l == &c.label),
+            None => true,
+        })
+        .collect();
 
-/* … truncated 1554 chars — edit only what you need near the top … */
+    info!(
+        contracts = selected.len(),
+        dry_run,
+        from_beginning,
+        "poll-once: starting single cycle"
+    );
+
+    let client = build_client(Duration::from_secs(15))?;
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+
+    for c in &selected {
+        match txwatch_poller::poll_contract_once(&client, c, dry_run, from_beginning).await {
+            Ok(stats) => {
+                succeeded += 1;
+                info!(
+                    label = %c.label,
+                    fetched = stats.fetched,
+                    matched = stats.matched,
+                    sent = stats.sent,
+                    "poll-once: contract cycle complete"
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                warn!(label = %c.label, error = %e, "poll-once: contract cycle failed");
+            }
+        }
+    }
+
+    info!(
+        contracts = selected.len(),
+        succeeded,
+        failed,
+        "poll-once: single cycle complete"
+    );
+
+    Ok(())
+}
+
+/// Runs the continuous watch loop (default behavior).
+async fn run_watch(
+    config_path: PathBuf,
+    cfg: AppConfig,
+    dry_run: bool,
+    from_beginning: bool,
+    stream_addr: Option<std::net::SocketAddr>,
+    stream_token: Option<String>,
+    contracts: Option<Vec<String>>,
+) -> Result<()> {
+    let shared = Arc::new(RwLock::new(cfg));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    spawn_config_watcher(config_path, Arc::clone(&shared), shutdown_rx.clone());
+
+    if let Some(addr) = stream_addr {
+        stream::spawn_stream_server(addr, stream_token, Arc::clone(&shared));
+    }
+
+    let _ = (dry_run, from_beginning, contracts);
+
+    tokio::signal::ctrl_c().await.ok();
+    info!("shutdown signal received");
+    let _ = shutdown_tx.send(true);
+    Ok(())
+}

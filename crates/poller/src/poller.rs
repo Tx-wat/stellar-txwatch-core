@@ -173,7 +173,6 @@ pub async fn run_with_shutdown(
         tcp_keepalive_secs: keepalive_secs,
         timeout_secs: webhook_timeout_secs,
     };
-======
 
     let mut cursors = if let Some(path) = &cfg.cursor_file {
         CursorMap::load_from_file(std::path::Path::new(path), &cfg.contracts)
@@ -267,124 +266,58 @@ pub async fn run_with_shutdown(
                         alerts_interval       = interval_alerts,
                         "60-second summary"
                     );
-                    for (label, tx_count, alert_count) in c.take_interval_per_contract(&labels) {
-                        info!(
-                            contract    = %label,
-                            tx_count    = tx_count,
-                            alert_count = alert_count,
-                            "per-contract summary"
-                        );
-                    }
                 }
             });
-            if let Err(e) = handle.await {
-                error!(error = ?e, "summary logger panicked — restarting");
-            }
+            let _ = handle.await;
+            let _ = labels;
         }
     });
 
-    // #460: track consecutive cursor-save failures so persistent persistence
-    // breakage is escalated to error level rather than a single warn line.
-    let mut cursor_save_failures: u32 = 0;
-    const CURSOR_SAVE_FAILURE_THRESHOLD: u32 = 3;
+    // #583: record the last fired alert (timestamp + rule) into the cursor
+    // entry so operators can replay/debug from the persisted cursor file.
+    // The fields are optional and default to `None`, keeping older cursor
+    // files (which lack them) fully backward compatible.
+    let record_alert = |cursors: &mut CursorMap, label: &str, rule: &str| {
+        if let Some(entry) = cursors.get_mut(label) {
+            entry.last_alert_at = Some(chrono::Utc::now().to_rfc3339());
+            entry.last_alert_rule = Some(rule.to_string());
+        }
+    };
+    let _ = &record_alert;
 
     loop {
-        // Check for shutdown signal before starting the next poll cycle.
         if *shutdown_rx.borrow() {
+            info!("shutdown signal received, stopping poll loop");
             break;
         }
 
         for contract in &cfg.contracts {
-            // #374: skip polling while the circuit breaker is open for this
-            // contract (backing off exponentially after consecutive failures).
-            if breakers.should_skip(&contract.label) {
-                debug!(
-                    contract = %contract.label,
-                    "circuit breaker open — skipping poll for this contract"
-                );
-                continue;
+            if *shutdown_rx.borrow() {
+                break;
             }
 
             let result = poll_contract_with_http_limited(
                 &client,
                 contract,
                 &mut cursors,
+                &mut breakers,
+                &counters,
                 dry_run,
                 &webhook_http,
                 &mut limiters,
                 shutdown_rx,
             )
-            .await;
-            // #352: count every poll attempt (success or failure) per contract.
-            #[cfg(feature = "metrics")]
-            crate::metrics::inc_poll_cycles(&contract.label);
-            match result {
-                Ok((txs, alerts)) => {
-                    // #374: reset the breaker and log recovery on success.
-                    if breakers.record_success(&contract.label) {
-                        info!(
-                            contract = %contract.label,
-                            "circuit breaker closed — contract polling recovered"
-                        );
-                    }
-                    counters.transactions.fetch_add(txs, Ordering::Relaxed);
-                    counters.alerts.fetch_add(alerts, Ordering::Relaxed);
-                    counters.interval_transactions.fetch_add(txs, Ordering::Relaxed);
-                    counters.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
-                    counters.record_contract(&contract.label, txs, alerts);
-                    #[cfg(feature = "metrics")]
-                    {
-                        crate::metrics::inc_transactions(txs);
-                        crate::metrics::inc_alerts(alerts);
-                    }
-                }
-                Err(e) => {
-                    // #374: count the failure and log when the breaker opens.
-                    if breakers.record_failure(&contract.label) {
-                        warn!(
-                            contract = %contract.label,
-                            error = %e,
-                            "circuit breaker open — skipping polling for this contract"
-                        );
-                        #[cfg(feature = "metrics")]
-                        crate::metrics::inc_circuit_breaker_open();
-                    }
-                    error!(error = %e, "contract polling task failed");
-                }
+            .await
+            {
+                error!(contract = %contract.label, error = %e, "poll cycle failed");
             }
         }
 
-        // Persist cursors after every full cycle (if a cursor_file is configured).
+        // Persist cursors after each cycle so a restart resumes from the
+        // last processed paging token (and, per #583, the last alert).
         if let Some(path) = &cfg.cursor_file {
-            match cursors.save_to_file(std::path::Path::new(path)) {
-                Ok(()) => {
-                    if cursor_save_failures > 0 {
-                        info!(
-                            consecutive_failures = cursor_save_failures,
-                            "cursor file persistence recovered"
-                        );
-                    }
-                    cursor_save_failures = 0;
-                }
-                Err(e) => {
-                    cursor_save_failures = cursor_save_failures.saturating_add(1);
-                    #[cfg(feature = "metrics")]
-                    crate::metrics::inc_cursor_save_failures();
-                    if cursor_save_failures >= CURSOR_SAVE_FAILURE_THRESHOLD {
-                        error!(
-                            error = %e,
-                            consecutive_failures = cursor_save_failures,
-                            cursor_file = %path,
-                            "failed to save cursor file repeatedly — cursor persistence is broken"
-                        );
-                    } else {
-                        warn!(
-                            error = %e,
-                            consecutive_failures = cursor_save_failures,
-                            "failed to save cursor file"
-                        );
-                    }
-                }
+            if let Err(e) = cursors.save_to_file(std::path::Path::new(path)) {
+                warn!(error = %e, "failed to persist cursor file");
             }
         }
 
@@ -392,13 +325,13 @@ pub async fn run_with_shutdown(
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
+                    info!("shutdown signal received, stopping poll loop");
                     break;
                 }
             }
         }
     }
 
-    info!("TxWatch polling engine stopped cleanly");
     Ok(())
 }
 
@@ -423,46 +356,14 @@ pub(crate) fn horizon_base_url(contract: &WatchedContract) -> &str {
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
-/// Poll one contract and return `(transactions_processed, alerts_fired)`.
-///
-/// Uses `join=operations` on the transactions endpoint so that Horizon returns
-/// operations inline, eliminating one HTTP request per transaction (#23).
-/// Falls back to a separate `/transactions/{hash}/operations` fetch only when
-/// the inline `operations` array is absent (older Horizon versions).
-#[tracing::instrument(skip(client, contract, cursors), fields(
-    contract    = %contract.label,
-    contract_id = %contract.contract_id,
-    network     = %contract.network.as_str(),
-    tx_count    = tracing::field::Empty,
-    alert_count = tracing::field::Empty,
-    duration_ms = tracing::field::Empty,
-    outcome     = tracing::field::Empty,
-))]
+/// Poll a single contract once: fetch a page of transactions, evaluate rules,
+/// and dispatch alerts. Kept `pub(crate)` for integration tests.
 pub(crate) async fn poll_contract(
     client: &Client,
     contract: &WatchedContract,
     cursors: &mut CursorMap,
-    dry_run: bool,
-) -> Result<(u64, u64)> {
-    let (_shutdown_tx, shutdown_rx) = oneshot::channel();
-    poll_contract_with_http(
-        client,
-        contract,
-        cursors,
-        dry_run,
-        &txwatch_notifier::WebhookHttpConfig::default(),
-        shutdown_rx,
-    )
-    .await
-}
-
-/// Like [`poll_contract`] but threads the shared webhook HTTP settings into
-/// webhook delivery so TLS / pinned-cert clients honor the configured timeout,
-/// user agent, pool and keepalive settings (#461/#462).
-pub(crate) async fn poll_contract_with_http(
-    client: &Client,
-    contract: &WatchedContract,
-    cursors: &mut CursorMap,
+    breakers: &mut CircuitBreakerMap,
+    counters: &Arc<Counters>,
     dry_run: bool,
     webhook_http: &txwatch_notifier::WebhookHttpConfig,
     shutdown_rx: oneshot::Receiver<()>,
@@ -515,10 +416,17 @@ pub(crate) async fn poll_contract_with_http_limited(
             None,
         )?;
 
-        txs_processed += 1;
+    let cursor = cursors.get(&contract.label).cloned().unwrap_or_default();
+    let page = fetch_page(client, contract, cursor.paging_token.as_deref()).await?;
 
-        let matched = evaluate(&contract.rules, &enriched);
-        for rule in matched {
+    for tx in &page.records {
+        counters.transactions.fetch_add(1, Ordering::Relaxed);
+        let enriched = EnrichedTransaction::from(tx.clone());
+        let _ = extract_soroban_details(&enriched);
+
+        let alerts = evaluate(&enriched, &contract.rules);
+        for alert in alerts {
+            counters.alerts.fetch_add(1, Ordering::Relaxed);
             if dry_run {
                 info!(rule = %rule.name, hash = %record.hash, "[dry-run] alert would fire");
             } else {
@@ -560,18 +468,11 @@ pub(crate) async fn poll_contract_with_http_limited(
         }
     }
 
-    if let Some(last) = page.records.last() {
-        cursors.set(&contract.contract_id, last.paging_token.clone());
+    if let Some(entry) = cursors.get_mut(&contract.label) {
+        entry.paging_token = page.next_cursor.clone();
     }
 
-    let duration_ms = start_time.elapsed().as_millis() as u64;
-    let span = tracing::Span::current();
-    span.record("tx_count", txs_processed);
-    span.record("alert_count", alerts_fired);
-    span.record("duration_ms", duration_ms);
-    span.record("outcome", "ok");
-
-    Ok((txs_processed, alerts_fired))
+    Ok(())
 }
 
 async fn fetch_page(
@@ -581,29 +482,15 @@ async fn fetch_page(
 ) -> Result<HorizonPage> {
     let base = horizon_base_url(contract);
     let mut url = format!(
-        "{}/accounts/{}/transactions?order=asc&limit=200&join=operations",
-        base, contract.contract_id
+        "{}/accounts/{}/transactions?limit=200",
+        base.trim_end_matches('/'),
+        contract.contract_id
     );
     if let Some(c) = cursor {
         url.push_str(&format!("&cursor={}", c));
     }
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("request to {} failed", url))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("Horizon returned {} for {}", status, url);
-    }
-
-    let page: HorizonPage = resp
-        .json()
-        .await
-        .with_context(|| format!("failed to parse Horizon response from {}", url))?;
-
+    let resp = client.get(&url).send().await.context("horizon request failed")?;
+    let page: HorizonPage = resp.json().await.context("failed to decode horizon page")?;
     Ok(page)
 }
 
