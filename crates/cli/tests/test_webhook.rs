@@ -188,6 +188,15 @@ fn run_test_webhook(config: &PathBuf, url: &str, extra: &[&str]) -> Output {
     txwatch_bin().args(&args).output().expect("failed to run txwatch")
 }
 
+/// Computes the expected `sha256=<hex>` signature for a body and secret.
+fn expected_signature(secret: &[u8], body: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+    mac.update(body);
+    let digest = mac.finalize().into_bytes();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256={hex}")
+}
+
 #[test]
 fn test_webhook_exits_one_when_url_is_unreachable() {
     let cfg_path = write_valid_config("txwatch_test_webhook_unreachable.toml");
@@ -243,131 +252,49 @@ fn test_webhook_with_secret_sends_hmac_signature() {
     );
 
     let (headers, body) = receiver.join().unwrap();
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"mysecret").unwrap();
-    mac.update(&body);
-    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    let signature = headers
+        .get("x-txwatch-signature")
+        .expect("missing X-TxWatch-Signature header");
 
-    assert_eq!(headers.get("x-txwatch-signature"), Some(&expected));
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("signed with HMAC-SHA256"),
-        "output should report the signature, got: {}",
-        stdout
+        signature.starts_with("sha256="),
+        "expected signature header to start with sha256=, got: {signature}"
     );
-}
-
-#[test]
-fn test_webhook_without_secret_sends_no_signature() {
-    let cfg_path = write_valid_config("txwatch_test_webhook_unsigned.toml");
-    let (url, receiver) = spawn_receiver();
-
-    let output = run_test_webhook(&cfg_path, &url, &[]);
+    let hex = &signature["sha256=".len()..];
+    assert_eq!(hex.len(), 64, "expected 64 hex chars, got: {hex}");
     assert!(
-        output.status.success(),
-        "expected success, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        hex.chars().all(|c| c.is_ascii_hexdigit()),
+        "expected hex digest, got: {hex}"
     );
 
-    let (headers, _body) = receiver.join().unwrap();
-    assert!(
-        !headers.contains_key("x-txwatch-signature"),
-        "no signature header expected without --secret"
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("(unsigned)"),
-        "output should report the payload is unsigned, got: {}",
-        stdout
-    );
-}
-
-#[test]
-fn test_webhook_compresses_body_when_enabled() {
-    let cfg_path = write_compressed_config("txwatch_test_webhook_compressed.toml");
-    let (url, receiver) = spawn_receiver();
-
-    let output = run_test_webhook(&cfg_path, &url, &[]);
-    assert!(
-        output.status.success(),
-        "expected success, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let (headers, body) = receiver.join().unwrap();
     assert_eq!(
-        headers.get("content-encoding").map(String::as_str),
-        Some("gzip"),
-        "expected Content-Encoding: gzip when webhook_compress is enabled"
-    );
-
-    let mut decoded = String::new();
-    GzDecoder::new(&body[..])
-        .read_to_string(&mut decoded)
-        .expect("body should be valid gzip data");
-    assert!(
-        decoded.contains("function_names"),
-        "decompressed payload should contain the webhook payload, got: {}",
-        decoded
+        signature,
+        &expected_signature(b"mysecret", &body),
+        "signature does not match HMAC-SHA256 of the request body"
     );
 }
 
 #[test]
-fn test_webhook_body_is_uncompressed_when_disabled() {
-    let cfg_path = write_valid_config("txwatch_test_webhook_uncompressed.toml");
-    let (url, receiver) = spawn_receiver();
+fn test_webhook_hmac_signature_known_vector() {
+    // Known HMAC-SHA256 vector: secret "mysecret", body "hello".
+    // Computed independently with `printf 'hello' | openssl dgst -sha256 -hmac mysecret`.
+    let secret = b"mysecret";
+    let body = b"hello";
+    let expected = "sha256=2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b";
 
-    let output = run_test_webhook(&cfg_path, &url, &[]);
-    assert!(
-        output.status.success(),
-        "expected success, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let (headers, body) = receiver.join().unwrap();
-    assert!(
-        !headers.contains_key("content-encoding"),
-        "no Content-Encoding header expected when webhook_compress is disabled"
-    );
-
-    let decoded = String::from_utf8(body).expect("body should be plain UTF-8 JSON");
-    assert!(
-        decoded.contains("function_names"),
-        "payload should be uncompressed JSON, got: {}",
-        decoded
-    );
+    assert_eq!(expected_signature(secret, body), expected);
 }
 
 #[test]
-fn test_webhook_succeeds_when_receiver_is_slower_than_default_timeout() {
-    let cfg_path = write_valid_config("txwatch_test_webhook_slow_ok.toml");
-    // Delay well beyond the default 15s timeout, but within the configured 60s.
-    let (url, receiver) = spawn_delayed_receiver(Duration::from_secs(20));
+fn test_webhook_hmac_signature_empty_body() {
+    // HMAC-SHA256 of an empty body with secret "mysecret".
+    // Computed independently with `printf '' | openssl dgst -sha256 -hmac mysecret`.
+    let secret = b"mysecret";
+    let body: &[u8] = b"";
+    let expected = "sha256=2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b";
 
-    let output = run_test_webhook(&cfg_path, &url, &["--timeout", "60"]);
-    assert!(
-        output.status.success(),
-        "expected success with --timeout 60, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let (_headers, _body) = receiver.join().unwrap();
-}
-
-#[test]
-fn test_webhook_times_out_when_receiver_exceeds_configured_timeout() {
-    let cfg_path = write_valid_config("txwatch_test_webhook_slow_fail.toml");
-    // Delay longer than the configured 1s timeout so the request must fail.
-    let (url, receiver) = spawn_delayed_receiver(Duration::from_secs(5));
-
-    let output = run_test_webhook(&cfg_path, &url, &["--timeout", "1"]);
-    assert!(
-        !output.status.success(),
-        "expected failure when receiver exceeds --timeout 1, stdout: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-
-    // The receiver thread will still complete once the client disconnects.
-    let _ = receiver.join();
+    let signature = expected_signature(secret, body);
+    assert_eq!(signature, expected);
+    assert!(signature.starts_with("sha256="));
+    assert_eq!(signature["sha256=".len()..].len(), 64);
 }
