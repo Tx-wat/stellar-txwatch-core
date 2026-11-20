@@ -216,7 +216,8 @@ txwatch [--config <path>] <command>
 
 Commands:
   watch [--dry-run] [--from-beginning]  Start the polling engine
-  validate [--check-webhooks]           Validate the config file and print a summary
+  validate [--check-webhooks] [--check-contracts] [--output text|json]
+                                        Validate the config file and print a summary
   test-webhook --url <URL>              Send a test payload to a webhook URL and exit
 ```
 
@@ -231,6 +232,14 @@ Optional OpenTelemetry trace export: build with `--features opentelemetry` and s
 - `--from-beginning` — start polling from the earliest available transaction (cursor `0`) instead of `now`. Overrides any persisted `cursor_file` values for this run (does not modify the file). Warning: may generate many alerts for historical transactions.
 - `--stream-addr <ADDR>` — enable Server-Sent Events (SSE) streaming on `GET /stream` (e.g. `127.0.0.1:8088`) for local development without public webhooks.
 - `--stream-token <TOKEN>` — optional bearer authentication token required to connect to the SSE `/stream` endpoint.
+- `--check-contracts` — before polling, look up each `contract_id` on Horizon and log a warning if it is not found on the configured network.
+
+**validate flags:**
+- `--check-webhooks` — send a HEAD request to each webhook URL and warn on unreachable endpoints.
+- `--check-contracts` — `GET /accounts/{contract_id}` on each contract's Horizon (the per-contract `horizon_url` if set) and warn — without failing — when the contract is not found on that network.
+- `--output json` — print a machine-readable JSON summary (`contracts[]` with `label`, `contract_id`, `network`, `webhook_url`, `rules`, and whether a `secret` is set) for CI pipelines. When checks are enabled, each contract also gets `webhook_reachable` / `contract_found`. Default is `text`.
+
+Logs are written to stderr, so stdout carries only command output.
 
 ---
 

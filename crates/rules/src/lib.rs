@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use txwatch_config::{AlertRule, ContractType};
+use txwatch_config::{AlertRule, ContractType, Network};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -155,6 +155,12 @@ pub struct HorizonTransaction {
     pub memo_type: Option<String>,
     /// Memo value; absent when `memo_type` is `"none"`.
     pub memo: Option<String>,
+    /// Stellar account that signed and submitted this transaction.
+    #[serde(default)]
+    pub source_account: Option<String>,
+    /// Ledger sequence number this transaction was included in.
+    #[serde(default, rename = "ledger")]
+    pub ledger_sequence: Option<u32>,
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -189,6 +195,8 @@ pub struct EnrichedTransaction {
     pub result_code: Option<i32>,
     /// Stellar account that signed and submitted this transaction.
     pub source_account: Option<String>,
+    /// Ledger sequence number this transaction was included in.
+    pub ledger_sequence: Option<u32>,
 }
 
 impl EnrichedTransaction {
@@ -231,6 +239,7 @@ impl EnrichedTransaction {
             memo:          tx.memo,
             result_code,
             source_account: tx.source_account,
+            ledger_sequence: tx.ledger_sequence,
         })
     }
 }
@@ -390,39 +399,19 @@ pub fn evaluate_with_tracker(
     tx: &EnrichedTransaction,
     tracker: &mut SuccessRateTracker,
 ) -> Vec<AlertPayload> {
-    let horizon_base  = horizon_base.trim_end_matches('/');
-    let explorer_base = explorer_base.trim_end_matches('/');
-    let horizon_link  = format!("{}/transactions/{}", horizon_base, tx.hash);
-    let explorer_link = format!("{}/tx/{}", explorer_base, tx.hash);
-    let timestamp = tx.timestamp.timestamp();
-    let timestamp_iso = tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let ctx = PayloadContext {
+        label,
+        contract_id,
+        network,
+        horizon_base,
+        explorer_base,
+        tags,
+    };
 
     rules
         .iter()
         .filter_map(|rule| match eval_rule(rule, tx, contract_id, tracker) {
-            Ok(true) => Some(AlertPayload {
-                label: label.to_string(),
-                contract_id: contract_id.to_string(),
-                contract_type: ContractType::from_contract_id(contract_id),
-                network: network.to_string(),
-                rule_type: rule.rule_type(),
-                rule_triggered: rule.label(),
-                transaction_hash: tx.hash.clone(),
-                function_name: tx.function_names.first().cloned(),
-                function_names: tx.function_names.clone(),
-                amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
-                amount_stroops: tx.amount_stroops,
-                fee_charged_stroops: tx.fee_charged_stroops,
-                operation_count: tx.operation_count,
-                memo_type: tx.memo_type.clone(),
-                memo: tx.memo.clone(),
-                timestamp,
-                timestamp_iso: timestamp_iso.clone(),
-                horizon_link: horizon_link.clone(),
-                explorer_link: explorer_link.clone(),
-                ledger_sequence: tx.ledger_sequence,
-                source_account: tx.source_account.clone(),
-            }),
+            Ok(true) => Some(AlertPayload::new(&ctx, tx, rule)),
             Ok(false) => None,
             Err(e) => {
                 tracing::warn!(
@@ -581,6 +570,16 @@ pub fn eval_time_window(
     }
 }
 
+/// Per-contract context needed to build an [`AlertPayload`].
+pub struct PayloadContext<'a> {
+    pub label: &'a str,
+    pub contract_id: &'a str,
+    pub network: &'a Network,
+    pub horizon_base: &'a str,
+    pub explorer_base: &'a str,
+    pub tags: Option<&'a HashMap<String, String>>,
+}
+
 impl AlertPayload {
     /// Build the webhook payload for `rule` matching `tx` on the contract described by `ctx`.
     pub fn new(ctx: &PayloadContext<'_>, tx: &EnrichedTransaction, rule: &AlertRule) -> Self {
@@ -589,19 +588,26 @@ impl AlertPayload {
         Self {
             label: ctx.label.to_string(),
             contract_id: ctx.contract_id.to_string(),
-            contract_type: ContractType::from_contract_id(ctx.contract_id),
-            network: ctx.network.to_string(),
-            rule_type: rule_type(rule),
-            rule_triggered: rule_label(rule),
+            contract_type: ContractType::from_contract_id(ctx.contract_id)
+                .unwrap_or(ContractType::Soroban),
+            network: ctx.network.clone(),
+            rule_type: rule.rule_type(),
+            rule_triggered: rule.label(),
             transaction_hash: tx.hash.clone(),
             function_name: tx.function_names.first().cloned(),
             function_names: tx.function_names.clone(),
             amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+            amount_stroops: tx.amount_stroops,
             fee_charged_stroops: tx.fee_charged_stroops,
+            operation_count: tx.operation_count,
+            memo_type: tx.memo_type.clone(),
+            memo: tx.memo.clone(),
             timestamp: tx.timestamp.timestamp(),
             timestamp_iso: tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             horizon_link: format!("{}/transactions/{}", horizon_base, tx.hash),
             explorer_link: format!("{}/tx/{}", explorer_base, tx.hash),
+            ledger_sequence: tx.ledger_sequence,
+            source_account: tx.source_account.clone(),
             tags: ctx.tags.cloned(),
         }
     }
@@ -745,7 +751,8 @@ impl AlertPayloadBuilder {
 
     pub fn build(self) -> AlertPayload {
         AlertPayload {
-            contract_type: ContractType::from_contract_id(&self.contract_id),
+            contract_type: ContractType::from_contract_id(&self.contract_id)
+                .unwrap_or(ContractType::Soroban),
             label: self.label,
             contract_id: self.contract_id,
             network: self.network,
@@ -839,6 +846,7 @@ mod tests {
             memo: None,
             result_code: None,
             source_account: None,
+            ledger_sequence: None,
         }
     }
 
@@ -877,11 +885,17 @@ mod tests {
             "function_name",
             "function_names",
             "amount_xlm",
+            "amount_stroops",
             "fee_charged_stroops",
+            "operation_count",
+            "memo_type",
+            "memo",
             "timestamp",
             "timestamp_iso",
             "horizon_link",
             "explorer_link",
+            "ledger_sequence",
+            "source_account",
         ];
         for field in documented {
             assert!(object.contains_key(field), "missing documented field: {}", field);
@@ -934,7 +948,7 @@ mod tests {
             let ctx = PayloadContext {
                 label: "Label",
                 contract_id,
-                network: "testnet",
+                network: &Network::Testnet,
                 horizon_base: "https://horizon-testnet.stellar.org",
                 explorer_base: "https://stellar.expert/explorer/testnet",
                 tags: None,
@@ -965,7 +979,7 @@ mod tests {
         let ctx = PayloadContext {
             label: "Label",
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            network: "testnet",
+            network: &Network::Testnet,
             horizon_base: "https://horizon-testnet.stellar.org",
             explorer_base: "https://stellar.expert/explorer/testnet",
             tags: None,
@@ -976,7 +990,7 @@ mod tests {
         let payload = AlertPayload::new(&ctx, &tx, &AlertRule::AnyTransaction);
 
         assert_eq!(payload.label, "Label");
-        assert_eq!(payload.network, "testnet");
+        assert_eq!(payload.network, Network::Testnet);
         assert_eq!(payload.rule_type, "AnyTransaction");
         assert_eq!(payload.rule_triggered, "AnyTransaction");
         assert_eq!(payload.transaction_hash, "abc123");
@@ -1005,7 +1019,7 @@ mod tests {
         let payloads = evaluate(
             "Label",
             "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "testnet",
+            &Network::Testnet,
             "https://horizon-testnet.stellar.org",
             "https://stellar.expert/explorer/testnet",
             &[AlertRule::AnyTransaction, AlertRule::TransactionFailed],
@@ -1070,6 +1084,7 @@ mod tests {
             memo_type: None,
             memo: None,
             source_account: None,
+            ledger_sequence: None,
         }
     }
 
@@ -1367,6 +1382,7 @@ mod tests {
             memo_type: None,
             memo: None,
             source_account: None,
+            ledger_sequence: None,
         };
 
         let explicit = EnrichedTransaction::from_horizon(raw(Some("100")), vec![], None, Some(999)).unwrap();
@@ -1491,10 +1507,11 @@ mod tests {
                 memo: None,
                 result_code: None,
                 source_account: None,
+                ledger_sequence: None,
             };
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                "testnet", horizon_base, explorer_base,
+                &Network::Testnet, horizon_base, explorer_base,
                 &[AlertRule::AnyTransaction], None, &tx,
             );
             payloads.remove(0)
@@ -1523,7 +1540,7 @@ mod tests {
         let ctx = PayloadContext {
             label: "TestContract",
             contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            network: "testnet",
+            network: &Network::Testnet,
             horizon_base: "https://horizon-testnet.stellar.org/",
             explorer_base: "https://stellar.expert/explorer/testnet/",
             tags: None,
@@ -1688,6 +1705,7 @@ mod tests {
             memo_type: None,
             memo: None,
             source_account: Some(SOURCE.into()),
+            ledger_sequence: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.source_account.as_deref(), Some(SOURCE));
@@ -1707,6 +1725,7 @@ mod tests {
             memo_type: None,
             memo: None,
             source_account: None,
+            ledger_sequence: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
@@ -1720,11 +1739,13 @@ mod tests {
             successful: true,
             paging_token: "2".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
             memo_type: Some("text".into()),
             memo: Some("order-1234".into()),
             source_account: None,
+            ledger_sequence: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.memo_type.as_deref(), Some("text"));
@@ -1732,9 +1753,9 @@ mod tests {
 
         let payloads = evaluate(
             "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "testnet", "https://horizon-testnet.stellar.org",
+            &Network::Testnet, "https://horizon-testnet.stellar.org",
             "https://stellar.expert/explorer/testnet",
-            &[AlertRule::AnyTransaction], &enriched,
+            &[AlertRule::AnyTransaction], None, &enriched,
         );
         assert_eq!(payloads[0].memo_type.as_deref(), Some("text"));
         assert_eq!(payloads[0].memo.as_deref(), Some("order-1234"));
@@ -1763,6 +1784,7 @@ mod tests {
             memo_type: None,
             memo: None,
             source_account: None,
+            ledger_sequence: None,
         };
         let result = EnrichedTransaction::from_horizon(raw, vec![], None, None);
         assert!(result.is_err(), "expected Err for invalid timestamp");
@@ -1840,6 +1862,7 @@ mod tests {
             memo_type: None,
             memo: None,
             source_account: None,
+            ledger_sequence: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.operation_count, Some(5));
@@ -1864,6 +1887,7 @@ mod tests {
             memo_type: None,
             memo: None,
             source_account: None,
+            ledger_sequence: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.operation_count, None);
@@ -1976,6 +2000,7 @@ mod tests {
             memo_type: None,
             memo: None,
             source_account: Some("GABC1234567890".into()),
+            ledger_sequence: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.source_account.as_deref(), Some("GABC1234567890"));
@@ -2010,6 +2035,7 @@ mod tests {
             memo_type: None,
             memo: None,
             source_account: None,
+            ledger_sequence: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.ledger_sequence, None);

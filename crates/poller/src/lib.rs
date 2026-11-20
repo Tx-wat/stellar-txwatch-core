@@ -14,7 +14,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json;
 use std::fs;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
 use txwatch_notifier::{build_tls_client, send_webhook};
@@ -238,7 +238,7 @@ pub async fn run_with_shutdown(
     dry_run: bool,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    run_internal(cfg, dry_run, false, shutdown_rx).await
+    run_internal(cfg, dry_run, false, shutdown_rx, None).await
 }
 
 /// Full internal entry point with all options.
@@ -248,7 +248,19 @@ pub async fn run_with_options(
     from_beginning: bool,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    run_internal(cfg, dry_run, from_beginning, shutdown_rx).await
+    run_internal(cfg, dry_run, from_beginning, shutdown_rx, None).await
+}
+
+/// Like [`run_with_options`], but also publishes every fired alert (as its JSON
+/// payload) on `alerts_tx`, e.g. for the CLI's SSE `/stream` endpoint.
+pub async fn run_with_broadcast(
+    cfg: AppConfig,
+    dry_run: bool,
+    from_beginning: bool,
+    shutdown_rx: watch::Receiver<bool>,
+    alerts_tx: Option<broadcast::Sender<String>>,
+) -> Result<()> {
+    run_internal(cfg, dry_run, from_beginning, shutdown_rx, alerts_tx).await
 }
 
 async fn run_internal(
@@ -256,6 +268,7 @@ async fn run_internal(
     dry_run: bool,
     from_beginning: bool,
     mut shutdown_rx: watch::Receiver<bool>,
+    alerts_tx: Option<broadcast::Sender<String>>,
 ) -> Result<()> {
     let client = build_http_client(&cfg)?;
 
@@ -407,6 +420,7 @@ async fn run_internal(
             &counters,
             MAX_CONCURRENT_POLLS,
             &mut breakers,
+            alerts_tx.as_ref(),
         )
         .await;
         tokio::select! {
@@ -439,6 +453,7 @@ async fn poll_cycle(
     counters:       &Arc<Counters>,
     max_concurrent: usize,
     breakers:       &mut HashMap<String, CircuitBreaker>,
+    alerts_tx:      Option<&broadcast::Sender<String>>,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
     let mut set = tokio::task::JoinSet::new();
@@ -456,15 +471,20 @@ async fn poll_cycle(
         let counters  = Arc::clone(counters);
         let semaphore = Arc::clone(&semaphore);
         let cursor    = cursors.get(&contract.contract_id).cloned();
+        let alerts_tx = alerts_tx.cloned();
         set.spawn(async move {
             let _permit = semaphore.acquire_owned().await.ok();
             let mut local: HashMap<String, String> = HashMap::new();
             if let Some(c) = cursor {
                 local.insert(contract.contract_id.clone(), c);
             }
-            let result = poll_contract(&client, &client, &contract, &mut local, dry_run).await;
+            let result = poll_contract_with(
+                &client, &client, &contract, &mut local, dry_run, alerts_tx.as_ref(),
+            )
+            .await;
             match &result {
-                Ok((txs, alerts)) => {
+                Ok((txs, alerts, suppressed)) => {
+                    counters.interval_suppressed.fetch_add(*suppressed, Ordering::Relaxed);
                     counters.transactions.fetch_add(*txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(*alerts, Ordering::Relaxed);
                     counters.interval_transactions.fetch_add(*txs, Ordering::Relaxed);
@@ -611,7 +631,7 @@ impl HorizonClient for Client {
             anyhow::bail!("Horizon returned HTTP {} for {}", response.status(), url);
         }
 
-        let page: HorizonPage = response
+        let page: HorizonPage<HorizonTransactionWithOps> = response
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
@@ -639,12 +659,26 @@ impl HorizonClient for Client {
 /// starting cursors as `run_with_shutdown`. Returns the number of contracts whose
 /// poll failed; a contract that fails is logged and does not stop the others.
 pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<usize> {
+    run_once_with_broadcast(cfg, dry_run, None).await
+}
+
+/// Like [`run_once`], but also publishes every fired alert (as its JSON payload)
+/// on `alerts_tx`.
+pub async fn run_once_with_broadcast(
+    cfg: AppConfig,
+    dry_run: bool,
+    alerts_tx: Option<broadcast::Sender<String>>,
+) -> Result<usize> {
     let client = build_http_client(&cfg)?;
     let mut cursors = initial_cursors(&cfg);
     let mut failed = 0;
 
     for contract in &cfg.contracts {
-        if let Err(e) = poll_contract(&client, &client, contract, &mut cursors, dry_run).await {
+        if let Err(e) = poll_contract_with(
+            &client, &client, contract, &mut cursors, dry_run, alerts_tx.as_ref(),
+        )
+        .await
+        {
             error!(contract = %contract.label, error = %e, "contract polling task failed");
             failed += 1;
         }
@@ -719,7 +753,18 @@ fn initial_cursors(cfg: &AppConfig) -> HashMap<String, String> {
 ///
 /// `horizon` serves the Horizon reads and `client` sends webhooks. They are
 /// separate so the Horizon side can be replaced in tests (#302).
-#[tracing::instrument(skip(horizon, client, contract, cursors), fields(
+async fn poll_contract(
+    client:         &Client,
+    webhook_client: &Client,
+    contract:       &WatchedContract,
+    cursors:        &mut HashMap<String, String>,
+    dry_run:        bool,
+) -> Result<(u64, u64, u64)> {
+    poll_contract_with(client, webhook_client, contract, cursors, dry_run, None).await
+}
+
+/// [`poll_contract`] that additionally publishes each fired alert on `alerts_tx`.
+#[tracing::instrument(skip(client, webhook_client, contract, cursors, alerts_tx), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
     network     = %contract.network.as_str(),
@@ -728,12 +773,13 @@ fn initial_cursors(cfg: &AppConfig) -> HashMap<String, String> {
     duration_ms = tracing::field::Empty,
     outcome     = tracing::field::Empty,
 ))]
-async fn poll_contract(
+async fn poll_contract_with(
     client:         &Client,
     webhook_client: &Client,
     contract:       &WatchedContract,
     cursors:        &mut HashMap<String, String>,
     dry_run:        bool,
+    alerts_tx:      Option<&broadcast::Sender<String>>,
 ) -> Result<(u64, u64, u64)> {
     let start_time = std::time::Instant::now();
     let cursor = cursors
@@ -792,7 +838,7 @@ async fn poll_contract(
             anyhow::bail!("Horizon returned HTTP {} for {}", response.status(), url);
         }
 
-        let page: HorizonPage = response
+        let page: HorizonPage<HorizonTransactionWithOps> = response
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
@@ -918,9 +964,18 @@ fn reset_idle_counter(contract_id: &str) {
             info!(contract = %contract.label, rule = %payload.rule_triggered,
                 tx = %payload.transaction_hash, "rule matched");
 
+            if let Some(tx) = alerts_tx {
+                match serde_json::to_string(&payload) {
+                    // A send error only means no SSE client is subscribed right now.
+                    Ok(json) => { let _ = tx.send(json); }
+                    Err(e) => warn!(contract = %contract.label, error = %e,
+                        "failed to serialise alert for broadcast"),
+                }
+            }
+
             if dry_run {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
-                    tx = %payload.transaction_hash, "dry-run enabled: not sending webhook");
+                    tx = %payload.transaction_hash, "[dry-run] rule matched — webhook not sent");
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
@@ -930,7 +985,7 @@ fn reset_idle_counter(contract_id: &str) {
                 let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
                 std::mem::forget(_shutdown_tx);
                 if let Err(e) = send_webhook(
-                    webhook_client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
+                    webhook_client, &contract.webhook_url, &payload, contract.webhook_secret_str(),
                     shutdown_rx,
                 ).await {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,

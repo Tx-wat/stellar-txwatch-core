@@ -4,7 +4,7 @@
 //! Run with: `cargo bench -p txwatch-rules`
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use txwatch_config::AlertRule;
+use txwatch_config::{AlertRule, Network};
 use txwatch_rules::{evaluate, EnrichedTransaction};
 
 const CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -19,6 +19,12 @@ fn make_transactions(count: usize) -> Vec<EnrichedTransaction> {
             function_names: vec!["transfer".into()],
             amount_stroops: Some((i as u64 % 2_000) * 10_000_000),
             fee_charged_stroops: Some(100 + (i as u64 % 500)),
+            operation_count: Some(1),
+            memo_type: None,
+            memo: None,
+            result_code: None,
+            source_account: None,
+            ledger_sequence: Some(i as u32),
         })
         .collect()
 }
@@ -27,7 +33,7 @@ fn one_of_each_rule() -> Vec<AlertRule> {
     vec![
         AlertRule::AnyTransaction,
         AlertRule::TransactionFailed,
-        AlertRule::LargeTransfer { threshold_xlm: 1_000 },
+        AlertRule::LargeTransfer { threshold_xlm: Some(1_000), threshold_stroops: None },
         AlertRule::FunctionCalled { function_name: "withdraw".into() },
         AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] },
         AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None },
@@ -41,10 +47,11 @@ fn evaluate_all(rules: &[AlertRule], txs: &[EnrichedTransaction]) -> usize {
             black_box(evaluate(
                 "Bench",
                 CONTRACT_ID,
-                "testnet",
+                &Network::Testnet,
                 "https://horizon-testnet.stellar.org",
                 "https://stellar.expert/explorer/testnet",
                 rules,
+                None,
                 tx,
             ))
             .len()

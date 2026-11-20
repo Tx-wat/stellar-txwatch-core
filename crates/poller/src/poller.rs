@@ -426,7 +426,7 @@ pub(crate) async fn poll_contract_with_http(
                     client,
                     &contract.webhook_url,
                     &payload,
-                    contract.webhook_secret.as_deref(),
+                    contract.webhook_secret_str(),
                     shutdown_rx,
                 )
                 .await

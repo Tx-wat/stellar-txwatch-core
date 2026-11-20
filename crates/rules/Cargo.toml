@@ -10,6 +10,12 @@ chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 txwatch-config = { path = "../config" }
+tracing = "0.1"
 
 [dev-dependencies]
 proptest = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "eval_benchmark"
+harness = false

@@ -210,3 +210,136 @@ fn version_flag_prints_cargo_pkg_version() {
         stdout
     );
 }
+
+// ── Issue #530: validate --output json ────────────────────────────────────────
+
+#[test]
+fn validate_output_json_prints_contracts_array() {
+    let path = env::temp_dir().join("txwatch_validate_json_test.toml");
+    fs::write(&path, MULTI_CONTRACT_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate", "--output", "json"])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert!(output.status.success(), "expected exit code 0 for valid config");
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout should be valid JSON");
+    let contracts = json["contracts"].as_array().expect("contracts array");
+    assert_eq!(contracts.len(), 2);
+
+    assert_eq!(contracts[0]["label"], "Alpha Contract");
+    assert_eq!(contracts[0]["webhook_url"], "https://hooks.example.com/alpha");
+    assert_eq!(contracts[0]["rules"], serde_json::json!(["AnyTransaction"]));
+
+    assert_eq!(contracts[1]["label"], "Beta Contract");
+    assert_eq!(contracts[1]["webhook_url"], "https://hooks.example.com/beta");
+    assert_eq!(
+        contracts[1]["rules"],
+        serde_json::json!(["TransactionFailed", "AnyTransaction"])
+    );
+}
+
+#[test]
+fn validate_default_output_is_text() {
+    let path = env::temp_dir().join("txwatch_validate_default_text_test.toml");
+    fs::write(&path, VALID_CONFIG).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate"])
+        .output()
+        .expect("failed to run txwatch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("Config is valid."), "got: {}", stdout);
+    assert!(serde_json::from_str::<serde_json::Value>(&stdout).is_err());
+}
+
+#[test]
+fn validate_output_json_never_includes_webhook_secret() {
+    let config = VALID_CONFIG.replace(
+        "webhook_url = \"https://hooks.example.com/test\"",
+        "webhook_url = \"https://hooks.example.com/test\"\nwebhook_secret = \"do-not-print-me\"",
+    );
+    let path = env::temp_dir().join("txwatch_validate_json_secret_test.toml");
+    fs::write(&path, config).unwrap();
+
+    let output = txwatch_bin()
+        .args(["--config", path.to_str().unwrap(), "validate", "--output", "json"])
+        .output()
+        .expect("failed to run txwatch");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("do-not-print-me") && !stderr.contains("do-not-print-me"));
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(json["contracts"][0]["secret"], "set");
+}
+
+// ── Issue #525: validate --check-contracts ────────────────────────────────────
+
+fn config_with_horizon(horizon_url: &str) -> String {
+    VALID_CONFIG.replace(
+        "network     = \"testnet\"",
+        &format!("network     = \"testnet\"\nhorizon_url = \"{}\"", horizon_url),
+    )
+}
+
+const CONTRACT_ID: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+async fn run_check_contracts(status: u16, file_name: &str) -> std::process::Output {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let horizon = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{}", CONTRACT_ID)))
+        .respond_with(ResponseTemplate::new(status).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(&horizon)
+        .await;
+
+    let config_path = env::temp_dir().join(file_name);
+    fs::write(&config_path, config_with_horizon(&horizon.uri())).unwrap();
+
+    let config_arg = config_path.to_str().unwrap().to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        txwatch_bin()
+            .args([
+                "--config", &config_arg, "validate", "--check-contracts", "--output", "json",
+            ])
+            .output()
+            .expect("failed to run txwatch")
+    })
+    .await
+    .unwrap();
+    let _ = fs::remove_file(&config_path);
+    output
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn check_contracts_warns_but_succeeds_when_contract_not_found() {
+    let output = run_check_contracts(404, "txwatch_check_contracts_404.toml").await;
+
+    assert_eq!(output.status.code(), Some(0), "a missing contract must only warn");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not found"), "expected a not-found warning, got: {}", stderr);
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["contracts"][0]["contract_found"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn check_contracts_reports_found_contract() {
+    let output = run_check_contracts(200, "txwatch_check_contracts_200.toml").await;
+
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("not found"), "unexpected warning: {}", stderr);
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["contracts"][0]["contract_found"], true);
+}

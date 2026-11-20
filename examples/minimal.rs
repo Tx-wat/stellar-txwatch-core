@@ -47,7 +47,20 @@ async fn main() -> anyhow::Result<()> {
             webhook_url: format!("http://{}/webhook", addr),
             webhook_secret: None,
             test_horizon_base_url: None,
+            horizon_url: None,
+            max_alerts_per_cycle: None,
+            webhook_timeout_seconds: None,
+            // The echo receiver runs on 127.0.0.1.
+            allow_internal_webhook_urls: Some(true),
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_compress: false,
         }],
+        http_user_agent: None,
+        webhook_timeout_seconds: None,
+        allow_internal_webhook_urls: None,
+        horizon_startup_check: false,
     };
 
     println!("Running single poll cycle against Stellar Testnet...");

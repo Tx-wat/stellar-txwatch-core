@@ -301,6 +301,21 @@ pub async fn send_webhook_once(
     send_webhook(client, url, payload, secret, rx).await
 }
 
+/// Like [`send_webhook_once`], but gzip-compresses the body (with
+/// `Content-Encoding: gzip`) when `compress` is `true` (Issue #540).
+pub async fn send_webhook_once_compressed(
+    client:   &Client,
+    url:      &str,
+    payload:  &AlertPayload,
+    secret:   Option<&str>,
+    compress: bool,
+) -> Result<DeliveryResult> {
+    let (tx, rx) = oneshot::channel();
+    // Keep the sender alive so the receiver never resolves.
+    std::mem::forget(tx);
+    send_webhook_with_backoff_opts(client, url, payload, secret, compress, RETRY_BASE_DELAY, rx).await
+}
+
 /// Internal variant of [`send_webhook`] that accepts a custom backoff base duration.
 /// Used by tests to speed up retry testing without changing retry count semantics.
 async fn send_webhook_with_backoff(
@@ -651,7 +666,8 @@ pub fn test_payload_with_network(
     AlertPayload {
         label:               label.to_string(),
         contract_id:         contract_id.into(),
-        contract_type:       ContractType::from_contract_id(contract_id),
+        contract_type:       ContractType::from_contract_id(contract_id)
+            .unwrap_or(ContractType::Soroban),
         network:             network.clone(),
         rule_type:           "TestWebhook".into(),
         rule_triggered:      "TestWebhook".into(),
@@ -670,6 +686,7 @@ pub fn test_payload_with_network(
         explorer_link:       format!("https://stellar.expert/explorer/{}/tx/{}", explorer_network, tx_hash),
         ledger_sequence:     None,
         source_account:      None,
+        tags:                None,
     }
     .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }

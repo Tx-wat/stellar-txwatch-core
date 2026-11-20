@@ -5,7 +5,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_path_to_error::Deserializer as PathDeserializer;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -202,6 +201,8 @@ pub enum AlertRule {
         #[serde(default)]
         wrap_rule: Option<String>,
     },
+    /// Fires when the transaction's ledger sequence falls within `from..=to` (Issue #499).
+    LedgerSequenceRange { from: u32, to: u32 },
 }
 
 impl AlertRule {
@@ -371,6 +372,16 @@ impl AlertRule {
                     }
                 }
             }
+            AlertRule::LedgerSequenceRange { from, to } => {
+                if *from > *to {
+                    bail!(
+                        "contract '{}': LedgerSequenceRange from ({}) must be <= to ({})",
+                        contract_label,
+                        from,
+                        to
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -434,6 +445,48 @@ impl AlertRule {
     }
 }
 
+// ── SecretString ──────────────────────────────────────────────────────────────
+
+/// A string holding sensitive material (e.g. a webhook secret) (Issue #456).
+///
+/// `Debug` always prints `"<redacted>"`, so a `{:?}` of any struct containing a
+/// `SecretString` — a panic message, a `tracing::debug!(c = ?contract)` call or a
+/// derived-`Debug` dump of the whole config — can never leak the value. There is
+/// deliberately no `Display` or `Serialize` impl; callers must opt in to reading the
+/// plaintext with [`SecretString::expose_secret`].
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the plaintext secret. Never log or print the result.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 // ── TlsConfig ─────────────────────────────────────────────────────────────────
 
 /// Optional mutual-TLS settings for webhook delivery to one contract.
@@ -486,7 +539,9 @@ pub struct WatchedContract {
     pub webhook_url: String,
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
-    pub webhook_secret: Option<String>,
+    /// Wrapped in [`SecretString`] so `Debug` output never contains the value (#456).
+    #[serde(default)]
+    pub webhook_secret: Option<SecretString>,
     /// Test-only: override the Horizon base URL. Never read from TOML (`serde(skip)`) —
     /// set programmatically in tests. Production code must leave this `None`.
     #[serde(skip, default)]
@@ -545,6 +600,20 @@ impl WatchedContract {
     /// `'G'` → Classic). Defaults to `Soroban` for unrecognised prefixes.
     pub fn contract_type(&self) -> ContractType {
         ContractType::from_contract_id(&self.contract_id).unwrap_or(ContractType::Soroban)
+    }
+
+    /// Plaintext webhook secret, if configured. Never log the result.
+    pub fn webhook_secret_str(&self) -> Option<&str> {
+        self.webhook_secret.as_ref().map(SecretString::expose_secret)
+    }
+
+    /// Horizon base URL used for API requests: the per-contract `horizon_url`
+    /// override when set, otherwise the network default.
+    pub fn horizon_base_url(&self) -> &str {
+        self.horizon_url
+            .as_deref()
+            .unwrap_or_else(|| self.network.horizon_base_url())
+            .trim_end_matches('/')
     }
 
     pub fn validate(&mut self) -> Result<()> {
@@ -720,7 +789,7 @@ pub const MAX_CONTRACTS: usize = 100;
 //    needless ceremony and break test ergonomics across the workspace.
 // 3. Deserialization: Serde deserialization directly into the struct remains idiomatic and clean;
 //    runtime validation via `validate()` provides richer error reporting with field contexts.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub poll_interval_seconds: u64,
@@ -884,7 +953,8 @@ impl AppConfig {
     fn resolve_env_vars(&mut self) -> Result<()> {
         for contract in &mut self.contracts {
             if let Some(secret) = &contract.webhook_secret {
-                contract.webhook_secret = Some(resolve_env_interpolation(secret)?);
+                let resolved = resolve_env_interpolation(secret.expose_secret())?;
+                contract.webhook_secret = Some(SecretString::from(resolved));
             }
             contract.webhook_url = resolve_env_interpolation(&contract.webhook_url)?;
         }
@@ -1278,6 +1348,8 @@ mod tests {
             max_alerts_per_cycle: None,
             allow_internal_webhook_urls: Some(true),
             horizon_startup_check: false,
+            http_user_agent: None,
+            webhook_timeout_seconds: None,
         };
         cfg.validate().unwrap();
 
@@ -1421,6 +1493,7 @@ mod tests {
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
             horizon_startup_check: false,
+            http_user_agent: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
@@ -1477,6 +1550,7 @@ mod tests {
             webhook_timeout_seconds: Some(0),
             allow_internal_webhook_urls: None,
             horizon_startup_check: false,
+            http_user_agent: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
@@ -1729,6 +1803,8 @@ mod tests {
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
             horizon_startup_check: false,
+            max_alerts_per_cycle: None,
+            http_user_agent: None,
         }
     }
 
@@ -1965,6 +2041,7 @@ mod tests {
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
             horizon_startup_check: false,
+            http_user_agent: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -1981,6 +2058,8 @@ mod tests {
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
             horizon_startup_check: false,
+            max_alerts_per_cycle: None,
+            http_user_agent: None,
         }
     }
 
@@ -2031,6 +2110,7 @@ mod tests {
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
             horizon_startup_check: false,
+            http_user_agent: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -2299,6 +2379,12 @@ mod tests {
                     test_horizon_base_url: None,
                     allow_internal_webhook_urls: None,
                     webhook_compress: false,
+                    horizon_url: None,
+                    max_alerts_per_cycle: None,
+                    webhook_timeout_seconds: None,
+                    tags: None,
+                    tls: None,
+                    webhook_tls_cert_pem: None,
                 }
             })
             .collect();
@@ -2314,6 +2400,7 @@ mod tests {
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
             horizon_startup_check: false,
+            http_user_agent: None,
         }
     }
 
@@ -2442,7 +2529,7 @@ mod tests {
     #[test]
     fn config_watcher_errors_on_missing_path() {
         let missing = std::env::temp_dir().join("txwatch-no-such-config-538.toml");
-        let err = ConfigWatcher::new(&missing).unwrap_err();
+        let Err(err) = ConfigWatcher::new(&missing) else { panic!("expected an error for a missing path") };
         assert!(
             format!("{:#}", err).contains("cannot resolve config path"),
             "got: {:#}",

@@ -10,6 +10,8 @@ pub(crate) struct Counters {
     pub(crate) alerts: AtomicU64,
     pub(crate) interval_transactions: AtomicU64,
     pub(crate) interval_alerts: AtomicU64,
+    /// Alerts suppressed by `max_alerts_per_cycle` since the last summary.
+    pub(crate) interval_suppressed: AtomicU64,
     /// Per-contract `(transactions, alerts)` since the last summary, keyed by label.
     interval_per_contract: Mutex<HashMap<String, (u64, u64)>>,
 }
