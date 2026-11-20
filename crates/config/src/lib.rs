@@ -2,12 +2,15 @@
 #![deny(clippy::unwrap_used)]
 
 use anyhow::{anyhow, bail, Context, Result};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_path_to_error::Deserializer as PathDeserializer;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::{fmt, fs, path::Path};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+use std::{fmt, fs, path::Path, path::PathBuf};
 use url::Url;
 
 const MAX_LARGE_TRANSFER_THRESHOLD_XLM: u64 = 1_000_000_000;
@@ -174,9 +177,9 @@ pub enum AlertRule {
     /// converted to stroops during validation); the two are mutually exclusive.
     LargeTransfer {
         #[serde(default)]
-        threshold_stroops: Option<u64>,
-        #[serde(default)]
         threshold_xlm: Option<u64>,
+        #[serde(default)]
+        threshold_stroops: Option<u64>,
     },
     FunctionCalled      { function_name: String },
     AdminFunctionCalled { function_names: Vec<String> },
@@ -312,7 +315,33 @@ impl AlertRule {
                     );
                 }
             }
-            AlertRule::TimeWindow { hours_utc, weekdays, .. } => {
+            AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
+                if let Some(wrapped) = wrap_rule {
+                    // Only rule types whose condition can be evaluated from the
+                    // transaction alone are supported here. Types that require
+                    // parameters (function names, thresholds, account IDs) cannot be
+                    // expressed by `wrap_rule: Option<String>`, so reject them at
+                    // validation time rather than silently always-firing (#453).
+                    const SUPPORTED_WRAP_RULES: [&str; 5] = [
+                        "TransactionFailed",
+                        "InsufficientFunds",
+                        "SorobanInvocation",
+                        "LargeTransfer",
+                        "AnyTransaction",
+                    ];
+                    if !SUPPORTED_WRAP_RULES.contains(&wrapped.as_str()) {
+                        bail!(
+                            "contract '{}': TimeWindow wrap_rule '{}' is not supported: \
+                             wrap_rule only accepts rule types that need no parameters \
+                             ({}). Rule types such as FunctionCalled, AdminFunctionCalled, \
+                             HighFee and SourceAccountMatch require parameters that \
+                             wrap_rule cannot express; use them as standalone rules instead.",
+                            contract_label,
+                            wrapped,
+                            SUPPORTED_WRAP_RULES.join(", ")
+                        );
+                    }
+                }
                 let parts: Vec<&str> = hours_utc.split('-').collect();
                 if parts.len() != 2 {
                     bail!(
@@ -379,6 +408,9 @@ impl AlertRule {
                     format!("TimeWindow({}, [{}])", hours_utc, weekdays.join(", "))
                 }
             }
+            AlertRule::LedgerSequenceRange { from, to } => {
+                format!("LedgerSequenceRange({}..{})", from, to)
+            }
         }
     }
 
@@ -397,6 +429,7 @@ impl AlertRule {
             AlertRule::HighFee { .. } => "HighFee".into(),
             AlertRule::SourceAccountMatch { .. } => "SourceAccountMatch".into(),
             AlertRule::TimeWindow { .. } => "TimeWindow".into(),
+            AlertRule::LedgerSequenceRange { .. } => "LedgerSequenceRange".into(),
         }
     }
 }
@@ -437,6 +470,50 @@ impl TlsConfig {
                 );
             }
         }
+
+        // #457: actually parse the PEM material so `validate` catches garbage,
+        // expired, or mismatched cert/key pairs instead of deferring the failure
+        // to webhook delivery time. This mirrors `build_tls_client` in the notifier.
+        let cert_bytes = fs::read(&self.client_cert).with_context(|| {
+            format!(
+                "contract '{}': tls.client_cert file '{}' cannot be read",
+                contract_label, self.client_cert
+            )
+        })?;
+        let key_bytes = fs::read(&self.client_key).with_context(|| {
+            format!(
+                "contract '{}': tls.client_key file '{}' cannot be read",
+                contract_label, self.client_key
+            )
+        })?;
+        reqwest::Identity::from_pkcs8_pem(&cert_bytes, &key_bytes).map_err(|e| {
+            anyhow!(
+                "contract '{}': tls.client_cert '{}' / tls.client_key '{}' are not a valid \
+                 PKCS#8 PEM certificate/key pair: {}",
+                contract_label,
+                self.client_cert,
+                self.client_key,
+                e
+            )
+        })?;
+
+        if let Some(ca) = &self.ca_cert {
+            let ca_bytes = fs::read(ca).with_context(|| {
+                format!(
+                    "contract '{}': tls.ca_cert file '{}' cannot be read",
+                    contract_label, ca
+                )
+            })?;
+            reqwest::Certificate::from_pem(&ca_bytes).map_err(|e| {
+                anyhow!(
+                    "contract '{}': tls.ca_cert file '{}' is not a valid PEM-encoded certificate: {}",
+                    contract_label,
+                    ca,
+                    e
+                )
+            })?;
+        }
+
         Ok(())
     }
 }
@@ -482,6 +559,16 @@ pub struct WatchedContract {
     /// Optional inline PEM-encoded client certificate for webhook mTLS.
     #[serde(default)]
     pub webhook_tls_cert_pem: Option<String>,
+    /// Optional allow-list of rule types whose alerts are delivered to this
+    /// contract's webhook (Issue #553). Entries are matched against
+    /// `AlertRule::rule_type()` (e.g. `"LargeTransfer"`, `"HighFee"`).
+    /// An empty list (the default) means every rule type is delivered.
+    #[serde(default)]
+    pub webhook_rule_filter: Vec<String>,
+    /// Gzip-compress webhook request bodies (Issue #540). When enabled, the body
+    /// is sent with `Content-Encoding: gzip`. Defaults to `false`.
+    #[serde(default)]
+    pub webhook_compress: bool,
 }
 
 /// Maximum length, in characters, of a tag key or value.
@@ -606,6 +693,28 @@ impl WatchedContract {
             );
         }
 
+        if self.max_alerts_per_minute == Some(0) {
+            bail!(
+                "contract '{}': max_alerts_per_minute must be >= 1 when set",
+                self.label
+            );
+        }
+
+        if let Some(alias) = &self.cursor_alias {
+            if alias.trim().is_empty() {
+                bail!(
+                    "contract '{}': cursor_alias must not be empty when set",
+                    self.label
+                );
+            }
+            if alias == &self.label {
+                bail!(
+                    "contract '{}': cursor_alias must differ from the contract label",
+                    self.label
+                );
+            }
+        }
+
         if let Some(horizon_url) = &self.horizon_url {
             let parsed_horizon = Url::parse(horizon_url).map_err(|e| {
                 anyhow!(
@@ -655,12 +764,38 @@ impl WatchedContract {
             if pem.trim().is_empty() {
                 bail!("contract '{}': webhook_tls_cert_pem must not be empty", self.label);
             }
-            if !pem.contains("-----BEGIN CERTIFICATE-----") || !pem.contains("-----END CERTIFICATE-----") {
-                bail!("contract '{}': webhook_tls_cert_pem is not a valid PEM-encoded certificate", self.label);
+            // #458: actually parse the PEM/DER rather than only checking for the
+            // BEGIN/END markers, so `validate` catches invalid certificates before
+            // `build_pinned_cert_client` fails at webhook-send time.
+            reqwest::Certificate::from_pem(pem.as_bytes()).map_err(|e| {
+                anyhow!(
+                    "contract '{}': webhook_tls_cert_pem is not a valid PEM-encoded certificate: {}",
+                    self.label,
+                    e
+                )
+            })?;
+        }
+
+        for rule_type in &self.webhook_rule_filter {
+            if rule_type.trim().is_empty() {
+                bail!(
+                    "contract '{}': webhook_rule_filter entries must not be empty",
+                    self.label
+                );
             }
         }
 
         Ok(())
+    }
+
+    /// Returns `true` when alerts for `rule_type` should be delivered to this
+    /// contract's webhook (Issue #553). An empty filter delivers everything.
+    pub fn webhook_accepts_rule_type(&self, rule_type: &str) -> bool {
+        self.webhook_rule_filter.is_empty()
+            || self
+                .webhook_rule_filter
+                .iter()
+                .any(|allowed| allowed == rule_type)
     }
 }
 
@@ -727,6 +862,10 @@ pub struct AppConfig {
     /// contract (Issue #346). Per-contract settings take precedence.
     #[serde(default)]
     pub allow_internal_webhook_urls: Option<bool>,
+    /// Run an optional Horizon connectivity probe at startup (Issue #380).
+    /// Warn-only: a failed probe never aborts the poller. Default: false.
+    #[serde(default)]
+    pub horizon_startup_check: bool,
 }
 
 /// Default webhook delivery timeout in seconds (Issue #462).
@@ -933,6 +1072,172 @@ impl AppConfig {
     }
 }
 
+// ── Config file watching (Issue #538) ─────────────────────────────────────────
+
+/// Default debounce window for coalescing rapid successive config writes.
+pub const DEFAULT_WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Returns `true` when `event` is a write-like change to `target`.
+///
+/// Only `Create`, `Modify` and `Write` kinds are considered; access, metadata
+/// and removal events are ignored. The event must reference `target` itself
+/// (not a sibling file in the same directory).
+fn is_relevant_event(event: &Event, target: &Path) -> bool {
+    let kind_matches = matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Any
+    );
+    if !kind_matches {
+        return false;
+    }
+    event.paths.iter().any(|p| p == target)
+}
+
+/// Debounces a stream of raw filesystem events into coalesced reload signals.
+///
+/// Each call to `wait_for_reload` blocks until at least one relevant event has
+/// been observed, then keeps draining further relevant events until no new one
+/// arrives within `debounce`. This collapses editor "write + rename" bursts
+/// into a single reload.
+struct Debouncer {
+    debounce: Duration,
+}
+
+impl Debouncer {
+    fn new(debounce: Duration) -> Self {
+        Self { debounce }
+    }
+
+    /// Blocks until a reload should be signalled, or returns `None` if the
+    /// event channel is disconnected (watcher dropped).
+    fn wait_for_reload(&self, rx: &Receiver<Event>, target: &Path) -> Option<()> {
+        // Block indefinitely for the first relevant event.
+        loop {
+            match rx.recv() {
+                Ok(event) => {
+                    if is_relevant_event(&event, target) {
+                        break;
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+        // Coalesce any further relevant events arriving within the window.
+        let deadline = Instant::now() + self.debounce;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok(event) => {
+                    if is_relevant_event(&event, target) {
+                        // Extend the window on each new relevant event.
+                        continue;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Some(())
+    }
+}
+
+/// Handle returned by [`ConfigWatcher::new`].
+///
+/// The underlying `notify` watcher is kept alive inside this handle; dropping
+/// it stops watching. Use [`ConfigWatcher::wait_for_reload`] to block until the
+/// config file changes (debounced), or [`ConfigWatcher::try_recv`] for a
+/// non-blocking poll.
+pub struct ConfigWatcher {
+    _watcher: RecommendedWatcher,
+    rx: Receiver<Event>,
+    target: PathBuf,
+    debouncer: Debouncer,
+}
+
+impl ConfigWatcher {
+    /// Starts watching `config_path` for write events.
+    ///
+    /// The parent directory is watched (rather than the file itself) so that
+    /// editors which replace the file via rename are still detected.
+    pub fn new(config_path: &Path) -> Result<Self> {
+        Self::with_debounce(config_path, DEFAULT_WATCH_DEBOUNCE)
+    }
+
+    /// Like [`ConfigWatcher::new`] but with a custom debounce window.
+    pub fn with_debounce(config_path: &Path, debounce: Duration) -> Result<Self> {
+        let target = config_path
+            .canonicalize()
+            .with_context(|| format!("cannot resolve config path '{}'", config_path.display()))?;
+        let parent = target
+            .parent()
+            .map(Path::to_path_buf)
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            if let Ok(event) = res {
+                // Ignore send errors: the receiver was dropped, so nobody cares.
+                let _ = tx.send(event);
+            }
+        })
+        .with_context(|| {
+            format!(
+                "failed to create config file watcher for '{}'",
+                target.display()
+            )
+        })?;
+
+        watcher
+            .watch(&parent, RecursiveMode::NonRecursive)
+            .with_context(|| {
+                format!(
+                    "failed to watch config directory '{}' for changes",
+                    parent.display()
+                )
+            })?;
+
+        Ok(Self {
+            _watcher: watcher,
+            rx,
+            target,
+            debouncer: Debouncer::new(debounce),
+        })
+    }
+
+    /// Blocks until the config file changes (after debouncing).
+    ///
+    /// Returns `false` if the watcher has been shut down (channel closed).
+    pub fn wait_for_reload(&self) -> bool {
+        self.debouncer
+            .wait_for_reload(&self.rx, &self.target)
+            .is_some()
+    }
+
+    /// Non-blocking check for a pending (debounced) reload.
+    ///
+    /// Returns `true` if a reload should be performed now. Note that this does
+    /// not itself wait out the debounce window; callers that need coalescing
+    /// should prefer [`ConfigWatcher::wait_for_reload`].
+    pub fn try_recv(&self) -> bool {
+        let mut saw_relevant = false;
+        while let Ok(event) = self.rx.try_recv() {
+            if is_relevant_event(&event, &self.target) {
+                saw_relevant = true;
+            }
+        }
+        saw_relevant
+    }
+
+    /// Path of the watched config file (canonicalized).
+    pub fn path(&self) -> &Path {
+        &self.target
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -980,6 +1285,8 @@ mod tests {
             tags: None,
             tls: None,
             webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
         }
     }
 
@@ -1069,6 +1376,7 @@ mod tests {
             http_connection_verbose: None,
             max_alerts_per_cycle: None,
             allow_internal_webhook_urls: Some(true),
+            horizon_startup_check: false,
         };
         cfg.validate().unwrap();
 
@@ -1111,6 +1419,55 @@ mod tests {
             wrap_rule: None,
         };
         assert!(bad_weekday.validate("test").is_err());
+    }
+
+    /// #453: `wrap_rule` values that `eval_time_window` cannot evaluate must be
+    /// rejected at validation time instead of silently always-firing.
+    #[test]
+    fn time_window_rejects_unsupported_wrap_rule() {
+        for unsupported in [
+            "FunctionCalled",
+            "AdminFunctionCalled",
+            "HighFee",
+            "SourceAccountMatch",
+            "NotARule",
+        ] {
+            let mut rule = AlertRule::TimeWindow {
+                hours_utc: "09:00-17:00".into(),
+                weekdays: vec!["Mon".into()],
+                wrap_rule: Some(unsupported.into()),
+            };
+            let err = rule.validate("test").unwrap_err().to_string();
+            assert!(
+                err.contains("wrap_rule") && err.contains(unsupported),
+                "expected wrap_rule rejection for '{}', got: {}",
+                unsupported,
+                err
+            );
+        }
+    }
+
+    /// #453: every rule type the evaluator actually handles is accepted.
+    #[test]
+    fn time_window_accepts_supported_wrap_rules() {
+        for supported in [
+            "TransactionFailed",
+            "InsufficientFunds",
+            "SorobanInvocation",
+            "LargeTransfer",
+            "AnyTransaction",
+        ] {
+            let mut rule = AlertRule::TimeWindow {
+                hours_utc: "09:00-17:00".into(),
+                weekdays: vec!["Mon".into()],
+                wrap_rule: Some(supported.into()),
+            };
+            assert!(
+                rule.validate("test").is_ok(),
+                "expected '{}' to be accepted as wrap_rule",
+                supported
+            );
+        }
     }
 
     /// #268: horizon_url is optional and absent by default.
@@ -1162,6 +1519,7 @@ mod tests {
             max_alerts_per_cycle: Some(0),
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("max_alerts_per_cycle must be >= 1"), "got: {}", err);
@@ -1217,6 +1575,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: Some(0),
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
@@ -1228,6 +1587,97 @@ mod tests {
         c.webhook_timeout_seconds = Some(0);
         let err = c.validate().unwrap_err();
         assert!(err.to_string().contains("webhook_timeout_seconds must be >= 1"), "got: {}", err);
+    }
+
+    // ── Issue #543: max_alerts_per_minute ────────────────────────────────────
+
+    #[test]
+    fn max_alerts_per_minute_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.max_alerts_per_minute.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn max_alerts_per_minute_is_parsed_from_toml() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            max_alerts_per_minute = 30
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let c: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(c.max_alerts_per_minute, Some(30));
+    }
+
+    #[test]
+    fn rejects_zero_max_alerts_per_minute() {
+        let mut c = valid_contract();
+        c.max_alerts_per_minute = Some(0);
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("max_alerts_per_minute must be >= 1"),
+            "got: {}",
+            err
+        );
+    }
+
+    // ── Issue #547: cursor_alias ─────────────────────────────────────────────
+
+    #[test]
+    fn cursor_alias_defaults_to_none() {
+        let mut c = valid_contract();
+        assert!(c.cursor_alias.is_none());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn cursor_alias_is_parsed_from_toml() {
+        let raw = r#"
+            label = "NewName"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            cursor_alias = "OldName"
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let c: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(c.cursor_alias.as_deref(), Some("OldName"));
+    }
+
+    #[test]
+    fn accepts_cursor_alias_differing_from_label() {
+        let mut c = valid_contract();
+        c.cursor_alias = Some("OldLabel".into());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_cursor_alias() {
+        let mut c = valid_contract();
+        c.cursor_alias = Some("   ".into());
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cursor_alias must not be empty"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_cursor_alias_equal_to_label() {
+        let mut c = valid_contract();
+        c.cursor_alias = Some(c.label.clone());
+        let err = c.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cursor_alias must differ from the contract label"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -1256,6 +1706,76 @@ mod tests {
             cfg.contracts[0].horizon_url.as_deref(),
             Some("https://my-private-horizon.example.com")
         );
+    }
+
+    // ── Issue #553: webhook_rule_filter ──────────────────────────────────────
+
+    #[test]
+    fn webhook_rule_filter_defaults_to_empty() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let mut c: WatchedContract = toml::from_str(raw).unwrap();
+        assert!(c.webhook_rule_filter.is_empty());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn webhook_rule_filter_parses_from_toml() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            webhook_rule_filter = ["LargeTransfer", "HighFee"]
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let mut c: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(c.webhook_rule_filter, vec!["LargeTransfer", "HighFee"]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_webhook_rule_filter_accepts_all_rule_types() {
+        let c = valid_contract();
+        assert!(c.webhook_accepts_rule_type("AnyTransaction"));
+        assert!(c.webhook_accepts_rule_type("LargeTransfer"));
+        assert!(c.webhook_accepts_rule_type("HighFee"));
+    }
+
+    #[test]
+    fn webhook_rule_filter_only_accepts_listed_rule_types() {
+        let mut c = valid_contract();
+        c.webhook_rule_filter = vec!["LargeTransfer".into()];
+        assert!(c.webhook_accepts_rule_type("LargeTransfer"));
+        assert!(!c.webhook_accepts_rule_type("HighFee"));
+        assert!(!c.webhook_accepts_rule_type("AnyTransaction"));
+    }
+
+    #[test]
+    fn webhook_rule_filter_matches_rule_type_labels() {
+        let mut c = valid_contract();
+        c.rules = vec![
+            AlertRule::LargeTransfer { threshold_xlm: Some(100), threshold_stroops: None },
+            AlertRule::HighFee { threshold_stroops: 100, threshold_xlm: None },
+        ];
+        c.webhook_rule_filter = vec![c.rules[1].rule_type()];
+        assert!(!c.webhook_accepts_rule_type(&c.rules[0].rule_type()));
+        assert!(c.webhook_accepts_rule_type(&c.rules[1].rule_type()));
+    }
+
+    #[test]
+    fn rejects_blank_webhook_rule_filter_entry() {
+        let mut c = valid_contract();
+        c.webhook_rule_filter = vec!["  ".into()];
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("webhook_rule_filter"), "got: {}", err);
     }
 
     #[test]
@@ -1446,6 +1966,48 @@ mod tests {
         assert!(c.validate().is_ok());
     }
 
+    /// #457: a cert file that exists but is not a parseable PEM certificate must
+    /// be rejected by `validate`, not deferred to webhook delivery time.
+    #[test]
+    fn tls_rejects_unparseable_client_cert() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("not-a-certificate.txt"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_cert"), "got: {}", err);
+    }
+
+    /// #457: a key file that exists but is not a parseable PKCS#8 PEM key must be
+    /// rejected by `validate`.
+    #[test]
+    fn tls_rejects_unparseable_client_key() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("not-a-certificate.txt"),
+            ca_cert: None,
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_key"), "got: {}", err);
+    }
+
+    /// #457: a `ca_cert` file that exists but is not a parseable PEM certificate
+    /// must be rejected by `validate`.
+    #[test]
+    fn tls_rejects_unparseable_ca_cert() {
+        let mut c = valid_contract();
+        c.tls = Some(TlsConfig {
+            client_cert: fixture_path("client-cert.pem"),
+            client_key: fixture_path("client-key.pem"),
+            ca_cert: Some(fixture_path("not-a-certificate.txt")),
+        });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.ca_cert"), "got: {}", err);
+    }
+
     // ── Issue #279: cursor_file validation ───────────────────────────────────
 
     fn cursor_test_dir(name: &str) -> PathBuf {
@@ -1468,6 +2030,7 @@ mod tests {
             http_connection_verbose: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         }
     }
 
@@ -1524,6 +2087,18 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         let _ = fs::remove_dir_all(&dir);
         assert!(err.contains("is not writable"), "got: {}", err);
+    }
+
+    /// #438: `label()` for a stroops-configured `LargeTransfer` rule must match
+    /// `large_transfer_label`'s output exactly.
+    #[test]
+    fn large_transfer_label_matches_helper_for_stroops() {
+        let rule = AlertRule::LargeTransfer {
+            threshold_xlm: None,
+            threshold_stroops: Some(5_000_000),
+        };
+        assert_eq!(rule.label(), large_transfer_label(None, Some(5_000_000)));
+        assert_eq!(rule.label(), "LargeTransfer(>=0.5XLM)");
     }
 
     #[test]
@@ -1691,6 +2266,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("duplicate contract label"));
@@ -1706,6 +2282,7 @@ mod tests {
             http_connection_verbose: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         }
     }
 
@@ -1755,6 +2332,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         };
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -1917,8 +2495,10 @@ mod tests {
                 http_tcp_keepalive_secs: None,
                 http_connection_verbose: None,
                 max_alerts_per_cycle: None,
+                http_user_agent: None,
                 webhook_timeout_seconds: None,
                 allow_internal_webhook_urls: None,
+                horizon_startup_check: false,
             };
             let err = cfg.validate().unwrap_err();
             assert!(
@@ -2019,7 +2599,15 @@ mod tests {
                     webhook_url: "https://example.com/hook".into(),
                     webhook_secret: None,
                     test_horizon_base_url: None,
+                    horizon_url: None,
+                    max_alerts_per_cycle: None,
+                    webhook_timeout_seconds: None,
                     allow_internal_webhook_urls: None,
+                    tags: None,
+                    tls: None,
+                    webhook_tls_cert_pem: None,
+                    webhook_rule_filter: Vec::new(),
+                    webhook_compress: false,
                 }
             })
             .collect();
@@ -2034,6 +2622,7 @@ mod tests {
             max_alerts_per_cycle: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
+            horizon_startup_check: false,
         }
     }
 
@@ -2090,5 +2679,99 @@ mod tests {
             "{} contracts should be valid (only a warning is emitted at startup)",
             warn_threshold + 1
         );
+    }
+
+    // ── Issue #538: config file watching ─────────────────────────────────────
+
+    fn write_event(path: &Path) -> Event {
+        Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![path.to_path_buf()],
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn is_relevant_event_filters_by_path_and_kind() {
+        let target = Path::new("/tmp/txwatch/config.toml");
+        let other = Path::new("/tmp/txwatch/other.toml");
+
+        assert!(is_relevant_event(&write_event(target), target));
+        assert!(!is_relevant_event(&write_event(other), target));
+
+        let access = Event {
+            kind: EventKind::Access(notify::event::AccessKind::Any),
+            paths: vec![target.to_path_buf()],
+            attrs: Default::default(),
+        };
+        assert!(!is_relevant_event(&access, target));
+
+        let create = Event {
+            kind: EventKind::Create(notify::event::CreateKind::Any),
+            paths: vec![target.to_path_buf()],
+            attrs: Default::default(),
+        };
+        assert!(is_relevant_event(&create, target));
+    }
+
+    #[test]
+    fn debouncer_coalesces_rapid_events_into_one_reload() {
+        let target = PathBuf::from("/tmp/txwatch/config.toml");
+        let (tx, rx) = mpsc::channel();
+        // Three rapid writes.
+        for _ in 0..3 {
+            tx.send(write_event(&target)).unwrap();
+        }
+        let debouncer = Debouncer::new(Duration::from_millis(50));
+        assert!(debouncer.wait_for_reload(&rx, &target).is_some());
+        // All three events were consumed by the single debounced reload.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn debouncer_ignores_irrelevant_events() {
+        let target = PathBuf::from("/tmp/txwatch/config.toml");
+        let other = PathBuf::from("/tmp/txwatch/other.toml");
+        let (tx, rx) = mpsc::channel();
+        tx.send(write_event(&other)).unwrap();
+        tx.send(write_event(&target)).unwrap();
+        let debouncer = Debouncer::new(Duration::from_millis(50));
+        assert!(debouncer.wait_for_reload(&rx, &target).is_some());
+    }
+
+    #[test]
+    fn debouncer_returns_none_when_channel_closes() {
+        let target = PathBuf::from("/tmp/txwatch/config.toml");
+        let (tx, rx) = mpsc::channel::<Event>();
+        drop(tx);
+        let debouncer = Debouncer::new(Duration::from_millis(50));
+        assert!(debouncer.wait_for_reload(&rx, &target).is_none());
+    }
+
+    #[test]
+    fn config_watcher_errors_on_missing_path() {
+        let missing = std::env::temp_dir().join("txwatch-no-such-config-538.toml");
+        let err = ConfigWatcher::new(&missing).unwrap_err();
+        assert!(
+            format!("{:#}", err).contains("cannot resolve config path"),
+            "got: {:#}",
+            err
+        );
+    }
+
+    #[test]
+    fn config_watcher_detects_write() {
+        let dir = std::env::temp_dir().join(format!("txwatch-watch-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.toml");
+        fs::write(&file, "poll_interval_seconds = 10\n").unwrap();
+
+        let watcher = ConfigWatcher::with_debounce(&file, Duration::from_millis(50)).unwrap();
+        assert_eq!(watcher.path(), file.canonicalize().unwrap());
+
+        fs::write(&file, "poll_interval_seconds = 20\n").unwrap();
+        assert!(watcher.wait_for_reload(), "expected a reload signal");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

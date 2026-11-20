@@ -193,17 +193,53 @@ impl CursorMap {
         state.is_skipped()
     }
 
+    /// Migrate a cursor entry from a previous label (`alias`) to the contract's
+    /// current primary key (`contract_id`).
+    ///
+    /// If the primary key already has an entry, nothing is migrated and `false`
+    /// is returned. Otherwise, if an entry exists under `alias`, its
+    /// [`ContractState`] is copied to `contract_id`, the alias entry is removed,
+    /// and `true` is returned. This lets polling resume from the saved token
+    /// after a contract label is renamed in config (Issue #547).
+    pub fn migrate_alias(&mut self, contract_id: &str, alias: &str) -> bool {
+        if self.0.contains_key(contract_id) {
+            return false;
+        }
+        match self.0.remove(alias) {
+            Some(state) => {
+                debug!(
+                    contract = %contract_id,
+                    alias = %alias,
+                    token = %state.token,
+                    "migrated cursor entry from renamed contract alias"
+                );
+                self.0.insert(contract_id.to_string(), state);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Load a `CursorMap` from a JSON file.
     ///
     /// If the file cannot be read or parsed, logs a warning/debug message and
     /// returns a fresh map initialised to `"now"` for all supplied contracts.
     /// This matches the existing graceful-degradation behaviour in the poller.
+    ///
+    /// If a contract has no entry under its primary key but has a
+    /// `cursor_alias` configured, the entry stored under the alias is migrated
+    /// to the primary key so polling resumes from the saved token rather than
+    /// restarting from `"now"` (Issue #547).
     pub fn load_from_file(path: &Path, contracts: &[WatchedContract]) -> Self {
         match std::fs::read_to_string(path) {
             Ok(raw) => match serde_json::from_str::<CursorMap>(&raw) {
                 Ok(mut map) => {
-                    // Ensure every configured contract has a cursor entry.
+                    // Ensure every configured contract has a cursor entry,
+                    // migrating from a renamed label's alias when needed.
                     for c in contracts {
+                        if let Some(alias) = c.cursor_alias.as_deref() {
+                            map.migrate_alias(&c.contract_id, alias);
+                        }
                         map.0
                             .entry(c.contract_id.clone())
                             .or_insert_with(ContractState::new);
@@ -230,15 +266,63 @@ impl CursorMap {
         }
     }
 
-    /// Persist the current cursor map to a JSON file.
+    /// Persist the current cursor map to a JSON file atomically.
+    ///
+    /// The JSON is written to a uniquely-named temporary file in the same
+    /// directory as `path`, flushed and fsynced, then atomically renamed over
+    /// `path`. A crash mid-write therefore leaves either the old file or the
+    /// new file intact — never a truncated/corrupt one. On any error the
+    /// temporary file is removed before returning.
     ///
     /// Errors are returned to the caller; the poller can choose to log and
     /// continue rather than aborting the poll cycle.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
+
         let json = serde_json::to_string_pretty(self)
             .context("failed to serialise cursor map to JSON")?;
-        std::fs::write(path, json)
-            .with_context(|| format!("failed to write cursor file '{}'", path.display()))
+
+        // Build a temp path in the same directory so the rename stays on the
+        // same filesystem (required for atomicity).
+        let tmp_path = {
+            let mut name = path
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_else(|| std::ffi::OsString::from("cursor"));
+            name.push(format!(".tmp.{}", std::process::id()));
+            match path.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+                _ => std::path::PathBuf::from(name),
+            }
+        };
+
+        let write_result = (|| -> Result<()> {
+            let mut file = std::fs::File::create(&tmp_path).with_context(|| {
+                format!("failed to create temp cursor file '{}'", tmp_path.display())
+            })?;
+            file.write_all(json.as_bytes()).with_context(|| {
+                format!("failed to write temp cursor file '{}'", tmp_path.display())
+            })?;
+            file.sync_all().with_context(|| {
+                format!("failed to fsync temp cursor file '{}'", tmp_path.display())
+            })?;
+            drop(file);
+            std::fs::rename(&tmp_path, path).with_context(|| {
+                format!(
+                    "failed to rename temp cursor file '{}' to '{}'",
+                    tmp_path.display(),
+                    path.display()
+                )
+            })?;
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            // Best-effort cleanup so a failed write doesn't leave stale temps.
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+
+        write_result
     }
 }
 
@@ -259,6 +343,15 @@ mod tests {
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
             horizon_base_url_override: None,
+            cursor_alias: None,
+            test_horizon_base_url: None,
+        }
+    }
+
+    fn contract_with_alias(id: &str, alias: &str) -> WatchedContract {
+        WatchedContract {
+            cursor_alias: Some(alias.to_string()),
+            ..contract(id)
         }
     }
 
@@ -319,6 +412,22 @@ mod tests {
         let contracts = vec![contract(ID_A)];
         let map = CursorMap::load_from_file(&tmp, &contracts);
         assert_eq!(map.get(ID_A), "now");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn save_to_file_produces_valid_json() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_valid_json.json");
+        let contracts = vec![contract(ID_A)];
+
+        let mut map = CursorMap::new_for_contracts(&contracts);
+        map.set(ID_A, "424242");
+        map.save_to_file(&tmp).unwrap();
+
+        let raw = std::fs::read_to_string(&tmp).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(parsed.is_object(), "cursor file should be a JSON object");
+
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -442,6 +551,138 @@ mod tests {
         let mut map = CursorMap::new_for_contracts(&[contract(ID_A)]);
         assert!(!map.record_success(ID_A));
         assert_eq!(map.state(ID_A).unwrap().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn load_migrates_cursor_from_alias() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_alias.json");
+        // File has an entry under the old label, not the contract ID.
+        let partial = serde_json::json!({ "old-label": "4242" });
+        std::fs::write(&tmp, partial.to_string()).unwrap();
+
+        let contracts = vec![contract_with_alias(ID_A, "old-label")];
+        let map = CursorMap::load_from_file(&tmp, &contracts);
+
+        assert_eq!(map.get(ID_A), "4242", "cursor should migrate from alias");
+        assert!(
+            map.state("old-label").is_none(),
+            "alias entry should be removed after migration"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn interrupted_write_leaves_original_file_intact() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_atomic.json");
+        let contracts = vec![contract(ID_A)];
+
+        // Establish a good cursor file first.
+        let mut original = CursorMap::new_for_contracts(&contracts);
+        original.set(ID_A, "111");
+        original.save_to_file(&tmp).unwrap();
+
+        // Simulate a crash mid-write: a stale temp file is left behind.
+        let stale_tmp = tmp.with_file_name(format!(
+            "{}.tmp.{}",
+            tmp.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        std::fs::write(&stale_tmp, "{\"partial\":").unwrap();
+
+        // The original file must be untouched and still load correctly.
+        let loaded = CursorMap::load_from_file(&tmp, &contracts);
+        assert_eq!(loaded.get(ID_A), "111");
+
+        // A subsequent successful save must overwrite the stale temp and
+        // produce a valid file.
+        let mut updated = CursorMap::new_for_contracts(&contracts);
+        updated.set(ID_A, "222");
+        updated.save_to_file(&tmp).unwrap();
+
+        let reloaded = CursorMap::load_from_file(&tmp, &contracts);
+        assert_eq!(reloaded.get(ID_A), "222");
+        assert!(!stale_tmp.exists(), "temp file should be cleaned up");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_prefers_primary_key_over_alias() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_alias_primary.json");
+        let partial = serde_json::json!({ ID_A: "111", "old-label": "222" });
+        std::fs::write(&tmp, partial.to_string()).unwrap();
+
+        let contracts = vec![contract_with_alias(ID_A, "old-label")];
+        let map = CursorMap::load_from_file(&tmp, &contracts);
+
+        assert_eq!(map.get(ID_A), "111", "primary key should win over alias");
+        assert_eq!(
+            map.get("old-label"),
+            "222",
+            "alias entry left untouched when primary exists"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn load_without_alias_entry_starts_at_now() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_alias_missing.json");
+        let partial = serde_json::json!({ "unrelated": "999" });
+        std::fs::write(&tmp, partial.to_string()).unwrap();
+
+        let contracts = vec![contract_with_alias(ID_A, "old-label")];
+        let map = CursorMap::load_from_file(&tmp, &contracts);
+
+        assert_eq!(map.get(ID_A), "now");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn corrupt_cursor_file_falls_back_to_now_without_panicking() {
+        let tmp = std::env::temp_dir().join("txwatch_cursor_truncated.json");
+        // Truncated JSON, as if a non-atomic write was interrupted.
+        std::fs::write(&tmp, "{\"CAAAA").unwrap();
+
+        let contracts = vec![contract(ID_A), contract(ID_B)];
+        let map = CursorMap::load_from_file(&tmp, &contracts);
+
+        assert_eq!(map.get(ID_A), "now");
+        assert_eq!(map.get(ID_B), "now");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn migrate_alias_moves_state_and_removes_alias() {
+        let mut map = CursorMap::default();
+        map.set("old-label", "555");
+        map.record_failure("old-label");
+
+        assert!(map.migrate_alias(ID_A, "old-label"));
+        assert_eq!(map.get(ID_A), "555");
+        assert_eq!(map.state(ID_A).unwrap().consecutive_failures, 1);
+        assert!(map.state("old-label").is_none());
+    }
+
+    #[test]
+    fn migrate_alias_is_noop_when_primary_exists() {
+        let mut map = CursorMap::default();
+        map.set(ID_A, "111");
+        map.set("old-label", "222");
+
+        assert!(!map.migrate_alias(ID_A, "old-label"));
+        assert_eq!(map.get(ID_A), "111");
+        assert_eq!(map.get("old-label"), "222");
+    }
+
+    #[test]
+    fn migrate_alias_returns_false_when_alias_missing() {
+        let mut map = CursorMap::default();
+        assert!(!map.migrate_alias(ID_A, "old-label"));
+        assert_eq!(map.get(ID_A), "now");
     }
 
     #[test]

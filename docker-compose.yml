@@ -6,21 +6,26 @@ services:
     container_name: txwatch-dev
     volumes:
       - ./config/example.toml:/config.toml
+      - ./config/docker-compose.toml:/config.docker-compose.toml
     environment:
       RUST_LOG: debug
-    command: --config /config.toml watch
+    command: --config /config.docker-compose.toml watch
     depends_on:
-      - webhook
+      - webhook-receiver
     networks:
       - txwatch
 
-  webhook:
-    image: mendhak/http-https-echo:latest
-    container_name: webhook-echo
+  webhook-receiver:
+    image: node:20-alpine
+    container_name: webhook-receiver
+    working_dir: /app
+    volumes:
+      - ./examples/webhook-receiver:/app
+    command: node receiver.js
     ports:
-      - "8080:8080"
+      - "3000:3000"
     environment:
-      HTTP_PORT: "8080"
+      PORT: "3000"
     networks:
       - txwatch
 

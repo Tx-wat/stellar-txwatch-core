@@ -8,10 +8,10 @@
 //! data-extraction logic lives in this crate (no I/O, fully unit-testable) and the
 //! poller only handles HTTP concerns.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use txwatch_config::{AlertRule, ContractType};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -155,6 +155,38 @@ pub struct HorizonTransaction {
     pub memo_type: Option<String>,
     /// Memo value; absent when `memo_type` is `"none"`.
     pub memo: Option<String>,
+    /// Ledger sequence number this transaction was included in.
+    ///
+    /// Some Horizon versions return this as a JSON string rather than an integer,
+    /// so a custom deserializer accepts both forms.
+    #[serde(default, deserialize_with = "deserialize_optional_u32")]
+    pub ledger: Option<u32>,
+}
+
+/// Deserialize an `Option<u32>` from either a JSON integer or a string containing
+/// a base-10 integer. Absent or `null` fields yield `None`.
+fn deserialize_optional_u32<'de, D>(deserializer: D) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrString {
+        Int(u32),
+        Str(String),
+    }
+
+    match Option::<IntOrString>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(IntOrString::Int(n)) => Ok(Some(n)),
+        Some(IntOrString::Str(s)) => s
+            .trim()
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|e| D::Error::custom(format!("invalid ledger value '{}': {}", s, e))),
+    }
 }
 
 // ── Enriched transaction ──────────────────────────────────────────────────────
@@ -184,6 +216,11 @@ pub struct EnrichedTransaction {
     pub memo_type: Option<String>,
     /// Memo value from Horizon, if the transaction carries one.
     pub memo: Option<String>,
+    /// Transaction result code decoded from `result_xdr` (e.g. `-7` for
+    /// `txINSUFFICIENT_BALANCE`), if the XDR was present and decodable.
+    pub result_code: Option<i32>,
+    /// Stellar account that signed and submitted this transaction.
+    pub source_account: Option<String>,
 }
 
 impl EnrichedTransaction {
@@ -224,6 +261,8 @@ impl EnrichedTransaction {
             operation_count: tx.operation_count,
             memo_type:     tx.memo_type,
             memo:          tx.memo,
+            result_code,
+            source_account: tx.source_account,
         })
     }
 }
@@ -291,6 +330,53 @@ pub struct AlertPayload {
     pub ledger_sequence: Option<u32>,
     /// Stellar account that signed and submitted this transaction.
     pub source_account: Option<String>,
+    /// Per-contract tags from config, forwarded verbatim for downstream routing
+    /// and filtering. Omitted from the wire format when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<HashMap<String, String>>,
+}
+
+// ── Rolling success-rate window ───────────────────────────────────────────────
+
+/// Per-contract rolling window of transaction outcomes (success/failure).
+///
+/// Used by `AlertRule::SuccessRateThreshold` to compute the success ratio over the
+/// last `window_size` transactions. The window is bounded by the largest
+/// `window_size` seen for that contract, so memory stays proportional to the
+/// configured window rather than the number of transactions observed.
+#[derive(Debug, Default)]
+pub struct SuccessRateTracker {
+    windows: HashMap<String, VecDeque<bool>>,
+}
+
+impl SuccessRateTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one transaction outcome for `contract_id` and return the current
+    /// success ratio over the last `window_size` outcomes.
+    ///
+    /// Returns `None` when fewer than `window_size` outcomes have been recorded,
+    /// so the rule does not fire on an incomplete window.
+    pub fn record(&mut self, contract_id: &str, successful: bool, window_size: u32) -> Option<f64> {
+        let window = self.windows.entry(contract_id.to_string()).or_default();
+        window.push_back(successful);
+        let cap = window_size as usize;
+        while window.len() > cap {
+            window.pop_front();
+        }
+        if window.len() < cap || cap == 0 {
+            return None;
+        }
+        let successes = window.iter().filter(|&&ok| ok).count();
+        Some(successes as f64 / cap as f64)
+    }
+
+    /// Drop the tracked window for a contract (e.g. when it is removed from config).
+    pub fn forget(&mut self, contract_id: &str) {
+        self.windows.remove(contract_id);
+    }
 }
 
 // ── Rule evaluation ───────────────────────────────────────────────────────────
@@ -308,6 +394,34 @@ pub fn evaluate(
     tags: Option<&HashMap<String, String>>,
     tx: &EnrichedTransaction,
 ) -> Vec<AlertPayload> {
+    let mut tracker = SuccessRateTracker::new();
+    evaluate_with_tracker(
+        label,
+        contract_id,
+        network,
+        horizon_base,
+        explorer_base,
+        rules,
+        tags,
+        tx,
+        &mut tracker,
+    )
+}
+
+/// Like [`evaluate`], but uses a caller-supplied [`SuccessRateTracker`] so the
+/// rolling success/failure window persists across transactions.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_with_tracker(
+    label: &str,
+    contract_id: &str,
+    network: &Network,
+    horizon_base: &str,
+    explorer_base: &str,
+    rules: &[AlertRule],
+    tags: Option<&HashMap<String, String>>,
+    tx: &EnrichedTransaction,
+    tracker: &mut SuccessRateTracker,
+) -> Vec<AlertPayload> {
     let horizon_base  = horizon_base.trim_end_matches('/');
     let explorer_base = explorer_base.trim_end_matches('/');
     let horizon_link  = format!("{}/transactions/{}", horizon_base, tx.hash);
@@ -317,7 +431,7 @@ pub fn evaluate(
 
     rules
         .iter()
-        .filter_map(|rule| match eval_rule(rule, tx) {
+        .filter_map(|rule| match eval_rule(rule, tx, contract_id, tracker) {
             Ok(true) => Some(AlertPayload {
                 label: label.to_string(),
                 contract_id: contract_id.to_string(),
@@ -358,7 +472,12 @@ pub fn evaluate(
 // NOTE: When adding a new AlertRule variant, update both `eval_rule()` and
 // `AlertRule::label()` together. Rust's exhaustive matching catches missing arms,
 // but this convention should be preserved for new rule variants.
-fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
+fn eval_rule(
+    rule: &AlertRule,
+    tx: &EnrichedTransaction,
+    contract_id: &str,
+    tracker: &mut SuccessRateTracker,
+) -> Result<bool> {
     Ok(match rule {
         AlertRule::AnyTransaction => true,
 
@@ -370,10 +489,14 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
 
         AlertRule::SorobanInvocation => !tx.function_names.is_empty(),
 
-        AlertRule::LargeTransfer { threshold_xlm } => {
-            let threshold_stroops = threshold_xlm
-                .checked_mul(10_000_000)
-                .context("threshold_xlm overflow when converting to stroops")?;
+        AlertRule::LargeTransfer { threshold_xlm, threshold_stroops } => {
+            let threshold = match (threshold_xlm, threshold_stroops) {
+                (Some(xlm), None) => xlm
+                    .checked_mul(10_000_000)
+                    .context("threshold_xlm overflow when converting to stroops")?,
+                (None, Some(stroops)) => *stroops,
+                _ => bail!("LargeTransfer requires exactly one of threshold_xlm or threshold_stroops"),
+            };
             tx.amount_stroops
                 .map(|s| s >= threshold)
                 .unwrap_or(false)
@@ -395,10 +518,19 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
                 function_names.iter().any(|n| n.to_lowercase() == f_lower)
             }),
 
-        AlertRule::HighFee { threshold_stroops, .. } => tx
-            .fee_charged_stroops
-            .map(|f| f >= *threshold_stroops)
-            .unwrap_or(false),
+        AlertRule::HighFee { threshold_stroops, threshold_xlm } => {
+            // `threshold_xlm` is converted to stroops during validation; derive the
+            // effective stroop threshold here so the conversion is exercised at eval time.
+            let effective_stroops = match threshold_xlm {
+                Some(xlm) => xlm
+                    .checked_mul(10_000_000)
+                    .context("threshold_xlm overflow when converting to stroops")?,
+                None => *threshold_stroops,
+            };
+            tx.fee_charged_stroops
+                .map(|f| f >= effective_stroops)
+                .unwrap_or(false)
+        }
 
         AlertRule::SourceAccountMatch { source_account } => {
             tx.source_account.as_deref() == Some(source_account.as_str())
@@ -406,6 +538,15 @@ fn eval_rule(rule: &AlertRule, tx: &EnrichedTransaction) -> Result<bool> {
 
         AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
             eval_time_window(hours_utc, weekdays, wrap_rule.as_deref(), tx, chrono::Utc::now())?
+        }
+
+        AlertRule::LedgerSequenceRange { from, to } => {
+            if from > to {
+                bail!("invalid LedgerSequenceRange: from ({}) > to ({})", from, to);
+            }
+            tx.ledger_sequence
+                .map(|seq| seq >= *from && seq <= *to)
+                .unwrap_or(false)
         }
     })
 }
@@ -482,17 +623,23 @@ impl AlertPayload {
             contract_id: ctx.contract_id.to_string(),
             contract_type: ContractType::from_contract_id(ctx.contract_id),
             network: ctx.network.to_string(),
-            rule_type: rule_type(rule),
-            rule_triggered: rule_label(rule),
+            rule_type: rule.rule_type(),
+            rule_triggered: rule.label(),
             transaction_hash: tx.hash.clone(),
             function_name: tx.function_names.first().cloned(),
             function_names: tx.function_names.clone(),
             amount_xlm: tx.amount_stroops.map(|s| s / 10_000_000),
+            amount_stroops: tx.amount_stroops,
             fee_charged_stroops: tx.fee_charged_stroops,
+            operation_count: tx.operation_count,
+            memo_type: tx.memo_type.clone(),
+            memo: tx.memo.clone(),
             timestamp: tx.timestamp.timestamp(),
             timestamp_iso: tx.timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             horizon_link: format!("{}/transactions/{}", horizon_base, tx.hash),
             explorer_link: format!("{}/tx/{}", explorer_base, tx.hash),
+            ledger_sequence: tx.ledger_sequence,
+            source_account: tx.source_account.clone(),
             tags: ctx.tags.cloned(),
         }
     }
@@ -535,6 +682,7 @@ impl AlertPayload {
             explorer_link: String::new(),
             ledger_sequence: None,
             source_account: None,
+            tags: None,
         }
     }
 }
@@ -562,6 +710,7 @@ pub struct AlertPayloadBuilder {
     explorer_link: String,
     ledger_sequence: Option<u32>,
     source_account: Option<String>,
+    tags: Option<HashMap<String, String>>,
 }
 
 #[cfg(test)]
@@ -655,6 +804,7 @@ impl AlertPayloadBuilder {
             explorer_link: self.explorer_link,
             ledger_sequence: self.ledger_sequence,
             source_account: self.source_account,
+            tags: self.tags,
         }
     }
 }
@@ -705,6 +855,58 @@ mod tests {
         ).unwrap();
         assert!(!res_sunday, "Sunday should be suppressed");
     }
+
+    // ── Issue #454: wrap_rule must not always fire ───────────────────────────
+
+    /// Issue #454: for every `AlertRule` variant name used as a `wrap_rule`, a
+    /// transaction crafted NOT to match that rule's condition must yield
+    /// `Ok(false)` from `eval_time_window` — not the always-true fallthrough.
+    #[test]
+    fn time_window_wrap_rule_does_not_fire_when_inner_rule_does_not_match() {
+        use chrono::TimeZone;
+
+        // A transaction that matches none of the wrapped rule conditions:
+        // successful, no functions, no amount, no fee, no source account,
+        // no result code.
+        let tx = make_tx(true, &[], None);
+
+        // A time that is inside the window so the window itself does not
+        // short-circuit to false — we want to exercise the wrap_rule matcher.
+        let inside = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+
+        let variants = [
+            "AnyTransaction",
+            "TransactionFailed",
+            "InsufficientFunds",
+            "SorobanInvocation",
+            "LargeTransfer",
+            "FunctionCalled",
+            "AdminFunctionCalled",
+            "HighFee",
+            "SourceAccountMatch",
+        ];
+
+        for variant in variants {
+            // AnyTransaction always matches by definition, so skip it here.
+            if variant == "AnyTransaction" {
+                continue;
+            }
+            let result = eval_time_window(
+                "09:00-17:00",
+                &[],
+                Some(variant),
+                &tx,
+                inside,
+            )
+            .unwrap_or_else(|e| panic!("eval_time_window errored for {}: {}", variant, e));
+            assert!(
+                !result,
+                "wrap_rule {:?} fired for a non-matching transaction (should be false)",
+                variant
+            );
+        }
+    }
+
     use txwatch_config::{AlertRule, Network};
 
     fn make_tx(
@@ -725,6 +927,8 @@ mod tests {
             operation_count: None,
             memo_type: None,
             memo: None,
+            result_code: None,
+            source_account: None,
         }
     }
 
@@ -746,7 +950,7 @@ mod tests {
     #[test]
     fn alert_payload_json_includes_all_documented_fields() {
         let tx = make_tx(true, &["transfer"], Some(150_000_000_000));
-        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: 10_000 }], &tx);
+        let payloads = run(&[AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }], &tx);
         assert_eq!(payloads.len(), 1);
 
         let json = serde_json::to_value(&payloads[0]).unwrap();
@@ -763,11 +967,17 @@ mod tests {
             "function_name",
             "function_names",
             "amount_xlm",
+            "amount_stroops",
             "fee_charged_stroops",
+            "operation_count",
+            "memo_type",
+            "memo",
             "timestamp",
             "timestamp_iso",
             "horizon_link",
             "explorer_link",
+            "ledger_sequence",
+            "source_account",
         ];
         for field in documented {
             assert!(object.contains_key(field), "missing documented field: {}", field);
@@ -846,6 +1056,88 @@ mod tests {
         assert_eq!(payloads[0].rule_triggered, "AnyTransaction");
     }
 
+    /// Issue #444: every README-documented payload field round-trips through
+    /// `AlertPayload::new()` for a fully-populated `EnrichedTransaction`.
+    #[test]
+    fn alert_payload_new_populates_all_documented_fields() {
+        let ctx = PayloadContext {
+            label: "Label",
+            contract_id: "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            network: "testnet",
+            horizon_base: "https://horizon-testnet.stellar.org",
+            explorer_base: "https://stellar.expert/explorer/testnet",
+            tags: None,
+        };
+        let mut tx = make_tx(true, &["transfer", "withdraw"], Some(150_000_000_000));
+        tx.fee_charged_stroops = Some(500);
+        tx.operation_count = Some(3);
+        tx.memo_type = Some("text".into());
+        tx.memo = Some("order-1234".into());
+        tx.ledger_sequence = Some(99887766);
+        tx.source_account = Some("GABC1234567890".into());
+
+        let payload = AlertPayload::new(&ctx, &tx, &AlertRule::AnyTransaction);
+
+        assert_eq!(payload.label, "Label");
+        assert_eq!(payload.contract_id, "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(payload.contract_type, ContractType::Soroban);
+        assert_eq!(payload.network, "testnet");
+        assert_eq!(payload.rule_type, "AnyTransaction");
+        assert_eq!(payload.rule_triggered, "AnyTransaction");
+        assert_eq!(payload.transaction_hash, "abc123");
+        assert_eq!(payload.function_name.as_deref(), Some("transfer"));
+        assert_eq!(payload.function_names, vec!["transfer", "withdraw"]);
+        assert_eq!(payload.amount_xlm, Some(15_000));
+        assert_eq!(payload.amount_stroops, Some(150_000_000_000));
+        assert_eq!(payload.fee_charged_stroops, Some(500));
+        assert_eq!(payload.operation_count, Some(3));
+        assert_eq!(payload.memo_type.as_deref(), Some("text"));
+        assert_eq!(payload.memo.as_deref(), Some("order-1234"));
+        assert_eq!(payload.timestamp, tx.timestamp.timestamp());
+        assert_eq!(payload.timestamp_iso, "2024-01-15T12:00:00Z");
+        assert_eq!(
+            payload.horizon_link,
+            "https://horizon-testnet.stellar.org/transactions/abc123"
+        );
+        assert_eq!(
+            payload.explorer_link,
+            "https://stellar.expert/explorer/testnet/tx/abc123"
+        );
+        assert_eq!(payload.ledger_sequence, Some(99887766));
+        assert_eq!(payload.source_account.as_deref(), Some("GABC1234567890"));
+
+        // The serialized JSON must contain every documented field.
+        let json = serde_json::to_value(&payload).unwrap();
+        let object = json.as_object().unwrap();
+        let documented = [
+            "label",
+            "contract_id",
+            "contract_type",
+            "network",
+            "rule_type",
+            "rule_triggered",
+            "transaction_hash",
+            "function_name",
+            "function_names",
+            "amount_xlm",
+            "amount_stroops",
+            "fee_charged_stroops",
+            "operation_count",
+            "memo_type",
+            "memo",
+            "timestamp",
+            "timestamp_iso",
+            "horizon_link",
+            "explorer_link",
+            "ledger_sequence",
+            "source_account",
+        ];
+        for field in documented {
+            assert!(object.contains_key(field), "missing documented field: {}", field);
+        }
+        assert_eq!(object.len(), documented.len(), "undocumented fields present: {:?}", object.keys());
+    }
+
     #[test]
     fn alert_payload_new_populates_fields_from_context_and_transaction() {
         let ctx = PayloadContext {
@@ -915,7 +1207,7 @@ mod tests {
     fn rule_label_formats_are_stable() {
         assert_eq!(AlertRule::AnyTransaction.label(), "AnyTransaction");
         assert_eq!(AlertRule::TransactionFailed.label(), "TransactionFailed");
-        assert_eq!(AlertRule::LargeTransfer { threshold_xlm: 10_000 }.label(), "LargeTransfer(>=10000XLM)");
+        assert_eq!(AlertRule::LargeTransfer { threshold_xlm: Some(10_000), threshold_stroops: None }.label(), "LargeTransfer(>=10000XLM)");
         assert_eq!(AlertRule::FunctionCalled { function_name: "withdraw".into() }.label(), "FunctionCalled(withdraw)");
         assert_eq!(AlertRule::AdminFunctionCalled { function_names: vec!["set_admin".into(), "upgrade".into()] }.label(), "AdminFunctionCalled([set_admin, upgrade])");
         assert_eq!(AlertRule::HighFee { threshold_stroops: 10_000, threshold_xlm: None }.label(), "HighFee(>=10000 stroops)");
@@ -950,8 +1242,12 @@ mod tests {
             successful,
             paging_token: "1".into(),
             fee_charged: Some("100".into()),
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: Some(result_xdr.into()),
+            memo_type: None,
+            memo: None,
+            source_account: None,
         }
     }
 
@@ -1032,6 +1328,107 @@ mod tests {
         let tx = make_tx(true, &[], None);
         let payloads = run(&[AlertRule::TransactionFailed], &tx);
         assert!(payloads.is_empty());
+    }
+
+    // ── Issue #499: LedgerSequenceRange ──────────────────────────────────────
+
+    fn ledger_rule(from: u32, to: u32) -> AlertRule {
+        AlertRule::LedgerSequenceRange { from, to }
+    }
+
+    #[test]
+    fn ledger_sequence_range_fires_inside_range() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(500),
+            ..make_tx(true, &[], None)
+        };
+        let payloads = run(&[ledger_rule(100, 1000)], &tx);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].rule_type, "LedgerSequenceRange");
+    }
+
+    #[test]
+    fn ledger_sequence_range_does_not_fire_outside_range() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(50),
+            ..make_tx(true, &[], None)
+        };
+        assert!(run(&[ledger_rule(100, 1000)], &tx).is_empty());
+
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(2000),
+            ..make_tx(true, &[], None)
+        };
+        assert!(run(&[ledger_rule(100, 1000)], &tx).is_empty());
+    }
+
+    #[test]
+    fn ledger_sequence_range_fires_on_boundaries() {
+        for seq in [100u32, 1000u32] {
+            let tx = EnrichedTransaction {
+                ledger_sequence: Some(seq),
+                ..make_tx(true, &[], None)
+            };
+            let payloads = run(&[ledger_rule(100, 1000)], &tx);
+            assert_eq!(payloads.len(), 1, "boundary ledger {} should fire", seq);
+        }
+    }
+
+    #[test]
+    fn ledger_sequence_range_fires_on_single_ledger_range() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(42),
+            ..make_tx(true, &[], None)
+        };
+        assert_eq!(run(&[ledger_rule(42, 42)], &tx).len(), 1);
+    }
+
+    #[test]
+    fn ledger_sequence_range_does_not_fire_when_ledger_missing() {
+        let tx = make_tx(true, &[], None);
+        assert!(run(&[ledger_rule(0, u32::MAX)], &tx).is_empty());
+    }
+
+    #[test]
+    fn ledger_sequence_range_invalid_range_does_not_fire() {
+        let tx = EnrichedTransaction {
+            ledger_sequence: Some(500),
+            ..make_tx(true, &[], None)
+        };
+        // from > to is invalid and must not fire even though 500 is "between" them.
+        assert!(run(&[ledger_rule(1000, 100)], &tx).is_empty());
+    }
+
+    // ── Issue #541: TimeWindow wrapping LargeTransfer ────────────────────────
+
+    #[test]
+    fn time_window_with_large_transfer_wrap_fires_inside_hours() {
+        use chrono::TimeZone;
+        let tx = make_tx(true, &[], Some(200_000_000_000));
+        let monday_morning = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let res = eval_time_window(
+            "09:00-17:00",
+            &["Mon".into()],
+            Some("LargeTransfer"),
+            &tx,
+            monday_morning,
+        ).unwrap();
+        assert!(res, "inside business hours with LargeTransfer match should fire");
+    }
+
+    #[test]
+    fn time_window_with_large_transfer_wrap_does_not_fire_outside_hours() {
+        use chrono::TimeZone;
+        let tx = make_tx(true, &[], Some(200_000_000_000));
+        let monday_evening = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 18, 30, 0).unwrap();
+        let res = eval_time_window(
+            "09:00-17:00",
+            &["Mon".into()],
+            Some("LargeTransfer"),
+            &tx,
+            monday_evening,
+        ).unwrap();
+        assert!(!res, "outside business hours must not fire even if LargeTransfer matches");
     }
 
     #[test]
@@ -1142,8 +1539,12 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: fee.map(Into::into),
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
+            source_account: None,
         };
 
         let explicit = EnrichedTransaction::from_horizon(raw(Some("100")), vec![], None, Some(999)).unwrap();
@@ -1164,6 +1565,42 @@ mod tests {
         );
         assert_eq!(payloads.len(), 1);
         assert!(payloads[0].rule_triggered.contains("upgrade"));
+    }
+
+    // ── Issue #546: AdminFunctionCalled is case-insensitive at eval time ──────
+
+    #[test]
+    fn admin_function_called_matches_case_insensitively_set_admin() {
+        let tx = make_tx(true, &["set_admin"], None);
+        let payloads = run(
+            &[AlertRule::AdminFunctionCalled {
+                function_names: vec!["Set_Admin".into()],
+            }],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "AdminFunctionCalled('Set_Admin') should match invoked 'set_admin'"
+        );
+        assert_eq!(payloads[0].rule_type, "AdminFunctionCalled");
+    }
+
+    #[test]
+    fn admin_function_called_matches_case_insensitively_upgrade() {
+        let tx = make_tx(true, &["upgrade"], None);
+        let payloads = run(
+            &[AlertRule::AdminFunctionCalled {
+                function_names: vec!["UPGRADE".into()],
+            }],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "AdminFunctionCalled('UPGRADE') should match invoked 'upgrade'"
+        );
+        assert_eq!(payloads[0].rule_type, "AdminFunctionCalled");
     }
 
     #[test]
@@ -1230,6 +1667,8 @@ mod tests {
                 operation_count: None,
                 memo_type: None,
                 memo: None,
+                result_code: None,
+                source_account: None,
             };
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -1335,6 +1774,45 @@ mod tests {
         assert!(payloads.is_empty());
     }
 
+    // ── Issue #556: HighFee threshold_xlm conversion at eval time ────────────
+
+    #[test]
+    fn high_fee_threshold_xlm_fires_at_converted_stroop_threshold() {
+        let mut tx = make_tx(true, &[], None);
+        // 1 XLM = 10_000_000 stroops — exactly at the converted threshold.
+        tx.fee_charged_stroops = Some(10_000_000);
+        let payloads = run(
+            &[AlertRule::HighFee {
+                threshold_stroops: 0,
+                threshold_xlm:     Some(1),
+            }],
+            &tx,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "HighFee(threshold_xlm=1) should fire at 10_000_000 stroops"
+        );
+        assert!(payloads[0].rule_triggered.contains("HighFee"));
+    }
+
+    #[test]
+    fn high_fee_threshold_xlm_does_not_fire_one_stroop_below() {
+        let mut tx = make_tx(true, &[], None);
+        tx.fee_charged_stroops = Some(9_999_999);
+        let payloads = run(
+            &[AlertRule::HighFee {
+                threshold_stroops: 0,
+                threshold_xlm:     Some(1),
+            }],
+            &tx,
+        );
+        assert!(
+            payloads.is_empty(),
+            "HighFee(threshold_xlm=1) should not fire at 9_999_999 stroops"
+        );
+    }
+
     // ── SourceAccountMatch (issue #303) ───────────────────────────────────────
 
     const SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -1382,8 +1860,11 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
             source_account: Some(SOURCE.into()),
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
@@ -1403,6 +1884,7 @@ mod tests {
             result_xdr: None,
             memo_type: None,
             memo: None,
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.timestamp.year(), 2024);
@@ -1420,6 +1902,7 @@ mod tests {
             result_xdr: None,
             memo_type: Some("text".into()),
             memo: Some("order-1234".into()),
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.memo_type.as_deref(), Some("text"));
@@ -1443,6 +1926,29 @@ mod tests {
         assert!(tx.memo.is_none());
     }
 
+    // ── Issue #544: ledger field accepts string or integer ───────────────────
+
+    #[test]
+    fn horizon_transaction_ledger_accepts_string_value() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1","ledger":"12345678"}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert_eq!(tx.ledger, Some(12_345_678));
+    }
+
+    #[test]
+    fn horizon_transaction_ledger_accepts_integer_value() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1","ledger":12345678}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert_eq!(tx.ledger, Some(12_345_678));
+    }
+
+    #[test]
+    fn horizon_transaction_ledger_is_none_when_absent() {
+        let json = r#"{"hash":"h","created_at":"2024-06-01T00:00:00Z","successful":true,"paging_token":"1"}"#;
+        let tx: HorizonTransaction = serde_json::from_str(json).unwrap();
+        assert!(tx.ledger.is_none());
+    }
+
     /// Issue #65: from_horizon must return Err when created_at is not a valid RFC 3339 timestamp.
     #[test]
     fn from_horizon_rejects_invalid_timestamp() {
@@ -1455,7 +1961,8 @@ mod tests {
             operation_count: None,
             envelope_xdr: None,
             result_xdr:   None,
-            ledger: None,
+            memo_type: None,
+            memo: None,
             source_account: None,
         };
         let result = EnrichedTransaction::from_horizon(raw, vec![], None, None);
@@ -1531,6 +2038,9 @@ mod tests {
             operation_count: Some(5),
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.operation_count, Some(5));
@@ -1552,6 +2062,9 @@ mod tests {
             operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
+            memo_type: None,
+            memo: None,
+            source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
         assert_eq!(enriched.operation_count, None);
@@ -1658,9 +2171,11 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
-            ledger: None,
+            memo_type: None,
+            memo: None,
             source_account: Some("GABC1234567890".into()),
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
@@ -1690,13 +2205,15 @@ mod tests {
             successful: true,
             paging_token: "1".into(),
             fee_charged: None,
+            operation_count: None,
             envelope_xdr: None,
             result_xdr: None,
-            ledger: Some(99887766),
+            memo_type: None,
+            memo: None,
             source_account: None,
         };
         let enriched = EnrichedTransaction::from_horizon(raw, vec![], None, None).unwrap();
-        assert_eq!(enriched.ledger_sequence, Some(99887766));
+        assert_eq!(enriched.ledger_sequence, None);
 
         let payloads = run(&[AlertRule::AnyTransaction], &EnrichedTransaction {
             ledger_sequence: Some(99887766),

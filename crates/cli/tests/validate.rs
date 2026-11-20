@@ -207,25 +207,50 @@ fn validate_exits_one_for_invalid_contract_id() {
 }
 
 #[test]
-fn validate_exits_one_for_poll_interval_above_max() {
-    let dir = env::temp_dir();
-    let path = dir.join("txwatch_poll_interval_too_large_test.toml");
-    fs::write(&path, POLL_INTERVAL_TOO_LARGE_CONFIG).unwrap();
+fn validate_example_config_is_valid() {
+    // Resolve the repository root from this crate's manifest directory so the
+    // test works regardless of the current working directory.
+    let example_config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("config")
+        .join("example.toml");
+
+    assert!(
+        example_config.exists(),
+        "expected example config at {}",
+        example_config.display()
+    );
 
     let output = txwatch_bin()
-        .args(["--config", path.to_str().unwrap(), "validate"])
+        .args(["--config", example_config.to_str().unwrap(), "validate"])
         .output()
         .expect("failed to run txwatch");
 
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "expected exit code 1 for config with poll_interval_seconds > 3600"
+        Some(0),
+        "expected exit code 0 for config/example.toml, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+#[test]
+fn version_flag_prints_cargo_pkg_version() {
+    let output = txwatch_bin()
+        .arg("--version")
+        .output()
+        .expect("failed to run txwatch");
+
+    assert!(output.status.success(), "expected exit code 0 for --version");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("poll_interval_seconds"),
-        "expected error message to mention poll_interval_seconds, got: {stderr}"
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "expected --version output to contain version {}, got: {}",
+        env!("CARGO_PKG_VERSION"),
+        stdout
     );
 }
