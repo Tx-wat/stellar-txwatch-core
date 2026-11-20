@@ -817,6 +817,58 @@ mod tests {
         ).unwrap();
         assert!(!res_sunday, "Sunday should be suppressed");
     }
+
+    // ── Issue #454: wrap_rule must not always fire ───────────────────────────
+
+    /// Issue #454: for every `AlertRule` variant name used as a `wrap_rule`, a
+    /// transaction crafted NOT to match that rule's condition must yield
+    /// `Ok(false)` from `eval_time_window` — not the always-true fallthrough.
+    #[test]
+    fn time_window_wrap_rule_does_not_fire_when_inner_rule_does_not_match() {
+        use chrono::TimeZone;
+
+        // A transaction that matches none of the wrapped rule conditions:
+        // successful, no functions, no amount, no fee, no source account,
+        // no result code.
+        let tx = make_tx(true, &[], None);
+
+        // A time that is inside the window so the window itself does not
+        // short-circuit to false — we want to exercise the wrap_rule matcher.
+        let inside = chrono::Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+
+        let variants = [
+            "AnyTransaction",
+            "TransactionFailed",
+            "InsufficientFunds",
+            "SorobanInvocation",
+            "LargeTransfer",
+            "FunctionCalled",
+            "AdminFunctionCalled",
+            "HighFee",
+            "SourceAccountMatch",
+        ];
+
+        for variant in variants {
+            // AnyTransaction always matches by definition, so skip it here.
+            if variant == "AnyTransaction" {
+                continue;
+            }
+            let result = eval_time_window(
+                "09:00-17:00",
+                &[],
+                Some(variant),
+                &tx,
+                inside,
+            )
+            .unwrap_or_else(|e| panic!("eval_time_window errored for {}: {}", variant, e));
+            assert!(
+                !result,
+                "wrap_rule {:?} fired for a non-matching transaction (should be false)",
+                variant
+            );
+        }
+    }
+
     use txwatch_config::{AlertRule, Network};
 
     fn make_tx(

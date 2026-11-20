@@ -692,9 +692,16 @@ impl WatchedContract {
             if pem.trim().is_empty() {
                 bail!("contract '{}': webhook_tls_cert_pem must not be empty", self.label);
             }
-            if !pem.contains("-----BEGIN CERTIFICATE-----") || !pem.contains("-----END CERTIFICATE-----") {
-                bail!("contract '{}': webhook_tls_cert_pem is not a valid PEM-encoded certificate", self.label);
-            }
+            // #458: actually parse the PEM/DER rather than only checking for the
+            // BEGIN/END markers, so `validate` catches invalid certificates before
+            // `build_pinned_cert_client` fails at webhook-send time.
+            reqwest::Certificate::from_pem(pem.as_bytes()).map_err(|e| {
+                anyhow!(
+                    "contract '{}': webhook_tls_cert_pem is not a valid PEM-encoded certificate: {}",
+                    self.label,
+                    e
+                )
+            })?;
         }
 
         Ok(())
