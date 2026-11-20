@@ -2367,3 +2367,43 @@ mod tests {
         assert!(amount.is_none());
     }
 }
+
+#[cfg(test)]
+mod extract_soroban_details_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_op() -> impl Strategy<Value = HorizonOperation> {
+        (
+            prop_oneof![
+                Just("invoke_host_function".to_string()),
+                Just("payment".to_string()),
+                Just("create_account".to_string()),
+            ],
+            proptest::option::of("[a-z_]{1,12}"),
+            proptest::option::of("[0-9]{1,6}\\.[0-9]{7}"),
+        )
+            .prop_map(|(op_type, function, amount)| HorizonOperation { op_type, function, amount })
+    }
+
+    proptest! {
+        /// function_names has one entry per invoke_host_function op with a `function` field.
+        #[test]
+        fn function_names_len_matches_invoke_ops(ops in proptest::collection::vec(arb_op(), 0..20)) {
+            let expected = ops
+                .iter()
+                .filter(|o| o.op_type == "invoke_host_function" && o.function.is_some())
+                .count();
+            let (names, _) = extract_soroban_details(ops);
+            prop_assert_eq!(names.len(), expected);
+        }
+
+        /// amount is None when the operation list contains no payment ops.
+        #[test]
+        fn amount_none_without_payment_ops(ops in proptest::collection::vec(arb_op(), 0..20)) {
+            let ops: Vec<_> = ops.into_iter().filter(|o| o.op_type != "payment").collect();
+            let (_, amount) = extract_soroban_details(ops);
+            prop_assert!(amount.is_none());
+        }
+    }
+}

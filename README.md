@@ -234,9 +234,29 @@ Optional OpenTelemetry trace export: build with `--features opentelemetry` and s
 
 ---
 
+### SSE stream format
+
+With `--stream-addr`, `GET /stream` emits one Server-Sent Event per alert. Each event has
+the type `alert` and a single `data:` line holding a JSON object. `data` contains the
+alert payload (the same JSON as the webhook body) as a string, and `idempotency_key`
+(`{contract_id}:{transaction_hash}:{rule_type}`) lets clients deduplicate.
+
+```
+event: alert
+data: {"idempotency_key":"CAAA...:abc123:LargeTransfer","data":"{\"label\":\"My Escrow Contract\", ...}"}
+
+```
+
+---
+
 ## Config
 
 See [docs/configuration.md](docs/configuration.md) for the full reference. For monitoring contracts on Stellar Futurenet, see [docs/futurenet-guide.md](docs/futurenet-guide.md).
+
+### Disabling a contract
+
+Set `enabled = false` on a `[[contracts]]` entry to pause monitoring without deleting it.
+Disabled contracts are skipped by the poll loop and logged once at startup. Default: `true`.
 
 ### Network configuration
 

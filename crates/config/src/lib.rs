@@ -582,6 +582,14 @@ pub struct WatchedContract {
     /// is sent with `Content-Encoding: gzip`. Defaults to `false`.
     #[serde(default)]
     pub webhook_compress: bool,
+    /// Set to `false` to temporarily stop monitoring this contract without
+    /// removing it from the config (Issue #532). Defaults to `true`.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 /// Maximum length, in characters, of a tag key or value.
@@ -1305,7 +1313,23 @@ mod tests {
             webhook_tls_cert_pem: None,
             webhook_rule_filter: Vec::new(),
             webhook_compress: false,
+            enabled: true,
         }
+    }
+
+    #[test]
+    fn enabled_defaults_to_true_and_can_be_disabled() {
+        let base = r#"
+label = "A"
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network = "testnet"
+rules = []
+webhook_url = "https://example.com/hook"
+"#;
+        let c: WatchedContract = toml::from_str(base).unwrap();
+        assert!(c.enabled);
+        let c: WatchedContract = toml::from_str(&format!("{base}enabled = false")).unwrap();
+        assert!(!c.enabled);
     }
 
     #[test]
@@ -2650,6 +2674,8 @@ mod tests {
                     webhook_tls_cert_pem: None,
                     webhook_rule_filter: Vec::new(),
                     webhook_compress: false,
+                    enabled: true,
+            enabled: true,
                 }
             })
             .collect();

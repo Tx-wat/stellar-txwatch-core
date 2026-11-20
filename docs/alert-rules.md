@@ -207,6 +207,37 @@ weekdays   = ["Mon", "Tue", "Wed", "Thu", "Fri"]
 wrap_rule  = "LargeTransfer"
 ```
 
+#### Examples
+
+Business-hours alerting (09:00-17:00 UTC, every day, any transaction):
+
+```toml
+[[contracts.rules]]
+type      = "TimeWindow"
+hours_utc = "09:00-17:00"
+weekdays  = []
+```
+
+Weekdays only: alert on failed transactions Monday to Friday and stay quiet on weekends.
+
+```toml
+[[contracts.rules]]
+type      = "TimeWindow"
+hours_utc = "00:00-23:59"
+weekdays  = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+wrap_rule = "TransactionFailed"
+```
+
+Wrapping another rule: only large transfers during a weekend overnight window.
+
+```toml
+[[contracts.rules]]
+type      = "TimeWindow"
+hours_utc = "22:00-06:00"
+weekdays  = ["Sat", "Sun"]
+wrap_rule = "LargeTransfer"
+```
+
 ## Evaluation order
 
 Rules are evaluated in the order they appear in the config file.

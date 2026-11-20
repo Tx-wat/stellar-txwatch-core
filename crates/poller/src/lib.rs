@@ -389,6 +389,9 @@ async fn run_internal(
     // Contracts with `[contracts.tls]` deliver webhooks through a dedicated client,
     // so their client certificate is never presented to Horizon.
     let mut webhook_clients: HashMap<String, Client> = HashMap::new();
+    for contract in cfg.contracts.iter().filter(|c| !c.enabled) {
+        info!(contract = %contract.label, "contract disabled (enabled = false) — skipping");
+    }
     for contract in &cfg.contracts {
         if let Some(tls) = &contract.tls {
             webhook_clients.insert(contract.label.clone(), build_tls_client(tls)?);
@@ -444,6 +447,9 @@ async fn poll_cycle(
     let mut set = tokio::task::JoinSet::new();
 
     for contract in contracts {
+        if !contract.enabled {
+            continue;
+        }
         let contract_id = contract.contract_id.clone();
         let breaker = breakers.entry(contract_id.clone()).or_default();
         if breaker.should_skip() {
@@ -643,7 +649,7 @@ pub async fn run_once(cfg: AppConfig, dry_run: bool) -> Result<usize> {
     let mut cursors = initial_cursors(&cfg);
     let mut failed = 0;
 
-    for contract in &cfg.contracts {
+    for contract in cfg.contracts.iter().filter(|c| c.enabled) {
         if let Err(e) = poll_contract(&client, &client, contract, &mut cursors, dry_run).await {
             error!(contract = %contract.label, error = %e, "contract polling task failed");
             failed += 1;
