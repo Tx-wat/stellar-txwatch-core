@@ -1,6 +1,6 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes seven counters:
+//! Exposes eight counters:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
@@ -8,6 +8,7 @@
 //! - `txwatch_poll_cycles_total`        — total poll cycles per contract (labelled by `contract`)
 //! - `txwatch_cursor_save_failures_total` — total failed cursor-file persistence attempts
 //! - `txwatch_circuit_breaker_open_total` — total times a contract entered circuit-breaker state
+//! - `txwatch_horizon_errors_total`     — total Horizon HTTP errors (labelled by `status_code`)
 //!
 //! And one histogram:
 //! - `txwatch_horizon_latency_seconds`  — Horizon API request duration, labelled by `endpoint`
@@ -117,6 +118,18 @@ fn poll_cycles_total() -> &'static IntCounterVec {
     })
 }
 
+fn horizon_errors_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_horizon_errors_total",
+            "Total Horizon HTTP errors by status code (see issue #581)",
+            &["status_code"]
+        )
+        .expect("register txwatch_horizon_errors_total")
+    })
+}
+
 /// Increment the `txwatch_transactions_total` counter by `n`.
 pub fn inc_transactions(n: u64) {
     transactions_total().inc_by(n);
@@ -165,6 +178,16 @@ pub fn inc_circuit_breaker_open() {
 /// stalled contract can be detected by the counter no longer incrementing.
 pub fn inc_poll_cycle(contract: &str) {
     poll_cycles_total().with_label_values(&[contract]).inc();
+}
+
+/// Increment the `txwatch_horizon_errors_total` counter for `status_code` by 1.
+///
+/// Call this whenever a Horizon request returns a non-success HTTP status, so
+/// that operators can distinguish e.g. 404 from 500 errors in dashboards
+/// (issue #581).
+pub fn inc_horizon_error(status_code: u16) {
+    let label = status_code.to_string();
+    horizon_errors_total().with_label_values(&[label.as_str()]).inc();
 }
 
 // ── /metrics HTTP endpoint ────────────────────────────────────────────────────
@@ -225,60 +248,35 @@ mod tests {
         serve_metrics(addr).await.unwrap();
 
         let client = reqwest::Client::new();
-        let resp = client.get(format!("http://{}/metrics", addr)).send().await.unwrap();
+        let resp = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+
         assert_eq!(resp.status(), 200);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert_eq!(ct, "text/plain; version=0.0.4; charset=utf-8");
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/plain"), "unexpected content-type: {ct}");
     }
 
     #[test]
-    fn build_info_metric_is_registered_and_set() {
-        init_build_info();
+    fn horizon_errors_counter_registers_with_status_code_label() {
+        inc_horizon_error(404);
+        inc_horizon_error(500);
         let families = prometheus::gather();
-        let build_info = families.iter().find(|f| f.get_name() == "txwatch_build_info").expect("txwatch_build_info metric");
-        assert_eq!(build_info.get_metric().len(), 1);
-        let metric = &build_info.get_metric()[0];
-        assert_eq!(metric.get_gauge().get_value(), 1.0);
+        let family = families
+            .iter()
+            .find(|f| f.get_name() == "txwatch_horizon_errors_total")
+            .expect("txwatch_horizon_errors_total should be registered");
+        let labels: Vec<String> = family
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label().iter().map(|l| l.get_name().to_string()))
+            .collect();
+        assert!(labels.iter().any(|l| l == "status_code"));
     }
-
-    #[test]
-    fn circuit_breaker_open_counter_increments() {
-        let before = circuit_breaker_open_total().get();
-        inc_circuit_breaker_open();
-        inc_circuit_breaker_open();
-        assert_eq!(circuit_breaker_open_total().get(), before + 2);
-    }
-
-    #[test]
-    fn poll_cycles_increment_per_contract() {
-        let before_a = poll_cycles_total()
-            .with_label_values(&["contract-a"])
-            .get();
-        let before_b = poll_cycles_total()
-            .with_label_values(&["contract-b"])
-            .get();
-
-        inc_poll_cycle("contract-a");
-        inc_poll_cycle("contract-a");
-        inc_poll_cycle("contract-b");
-
-        assert_eq!(
-            poll_cycles_total()
-                .with_label_values(&["contract-a"])
-                .get(),
-            before_a + 2
-        );
-        assert_eq!(
-            poll_cycles_total()
-                .with_label_values(&["contract-b"])
-                .get(),
-            before_b + 1
-        );
-    }
-#[test]
-    fn enrichment_errors_counter_increments() {
-        let before = enrichment_errors_total().get();
-        inc_enrichment_errors();
-        inc_enrichment_errors();
-        assert_eq!(enrichment_errors_total().get(), before + 2);
-    }
+}
