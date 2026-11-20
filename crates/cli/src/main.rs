@@ -77,6 +77,8 @@ fn spawn_config_watcher(
                             info!(path = %path.display(), "config reloaded");
                         }
                         Err(e) => {
+                            #[cfg(feature = "metrics")]
+                            txwatch_poller::metrics::inc_config_reload_errors();
                             warn!(error = %e, path = %path.display(), "config reload failed; keeping previous config");
                         }
                     }

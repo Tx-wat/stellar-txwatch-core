@@ -1,11 +1,12 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes seven counters:
+//! Exposes eight counters:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
 //! - `txwatch_enrichment_errors_total`  — transactions skipped because enrichment failed
 //! - `txwatch_poll_cycles_total`        — total poll cycles per contract (labelled by `contract`)
+//! - `txwatch_config_reload_errors_total` — config hot-reloads rejected (parse or validation failure)
 //! - `txwatch_cursor_save_failures_total` — total failed cursor-file persistence attempts
 //! - `txwatch_circuit_breaker_open_total` — total times a contract entered circuit-breaker state
 //!
@@ -83,6 +84,17 @@ fn config_reload_total() -> &'static IntCounter {
     })
 }
 
+fn config_reload_errors_total() -> &'static IntCounter {
+    static C: OnceLock<IntCounter> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter!(
+            "txwatch_config_reload_errors_total",
+            "Total config hot-reloads rejected because the new file failed to parse or validate"
+        )
+        .expect("register txwatch_config_reload_errors_total")
+    })
+}
+
 fn cursor_save_failures_total() -> &'static IntCounter {
     static C: OnceLock<IntCounter> = OnceLock::new();
     C.get_or_init(|| {
@@ -141,6 +153,14 @@ pub fn inc_enrichment_errors() {
 /// Reference: Hot-reload on SIGHUP support (issue #227).
 pub fn inc_config_reload() {
     config_reload_total().inc();
+}
+
+/// Increment the `txwatch_config_reload_errors_total` counter by 1.
+///
+/// Call this when a hot-reload is rejected (parse or validation failure) and
+/// the previous config stays active.
+pub fn inc_config_reload_errors() {
+    config_reload_errors_total().inc();
 }
 
 /// Increment the `txwatch_cursor_save_failures_total` counter by 1.

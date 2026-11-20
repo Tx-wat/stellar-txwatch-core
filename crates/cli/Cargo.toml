@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "minimal"
 path = "../../examples/minimal.rs"
 
+[features]
+# Forwards to the poller's Prometheus metrics (also counts failed config reloads).
+metrics = ["txwatch-poller/metrics"]
+
 [dependencies]
 txwatch-config   = { path = "../config" }
 txwatch-poller   = { path = "../poller" }
