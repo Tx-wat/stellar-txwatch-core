@@ -134,6 +134,24 @@ pub(crate) async fn fetch_soroban_details(
     result
 }
 
+// ── Horizon URL resolution ────────────────────────────────────────────────────
+
+/// Resolve the effective Horizon base URL for a contract.
+///
+/// A per-contract `horizon_url` override takes precedence over the network
+/// default so that users with private Horizon nodes can point individual
+/// contracts at their own endpoint. When no override is set (or it is blank),
+/// `network_default` is used.
+pub(crate) fn resolve_horizon_url<'a>(
+    contract_override: Option<&'a str>,
+    network_default: &'a str,
+) -> &'a str {
+    match contract_override {
+        Some(url) if !url.trim().is_empty() => url,
+        _ => network_default,
+    }
+}
+
 // ── Startup connectivity check ────────────────────────────────────────────────
 
 /// Probe a single Horizon base URL with `GET /fee_stats`.
@@ -243,6 +261,27 @@ mod tests {
         let client = reqwest::Client::new();
         // Unreachable URL is fine because the check is disabled.
         startup_connectivity_check(&client, &["http://127.0.0.1:1".to_string()], false).await;
+    }
+
+    #[test]
+    fn resolve_prefers_contract_override() {
+        let resolved = resolve_horizon_url(
+            Some("https://private-horizon.example.com"),
+            "https://horizon-testnet.stellar.org",
+        );
+        assert_eq!(resolved, "https://private-horizon.example.com");
+    }
+
+    #[test]
+    fn resolve_falls_back_to_network_default() {
+        let resolved = resolve_horizon_url(None, "https://horizon-testnet.stellar.org");
+        assert_eq!(resolved, "https://horizon-testnet.stellar.org");
+    }
+
+    #[test]
+    fn resolve_ignores_blank_override() {
+        let resolved = resolve_horizon_url(Some("   "), "https://horizon-testnet.stellar.org");
+        assert_eq!(resolved, "https://horizon-testnet.stellar.org");
     }
 
     #[test]

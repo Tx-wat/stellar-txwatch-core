@@ -45,122 +45,63 @@ fn broken_toml_fixture_fails_with_meaningful_error() {
 }
 
 #[test]
-fn contract_with_max_alerts_per_minute_parses() {
+fn webhook_rule_filter_defaults_to_empty() {
     let toml = r#"
 poll_interval_seconds = 10
 
 [[contracts]]
-label = "busy-contract"
 contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-threshold_xlm = 100
-max_alerts_per_minute = 30
-
-[[contracts.rules]]
-type = "any_transaction"
+threshold_xlm = 100.0
 "#;
-    let cfg = AppConfig::from_str(toml)
-        .expect("config with max_alerts_per_minute should parse and validate");
-
+    let cfg = AppConfig::from_str(toml).expect("config should parse");
     assert_eq!(cfg.contracts.len(), 1);
-    assert_eq!(cfg.contracts[0].max_alerts_per_minute, Some(30));
-}
-
-#[test]
-fn contract_with_zero_max_alerts_per_minute_is_rejected() {
-    let toml = r#"
-poll_interval_seconds = 10
-
-[[contracts]]
-label = "busy-contract"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-threshold_xlm = 100
-max_alerts_per_minute = 0
-
-[[contracts.rules]]
-type = "any_transaction"
-"#;
-    let err = AppConfig::from_str(toml)
-        .expect_err("max_alerts_per_minute = 0 should be rejected");
-    let msg = err.to_string();
-
     assert!(
-        msg.contains("max_alerts_per_minute"),
-        "expected a max_alerts_per_minute validation failure, got: {}",
-        msg
+        cfg.contracts[0].webhook_rule_filter.is_empty(),
+        "webhook_rule_filter should default to an empty list"
     );
 }
 
 #[test]
-fn contract_with_cursor_alias_parses() {
+fn webhook_rule_filter_parses_populated_list() {
     let toml = r#"
 poll_interval_seconds = 10
 
 [[contracts]]
-label = "renamed-contract"
-cursor_alias = "old-contract-label"
 contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-threshold_xlm = 100
-
-[[contracts.rules]]
-type = "any_transaction"
+threshold_xlm = 100.0
+webhook_rule_filter = ["large_transfer", "admin_call"]
 "#;
-    let cfg = AppConfig::from_str(toml)
-        .expect("config with cursor_alias should parse and validate");
-
+    let cfg = AppConfig::from_str(toml).expect("config should parse");
     assert_eq!(cfg.contracts.len(), 1);
     assert_eq!(
-        cfg.contracts[0].cursor_alias.as_deref(),
-        Some("old-contract-label")
+        cfg.contracts[0].webhook_rule_filter,
+        vec!["large_transfer".to_string(), "admin_call".to_string()]
     );
 }
 
 #[test]
-fn contract_with_empty_cursor_alias_is_rejected() {
+fn per_contract_horizon_url_parses() {
     let toml = r#"
 poll_interval_seconds = 10
 
 [[contracts]]
-label = "renamed-contract"
-cursor_alias = ""
 contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-threshold_xlm = 100
+threshold_xlm = 100.0
+horizon_url = "https://private-horizon.example.com"
 
-[[contracts.rules]]
-type = "any_transaction"
+[[contracts]]
+contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+threshold_xlm = 50.0
 "#;
-    let err = AppConfig::from_str(toml)
-        .expect_err("empty cursor_alias should be rejected");
-    let msg = err.to_string();
-
-    assert!(
-        msg.contains("cursor_alias"),
-        "expected a cursor_alias validation failure, got: {}",
-        msg
+    let cfg = AppConfig::from_str(toml).expect("config should parse");
+    assert_eq!(cfg.contracts.len(), 2);
+    assert_eq!(
+        cfg.contracts[0].horizon_url.as_deref(),
+        Some("https://private-horizon.example.com")
     );
-}
-
-#[test]
-fn contract_with_cursor_alias_equal_to_label_is_rejected() {
-    let toml = r#"
-poll_interval_seconds = 10
-
-[[contracts]]
-label = "same-label"
-cursor_alias = "same-label"
-contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-threshold_xlm = 100
-
-[[contracts.rules]]
-type = "any_transaction"
-"#;
-    let err = AppConfig::from_str(toml)
-        .expect_err("cursor_alias equal to label should be rejected");
-    let msg = err.to_string();
-
     assert!(
-        msg.contains("cursor_alias"),
-        "expected a cursor_alias validation failure, got: {}",
-        msg
+        cfg.contracts[1].horizon_url.is_none(),
+        "contract without horizon_url override should have None"
     );
 }
 

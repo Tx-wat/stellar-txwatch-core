@@ -95,7 +95,7 @@ pub(crate) async fn check_horizon_connectivity(client: &Client, cfg: &AppConfig)
     let mut urls: Vec<&str> = cfg
         .contracts
         .iter()
-        .map(|c| c.network.horizon_base_url())
+        .map(|c| horizon_base_url(c))
         .collect();
     urls.sort();
     urls.dedup();
@@ -208,7 +208,7 @@ pub async fn run_with_shutdown(
     let mut horizon_urls: Vec<(&str, &str)> = cfg
         .contracts
         .iter()
-        .map(|c| (c.network.as_str(), c.network.horizon_base_url()))
+        .map(|c| (c.network.as_str(), horizon_base_url(c)))
         .collect();
     horizon_urls.sort();
     horizon_urls.dedup();
@@ -402,6 +402,25 @@ pub async fn run_with_shutdown(
     Ok(())
 }
 
+// ── Horizon URL resolution ────────────────────────────────────────────────────
+
+/// Resolve the Horizon base URL for a contract.
+///
+/// #555: a per-contract `horizon_url` override takes precedence over the
+/// network default so users with private Horizon nodes can route individual
+/// contracts to their own endpoints. In tests, `test_horizon_base_url` is
+/// honored when no explicit override is set.
+pub(crate) fn horizon_base_url(contract: &WatchedContract) -> &str {
+    if let Some(url) = contract.horizon_url.as_deref() {
+        return url;
+    }
+    #[cfg(test)]
+    if let Some(url) = contract.test_horizon_base_url.as_deref() {
+        return url;
+    }
+    contract.network.horizon_base_url()
+}
+
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Poll one contract and return `(transactions_processed, alerts_fired)`.
@@ -473,21 +492,28 @@ pub(crate) async fn poll_contract_with_http_limited(
     let mut alerts_fired: u64 = 0;
 
     for record in &page.records {
-        let mut enriched = EnrichedTransaction::from_horizon(record);
-
-        // Fall back to a separate operations fetch when inline ops are missing.
-        if enriched.operations.is_empty() {
+        // Extract enrichment data from inline operations when present,
+        // otherwise fall back to a separate operations fetch.
+        let (function_names, amount_stroops) = if !record.operations.is_empty() {
+            extract_soroban_details(record.operations.clone())
+        } else {
             match fetch_soroban_details(client, contract, &record.hash).await {
-                Ok(details) => enriched.soroban = details,
+                Ok(details) => details,
                 Err(e) => {
                     debug!(error = %e, hash = %record.hash, "soroban details fetch failed");
                     #[cfg(feature = "metrics")]
                     crate::metrics::inc_enrichment_errors();
+                    (Vec::new(), None)
                 }
             }
-        } else {
-            enriched.soroban = extract_soroban_details(&enriched.operations);
-        }
+        };
+
+        let enriched = EnrichedTransaction::from_horizon(
+            record.tx.clone(),
+            function_names,
+            amount_stroops,
+            None,
+        )?;
 
         txs_processed += 1;
 
@@ -553,7 +579,7 @@ async fn fetch_page(
     contract: &WatchedContract,
     cursor: Option<&str>,
 ) -> Result<HorizonPage> {
-    let base = contract.network.horizon_base_url();
+    let base = horizon_base_url(contract);
     let mut url = format!(
         "{}/accounts/{}/transactions?order=asc&limit=200&join=operations",
         base, contract.contract_id
