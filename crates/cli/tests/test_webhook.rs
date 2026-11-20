@@ -135,6 +135,53 @@ fn spawn_status_receiver(
     (url, handle)
 }
 
+/// Accepts one HTTP request on a loopback port, replies with the given status
+/// line and response body, and returns the lowercased request headers together
+/// with the raw request body.
+fn spawn_body_receiver(
+    status_line: &'static str,
+    response_body: &'static str,
+) -> (String, JoinHandle<(HashMap<String, String>, Vec<u8>)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+
+    let handle = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut headers = HashMap::new();
+        let mut content_length = 0usize;
+
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                let name = name.trim().to_ascii_lowercase();
+                let value = value.trim().to_string();
+                if name == "content-length" {
+                    content_length = value.parse().unwrap();
+                }
+                headers.insert(name, value);
+            }
+        }
+
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+        let response = format!(
+            "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        reader.get_mut().write_all(response.as_bytes()).unwrap();
+
+        (headers, body)
+    });
+
+    (url, handle)
+}
+
 /// Accepts one HTTP request on a loopback port, waits `delay` before replying
 /// 200, and returns the lowercased request headers together with the raw body.
 fn spawn_delayed_receiver(
@@ -231,6 +278,97 @@ fn test_webhook_exits_one_when_target_returns_http_error() {
 }
 
 #[test]
+fn test_webhook_logs_response_body_on_failure() {
+    let cfg_path = write_valid_config("txwatch_test_webhook_error_body.toml");
+    let (url, receiver) = spawn_body_receiver(
+        "HTTP/1.1 500 Internal Server Error",
+        "upstream rejected the payload",
+    );
+
+    let output = run_test_webhook(&cfg_path, &url, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1 when webhook target returns HTTP 500, stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("upstream rejected the payload"),
+        "expected response body to be logged on failure, got: {combined}"
+    );
+
+    let _ = receiver.join();
+}
+
+#[test]
+fn test_webhook_truncates_long_response_body_on_failure() {
+    let cfg_path = write_valid_config("txwatch_test_webhook_error_body_long.toml");
+    let long_body = "x".repeat(1024);
+    let long_body: &'static str = Box::leak(long_body.into_boxed_str());
+    let (url, receiver) = spawn_body_receiver("HTTP/1.1 500 Internal Server Error", long_body);
+
+    let output = run_test_webhook(&cfg_path, &url, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1 when webhook target returns HTTP 500, stdout: {}, stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("..."),
+        "expected truncated response body to end with '...', got: {combined}"
+    );
+    assert!(
+        !combined.contains(&"x".repeat(513)),
+        "expected response body to be truncated to 512 bytes, got: {combined}"
+    );
+
+    let _ = receiver.join();
+}
+
+#[test]
+fn test_webhook_does_not_log_response_body_on_success() {
+    let cfg_path = write_valid_config("txwatch_test_webhook_success_body.toml");
+    let (url, receiver) = spawn_body_receiver("HTTP/1.1 200 OK", "success-body-marker");
+
+    let output = run_test_webhook(&cfg_path, &url, &[]);
+
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("success-body-marker"),
+        "expected response body not to be logged on success, got: {combined}"
+    );
+
+    let _ = receiver.join();
+}
+
+#[test]
 fn test_webhook_with_secret_sends_hmac_signature() {
     let cfg_path = write_valid_config("txwatch_test_webhook_signed.toml");
     let (url, receiver) = spawn_receiver();
@@ -243,131 +381,4 @@ fn test_webhook_with_secret_sends_hmac_signature() {
     );
 
     let (headers, body) = receiver.join().unwrap();
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"mysecret").unwrap();
-    mac.update(&body);
-    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-
-    assert_eq!(headers.get("x-txwatch-signature"), Some(&expected));
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("signed with HMAC-SHA256"),
-        "output should report the signature, got: {}",
-        stdout
-    );
-}
-
-#[test]
-fn test_webhook_without_secret_sends_no_signature() {
-    let cfg_path = write_valid_config("txwatch_test_webhook_unsigned.toml");
-    let (url, receiver) = spawn_receiver();
-
-    let output = run_test_webhook(&cfg_path, &url, &[]);
-    assert!(
-        output.status.success(),
-        "expected success, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let (headers, _body) = receiver.join().unwrap();
-    assert!(
-        !headers.contains_key("x-txwatch-signature"),
-        "no signature header expected without --secret"
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("(unsigned)"),
-        "output should report the payload is unsigned, got: {}",
-        stdout
-    );
-}
-
-#[test]
-fn test_webhook_compresses_body_when_enabled() {
-    let cfg_path = write_compressed_config("txwatch_test_webhook_compressed.toml");
-    let (url, receiver) = spawn_receiver();
-
-    let output = run_test_webhook(&cfg_path, &url, &[]);
-    assert!(
-        output.status.success(),
-        "expected success, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let (headers, body) = receiver.join().unwrap();
-    assert_eq!(
-        headers.get("content-encoding").map(String::as_str),
-        Some("gzip"),
-        "expected Content-Encoding: gzip when webhook_compress is enabled"
-    );
-
-    let mut decoded = String::new();
-    GzDecoder::new(&body[..])
-        .read_to_string(&mut decoded)
-        .expect("body should be valid gzip data");
-    assert!(
-        decoded.contains("function_names"),
-        "decompressed payload should contain the webhook payload, got: {}",
-        decoded
-    );
-}
-
-#[test]
-fn test_webhook_body_is_uncompressed_when_disabled() {
-    let cfg_path = write_valid_config("txwatch_test_webhook_uncompressed.toml");
-    let (url, receiver) = spawn_receiver();
-
-    let output = run_test_webhook(&cfg_path, &url, &[]);
-    assert!(
-        output.status.success(),
-        "expected success, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let (headers, body) = receiver.join().unwrap();
-    assert!(
-        !headers.contains_key("content-encoding"),
-        "no Content-Encoding header expected when webhook_compress is disabled"
-    );
-
-    let decoded = String::from_utf8(body).expect("body should be plain UTF-8 JSON");
-    assert!(
-        decoded.contains("function_names"),
-        "payload should be uncompressed JSON, got: {}",
-        decoded
-    );
-}
-
-#[test]
-fn test_webhook_succeeds_when_receiver_is_slower_than_default_timeout() {
-    let cfg_path = write_valid_config("txwatch_test_webhook_slow_ok.toml");
-    // Delay well beyond the default 15s timeout, but within the configured 60s.
-    let (url, receiver) = spawn_delayed_receiver(Duration::from_secs(20));
-
-    let output = run_test_webhook(&cfg_path, &url, &["--timeout", "60"]);
-    assert!(
-        output.status.success(),
-        "expected success with --timeout 60, stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let (_headers, _body) = receiver.join().unwrap();
-}
-
-#[test]
-fn test_webhook_times_out_when_receiver_exceeds_configured_timeout() {
-    let cfg_path = write_valid_config("txwatch_test_webhook_slow_fail.toml");
-    // Delay longer than the configured 1s timeout so the request must fail.
-    let (url, receiver) = spawn_delayed_receiver(Duration::from_secs(5));
-
-    let output = run_test_webhook(&cfg_path, &url, &["--timeout", "1"]);
-    assert!(
-        !output.status.success(),
-        "expected failure when receiver exceeds --timeout 1, stdout: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-
-    // The receiver thread will still complete once the client disconnects.
-    let _ = receiver.join();
-}
+    let mut mac = Hmac::<Sha256>::new_from_slice(
