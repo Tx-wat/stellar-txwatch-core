@@ -2,6 +2,7 @@
 //!
 //! Exposes eight counters:
 //! - `txwatch_transactions_total`       — total transactions processed
+//! - `txwatch_transactions_per_contract` — transactions processed, labelled by `contract`
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_alerts_suppressed_total`  — total alerts suppressed by the per-cycle cap (labelled by `contract`)
 //! - `txwatch_webhook_failures_total`   — total permanent webhook delivery failures
