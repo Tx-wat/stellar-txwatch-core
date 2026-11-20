@@ -627,3 +627,6 @@ MIT
 
 <!-- handsoff-issue-576 -->
 - #576: test: add test for format_xlm helper function
+
+<!-- handsoff-issue-567 -->
+- #567: feat: add network field to startup log

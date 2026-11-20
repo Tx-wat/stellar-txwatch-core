@@ -44,6 +44,67 @@ fn broken_toml_fixture_fails_with_meaningful_error() {
     );
 }
 
+#[test]
+fn webhook_rule_filter_defaults_to_empty() {
+    let toml = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+threshold_xlm = 100.0
+"#;
+    let cfg = AppConfig::from_str(toml).expect("config should parse");
+    assert_eq!(cfg.contracts.len(), 1);
+    assert!(
+        cfg.contracts[0].webhook_rule_filter.is_empty(),
+        "webhook_rule_filter should default to an empty list"
+    );
+}
+
+#[test]
+fn webhook_rule_filter_parses_populated_list() {
+    let toml = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+threshold_xlm = 100.0
+webhook_rule_filter = ["large_transfer", "admin_call"]
+"#;
+    let cfg = AppConfig::from_str(toml).expect("config should parse");
+    assert_eq!(cfg.contracts.len(), 1);
+    assert_eq!(
+        cfg.contracts[0].webhook_rule_filter,
+        vec!["large_transfer".to_string(), "admin_call".to_string()]
+    );
+}
+
+#[test]
+fn per_contract_horizon_url_parses() {
+    let toml = r#"
+poll_interval_seconds = 10
+
+[[contracts]]
+contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+threshold_xlm = 100.0
+horizon_url = "https://private-horizon.example.com"
+
+[[contracts]]
+contract_id = "CBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+threshold_xlm = 50.0
+"#;
+    let cfg = AppConfig::from_str(toml).expect("config should parse");
+    assert_eq!(cfg.contracts.len(), 2);
+    assert_eq!(
+        cfg.contracts[0].horizon_url.as_deref(),
+        Some("https://private-horizon.example.com")
+    );
+    assert!(
+        cfg.contracts[1].horizon_url.is_none(),
+        "contract without horizon_url override should have None"
+    );
+}
+
 const VALID_CONFIG: &str = r#"
 poll_interval_seconds = 10
 
@@ -64,6 +125,59 @@ fn write_config(dir: &TempDir, contents: &str) -> PathBuf {
     let path = dir.path().join("config.toml");
     std::fs::write(&path, contents).expect("failed to write config file");
     path
+}
+
+/// Build a valid 56-character base32 contract ID (Stellar strkey format).
+///
+/// The ID starts with the `C` version byte and is padded with `A` characters
+/// (base32 value 0) so that every generated ID is syntactically valid.
+fn contract_id(index: usize) -> String {
+    // Encode the index into the trailing characters so IDs stay unique while
+    // remaining valid base32 (A-Z, 2-7).
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut suffix = [b'A'; 8];
+    let mut n = index;
+    for slot in suffix.iter_mut().rev() {
+        *slot = alphabet[n % alphabet.len()];
+        n /= alphabet.len();
+    }
+    let suffix = std::str::from_utf8(&suffix).expect("base32 suffix is valid utf8");
+    format!("C{}{}", "A".repeat(47), suffix)
+}
+
+fn cfg_with_n_contracts(n: usize) -> String {
+    let mut cfg = String::from("poll_interval_seconds = 10\n");
+    for i in 0..n {
+        cfg.push_str(&format!(
+            "\n[[contracts]]\nid = \"{}\"\nthreshold_xlm = 100\n",
+            contract_id(i)
+        ));
+    }
+    cfg
+}
+
+#[test]
+fn accepts_exactly_max_contracts() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let path = write_config(&dir, &cfg_with_n_contracts(100));
+
+    let cfg = AppConfig::from_file(&path)
+        .expect("config with exactly MAX_CONTRACTS (100) should validate");
+    assert_eq!(cfg.contracts.len(), 100);
+}
+
+#[test]
+fn contract_at_index_99_is_valid() {
+    let dir = TempDir::new().expect("failed to create temp dir");
+    let path = write_config(&dir, &cfg_with_n_contracts(100));
+
+    let cfg = AppConfig::from_file(&path)
+        .expect("config with exactly MAX_CONTRACTS (100) should validate");
+
+    let last = cfg.contracts.last().expect("config should contain contracts");
+    assert_eq!(last.id, contract_id(99));
+    assert_eq!(last.id.len(), 56, "contract ID must be 56 characters");
+    assert!(last.id.starts_with('C'), "contract ID must start with 'C'");
 }
 
 #[test]
