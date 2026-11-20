@@ -5,9 +5,10 @@
 //! the integration tests in `tests/` can drive it directly.
 
 use std::{
+    collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -15,24 +16,76 @@ use reqwest::Client;
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract, MAX_CONTRACTS};
-use txwatch_notifier::send_webhook;
+use txwatch_notifier::{send_webhook, AlertPayload, PayloadContext};
 use txwatch_rules::{evaluate, extract_soroban_details, EnrichedTransaction};
 
 use crate::circuit_breaker::CircuitBreakerMap;
+use crate::counters::Counters;
 use crate::cursor::CursorMap;
 use crate::enrichment::fetch_soroban_details;
 use crate::horizon::HorizonPage;
 
-// ── Summary counters ──────────────────────────────────────────────────────────
+// ── #543: per-contract alert rate limiting ────────────────────────────────────
 
-#[derive(Default)]
-pub(crate) struct Counters {
-    pub transactions: AtomicU64,
-    pub alerts: AtomicU64,
-    pub interval_transactions: AtomicU64,
-    pub interval_alerts: AtomicU64,
+/// Token bucket rate limiter for a single contract's outbound alerts.
+///
+/// Capacity is `max_alerts_per_minute`; tokens refill continuously at
+/// `max_alerts_per_minute / 60` per second. State persists across poll cycles.
+pub(crate) struct AlertRateLimiter {
+    capacity: f64,
+    refill_per_sec: f64,
+    tokens: f64,
+    last_refill: Instant,
 }
 
+impl AlertRateLimiter {
+    pub(crate) fn new(max_alerts_per_minute: u32) -> Self {
+        let capacity = max_alerts_per_minute as f64;
+        Self {
+            capacity,
+            refill_per_sec: capacity / 60.0,
+            tokens: capacity,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Refill based on elapsed time, then try to consume one token.
+    /// Returns `true` if an alert may be sent.
+    pub(crate) fn try_acquire(&mut self) -> bool {
+        self.try_acquire_at(Instant::now())
+    }
+
+    /// Testable variant of [`try_acquire`] with an explicit "now".
+    pub(crate) fn try_acquire_at(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
+            self.last_refill = now;
+        }
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Per-contract limiter map, keyed by contract label. Contracts without a
+/// configured `max_alerts_per_minute` are absent from the map (unlimited).
+pub(crate) type AlertRateLimiters = HashMap<String, AlertRateLimiter>;
+
+fn limiter_for<'a>(
+    limiters: &'a mut AlertRateLimiters,
+    contract: &WatchedContract,
+) -> Option<&'a mut AlertRateLimiter> {
+    let max = contract.max_alerts_per_minute?;
+    Some(
+        limiters
+            .entry(contract.label.clone())
+            .or_insert_with(|| AlertRateLimiter::new(max)),
+    )
+}
 // ── Startup connectivity check ────────────────────────────────────────────────
 
 /// Send one `GET /fee_stats` to each unique Horizon base URL and warn (never
@@ -42,7 +95,7 @@ pub(crate) async fn check_horizon_connectivity(client: &Client, cfg: &AppConfig)
     let mut urls: Vec<&str> = cfg
         .contracts
         .iter()
-        .map(|c| c.network.horizon_base_url())
+        .map(|c| horizon_base_url(c))
         .collect();
     urls.sort();
     urls.dedup();
@@ -131,10 +184,15 @@ pub async fn run_with_shutdown(
     // #374: per-contract circuit breaker state, keyed by contract label.
     let mut breakers = CircuitBreakerMap::new();
 
+    // #543: per-contract alert rate limiter state, persisted across cycles.
+    let mut limiters = AlertRateLimiters::new();
+
     let interval      = Duration::from_secs(cfg.poll_interval_seconds);
     let summary_every = Duration::from_secs(60);
     let counters      = Arc::new(Counters::default());
     let n_contracts   = cfg.contracts.len();
+    let contract_labels: Vec<String> =
+        cfg.contracts.iter().map(|c| c.label.clone()).collect();
 
     // #259: set the gauge once at startup so dashboards always have a
     // baseline signal for how many contracts are being watched.
@@ -150,7 +208,7 @@ pub async fn run_with_shutdown(
     let mut horizon_urls: Vec<(&str, &str)> = cfg
         .contracts
         .iter()
-        .map(|c| (c.network.as_str(), c.network.horizon_base_url()))
+        .map(|c| (c.network.as_str(), horizon_base_url(c)))
         .collect();
     horizon_urls.sort();
     horizon_urls.dedup();
@@ -179,16 +237,23 @@ pub async fn run_with_shutdown(
         );
     }
 
-    // ── #380: optional startup connectivity check (warn-only, never aborts) ───
-    if cfg.horizon_startup_check {
-        check_horizon_connectivity(&client, &cfg).await;
-    }
+    // ── #380/#451: optional startup connectivity check (warn-only, never
+    // aborts). Delegates to the single implementation in `horizon.rs`.
+    let horizon_urls: Vec<String> = cfg
+        .contracts
+        .iter()
+        .map(|c| c.network.horizon_base_url().to_string())
+        .collect();
+    crate::horizon::startup_connectivity_check(&client, &horizon_urls, cfg.horizon_startup_check)
+        .await;
 
     // Spawn a background summary logger that never blocks the poll loop.
     let counters_for_summary = Arc::clone(&counters);
+    let labels_for_summary = contract_labels.clone();
     let _summary_guard = tokio::spawn(async move {
         loop {
             let c = Arc::clone(&counters_for_summary);
+            let labels = labels_for_summary.clone();
             let handle = tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(summary_every).await;
@@ -202,6 +267,14 @@ pub async fn run_with_shutdown(
                         alerts_interval       = interval_alerts,
                         "60-second summary"
                     );
+                    for (label, tx_count, alert_count) in c.take_interval_per_contract(&labels) {
+                        info!(
+                            contract    = %label,
+                            tx_count    = tx_count,
+                            alert_count = alert_count,
+                            "per-contract summary"
+                        );
+                    }
                 }
             });
             if let Err(e) = handle.await {
@@ -232,9 +305,16 @@ pub async fn run_with_shutdown(
                 continue;
             }
 
-            let result =
-                poll_contract_with_http(&client, contract, &mut cursors, dry_run, &webhook_http)
-                    .await;
+            let result = poll_contract_with_http_limited(
+                &client,
+                contract,
+                &mut cursors,
+                dry_run,
+                &webhook_http,
+                &mut limiters,
+                shutdown_rx,
+            )
+            .await;
             // #352: count every poll attempt (success or failure) per contract.
             #[cfg(feature = "metrics")]
             crate::metrics::inc_poll_cycles(&contract.label);
@@ -251,6 +331,7 @@ pub async fn run_with_shutdown(
                     counters.alerts.fetch_add(alerts, Ordering::Relaxed);
                     counters.interval_transactions.fetch_add(txs, Ordering::Relaxed);
                     counters.interval_alerts.fetch_add(alerts, Ordering::Relaxed);
+                    counters.record_contract(&contract.label, txs, alerts);
                     #[cfg(feature = "metrics")]
                     {
                         crate::metrics::inc_transactions(txs);
@@ -321,6 +402,25 @@ pub async fn run_with_shutdown(
     Ok(())
 }
 
+// ── Horizon URL resolution ────────────────────────────────────────────────────
+
+/// Resolve the Horizon base URL for a contract.
+///
+/// #555: a per-contract `horizon_url` override takes precedence over the
+/// network default so users with private Horizon nodes can route individual
+/// contracts to their own endpoints. In tests, `test_horizon_base_url` is
+/// honored when no explicit override is set.
+pub(crate) fn horizon_base_url(contract: &WatchedContract) -> &str {
+    if let Some(url) = contract.horizon_url.as_deref() {
+        return url;
+    }
+    #[cfg(test)]
+    if let Some(url) = contract.test_horizon_base_url.as_deref() {
+        return url;
+    }
+    contract.network.horizon_base_url()
+}
+
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
 /// Poll one contract and return `(transactions_processed, alerts_fired)`.
@@ -344,7 +444,16 @@ pub(crate) async fn poll_contract(
     cursors: &mut CursorMap,
     dry_run: bool,
 ) -> Result<(u64, u64)> {
-    poll_contract_with_http(client, contract, cursors, dry_run, &txwatch_notifier::WebhookHttpConfig::default()).await
+    let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+    poll_contract_with_http(
+        client,
+        contract,
+        cursors,
+        dry_run,
+        &txwatch_notifier::WebhookHttpConfig::default(),
+        shutdown_rx,
+    )
+    .await
 }
 
 /// Like [`poll_contract`] but threads the shared webhook HTTP settings into
@@ -356,30 +465,55 @@ pub(crate) async fn poll_contract_with_http(
     cursors: &mut CursorMap,
     dry_run: bool,
     webhook_http: &txwatch_notifier::WebhookHttpConfig,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> Result<(u64, u64)> {
+    // Standalone callers get a fresh limiter map; the poll loop uses
+    // `poll_contract_with_http_limited` to persist limiter state across cycles.
+    let mut limiters = AlertRateLimiters::new();
+    poll_contract_with_http_limited(client, contract, cursors, dry_run, webhook_http, &mut limiters)
+        .await
+}
+
+/// Like [`poll_contract_with_http`] but threads the per-contract alert rate
+/// limiter state so token buckets persist across poll cycles (#543).
+pub(crate) async fn poll_contract_with_http_limited(
+    client: &Client,
+    contract: &WatchedContract,
+    cursors: &mut CursorMap,
+    dry_run: bool,
+    webhook_http: &txwatch_notifier::WebhookHttpConfig,
+    limiters: &mut AlertRateLimiters,
 ) -> Result<(u64, u64)> {
     let start_time = std::time::Instant::now();
-    let cursor = cursors.get(&contract.label).map(|s| s.to_string());
-    let page = fetch_page(client, contract, cursor.as_deref()).await?;
+    let cursor = cursors.get(&contract.contract_id).to_string();
+    let page = fetch_page(client, contract, Some(&cursor)).await?;
 
     let mut txs_processed: u64 = 0;
     let mut alerts_fired: u64 = 0;
 
     for record in &page.records {
-        let mut enriched = EnrichedTransaction::from_horizon(record);
-
-        // Fall back to a separate operations fetch when inline ops are missing.
-        if enriched.operations.is_empty() {
+        // Extract enrichment data from inline operations when present,
+        // otherwise fall back to a separate operations fetch.
+        let (function_names, amount_stroops) = if !record.operations.is_empty() {
+            extract_soroban_details(record.operations.clone())
+        } else {
             match fetch_soroban_details(client, contract, &record.hash).await {
-                Ok(details) => enriched.soroban = details,
+                Ok(details) => details,
                 Err(e) => {
                     debug!(error = %e, hash = %record.hash, "soroban details fetch failed");
                     #[cfg(feature = "metrics")]
                     crate::metrics::inc_enrichment_errors();
+                    (Vec::new(), None)
                 }
             }
-        } else {
-            enriched.soroban = extract_soroban_details(&enriched.operations);
-        }
+        };
+
+        let enriched = EnrichedTransaction::from_horizon(
+            record.tx.clone(),
+            function_names,
+            amount_stroops,
+            None,
+        )?;
 
         txs_processed += 1;
 
@@ -388,16 +522,46 @@ pub(crate) async fn poll_contract_with_http(
             if dry_run {
                 info!(rule = %rule.name, hash = %record.hash, "[dry-run] alert would fire");
             } else {
-                match send_webhook(&contract.webhook_url, &rule, &enriched, &webhook_http).await {
-                    Ok(()) => alerts_fired += 1,
-                    Err(e) => error!(error = %e, rule = %rule.name, "webhook delivery failed"),
+                // #543: enforce the per-contract alert rate limit, if configured.
+                if let Some(limiter) = limiter_for(limiters, contract) {
+                    if !limiter.try_acquire() {
+                        warn!(
+                            contract = %contract.label,
+                            rule = %rule.name,
+                            hash = %record.hash,
+                            "alert suppressed by rate limiting"
+                        );
+                        #[cfg(feature = "metrics")]
+                        crate::metrics::inc_alerts_suppressed(&contract.label);
+                        continue;
+                    }
+                }
+                let payload_ctx = PayloadContext {
+                    contract_label: contract.label.clone(),
+                    contract_id: contract.contract_id.clone(),
+                    network: contract.network.as_str().to_string(),
+                    horizon_base: contract.network.horizon_base_url().to_string(),
+                    explorer_base: contract.network.explorer_base_url().to_string(),
+                };
+                let payload = AlertPayload::new(&payload_ctx, &enriched, rule);
+                match send_webhook(
+                    client,
+                    &contract.webhook_url,
+                    &payload,
+                    contract.webhook_secret.as_deref(),
+                    shutdown_rx,
+                )
+                .await
+                {
+                    Ok(_) => alerts_fired += 1,
+                    Err(e) => error!(error = %e, rule = %rule.label(), "webhook delivery failed"),
                 }
             }
         }
     }
 
     if let Some(last) = page.records.last() {
-        cursors.set(&contract.label, last.paging_token.clone());
+        cursors.set(&contract.contract_id, last.paging_token.clone());
     }
 
     let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -415,7 +579,7 @@ async fn fetch_page(
     contract: &WatchedContract,
     cursor: Option<&str>,
 ) -> Result<HorizonPage> {
-    let base = contract.network.horizon_base_url();
+    let base = horizon_base_url(contract);
     let mut url = format!(
         "{}/accounts/{}/transactions?order=asc&limit=200&join=operations",
         base, contract.contract_id
@@ -449,7 +613,7 @@ mod tests {
 
     #[test]
     fn counters_default_to_zero() {
-        let c = Counters::default();
+        let c = crate::counters::Counters::default();
         assert_eq!(c.transactions.load(Ordering::Relaxed), 0);
         assert_eq!(c.alerts.load(Ordering::Relaxed), 0);
     }
@@ -512,5 +676,54 @@ mod tests {
         }
         // 2^3 = 8 intervals skipped after the third failure.
         assert_eq!(breakers.skip_intervals(label), 8);
+    }
+
+    // ── #543: alert rate limiter ─────────────────────────────────────────────
+
+    #[test]
+    fn limiter_exhausts_after_capacity() {
+        let mut limiter = AlertRateLimiter::new(3);
+        let now = Instant::now();
+        assert!(limiter.try_acquire_at(now));
+        assert!(limiter.try_acquire_at(now));
+        assert!(limiter.try_acquire_at(now));
+        // Bucket empty: further acquisitions at the same instant are denied.
+        assert!(!limiter.try_acquire_at(now));
+        assert!(!limiter.try_acquire_at(now));
+    }
+
+    #[test]
+    fn limiter_refills_over_time() {
+        let mut limiter = AlertRateLimiter::new(60); // 1 token per second
+        let start = Instant::now();
+        for _ in 0..60 {
+            assert!(limiter.try_acquire_at(start));
+        }
+        assert!(!limiter.try_acquire_at(start));
+
+        // After one second, exactly one token is available again.
+        let later = start + Duration::from_secs(1);
+        assert!(limiter.try_acquire_at(later));
+        assert!(!limiter.try_acquire_at(later));
+
+        // Refill is capped at capacity.
+        let much_later = start + Duration::from_secs(3600);
+        for _ in 0..60 {
+            assert!(limiter.try_acquire_at(much_later));
+        }
+        assert!(!limiter.try_acquire_at(much_later));
+    }
+
+    #[test]
+    fn limiter_partial_refill_accumulates() {
+        let mut limiter = AlertRateLimiter::new(60); // 1 token per second
+        let start = Instant::now();
+        for _ in 0..60 {
+            assert!(limiter.try_acquire_at(start));
+        }
+        // Half a second yields half a token — not enough yet.
+        assert!(!limiter.try_acquire_at(start + Duration::from_millis(500)));
+        // Another half second completes the token.
+        assert!(limiter.try_acquire_at(start + Duration::from_secs(1)));
     }
 }

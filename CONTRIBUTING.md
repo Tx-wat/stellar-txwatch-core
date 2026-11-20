@@ -249,6 +249,50 @@ AlertRule::MyNewRule { my_field } => {
 > `AlertRule::label()` in `crates/config/src/lib.rs`. Rust's exhaustive matching helps
 > catch missing arms, but both functions must remain in sync for new variants.
 
+### Step 3b — Handle the `wrap_rule` matcher (`crates/rules/src/lib.rs`)
+
+`eval_rule()` is **not** the only evaluation path. `eval_time_window()` also
+matches on the wrapped rule's type name via `TimeWindow.wrap_rule`
+(`Option<String>`), in a separate `match` on `rule_type()` strings. That match
+has a `_ => Ok(true)` catch-all, so a new rule type that is not handled there
+will **silently always fire** for every transaction inside the time window
+(see issue #453).
+
+For every new variant, do one of the following:
+
+1. **Add a matching arm** to the `wrap_rule` match in `eval_time_window()`:
+
+   ```rust
+   match wrapped {
+       // ... existing arms ...
+       "MyNewRule" => Ok(/* the same condition as eval_rule() */),
+       _ => Ok(true),
+   }
+   ```
+
+   Note that `wrap_rule` only carries a bare type name, so if the rule's
+   condition depends on its own parameters (e.g. a function name), you cannot
+   express it here without threading those parameters through — in that case
+   use option 2.
+
+2. **Reject it at config-validation time**: add the rule type to the
+   `TimeWindow` arm of `AlertRule::validate()` in `crates/config/src/lib.rs`
+   so that configuring it as a `wrap_rule` value fails with a clear error
+   instead of falling through to always-true:
+
+   ```rust
+   AlertRule::TimeWindow { wrap_rule, .. } => {
+       if let Some(wrapped) = wrap_rule {
+           if !SUPPORTED_WRAP_RULES.contains(&wrapped.as_str()) {
+               bail!("TimeWindow wrap_rule '{}' is not supported", wrapped);
+           }
+       }
+   }
+   ```
+
+Whichever option you choose, add a test covering the `wrap_rule` path for the
+new rule type.
+
 ### Step 4 — Label the rule (`crates/config/src/lib.rs`)
 
 Add a match arm in `AlertRule::label()` and `AlertRule::rule_type()`:

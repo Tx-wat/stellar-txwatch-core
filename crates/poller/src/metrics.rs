@@ -1,6 +1,6 @@
 //! Prometheus metrics for TxWatch (enabled with the `metrics` feature flag).
 //!
-//! Exposes nine counters:
+//! Exposes eight counters:
 //! - `txwatch_transactions_total`       — total transactions processed
 //! - `txwatch_alerts_total`             — total alert payloads sent (rules matched)
 //! - `txwatch_alerts_suppressed_total`  — total alerts suppressed by the per-cycle cap (labelled by `contract`)
@@ -9,7 +9,7 @@
 //! - `txwatch_poll_cycles_total`        — total poll cycles per contract (labelled by `contract`)
 //! - `txwatch_cursor_save_failures_total` — total failed cursor-file persistence attempts
 //! - `txwatch_circuit_breaker_open_total` — total times a contract entered circuit-breaker state
-//! - `txwatch_horizon_rate_limits_total` — total Horizon 429 rate-limit responses (see issue #574)
+//! - `txwatch_horizon_errors_total`     — total Horizon HTTP errors (labelled by `status_code`)
 //!
 //! And one histogram:
 //! - `txwatch_horizon_latency_seconds`  — Horizon API request duration, labelled by `endpoint`
@@ -142,6 +142,18 @@ fn poll_cycles_total() -> &'static IntCounterVec {
     })
 }
 
+fn horizon_errors_total() -> &'static IntCounterVec {
+    static C: OnceLock<IntCounterVec> = OnceLock::new();
+    C.get_or_init(|| {
+        register_int_counter_vec!(
+            "txwatch_horizon_errors_total",
+            "Total Horizon HTTP errors by status code (see issue #581)",
+            &["status_code"]
+        )
+        .expect("register txwatch_horizon_errors_total")
+    })
+}
+
 /// Increment the `txwatch_transactions_total` counter by `n`.
 pub fn inc_transactions(n: u64) {
     transactions_total().inc_by(n);
@@ -210,6 +222,16 @@ pub fn inc_poll_cycle(contract: &str) {
     poll_cycles_total().with_label_values(&[contract]).inc();
 }
 
+/// Increment the `txwatch_horizon_errors_total` counter for `status_code` by 1.
+///
+/// Call this whenever a Horizon request returns a non-success HTTP status, so
+/// that operators can distinguish e.g. 404 from 500 errors in dashboards
+/// (issue #581).
+pub fn inc_horizon_error(status_code: u16) {
+    let label = status_code.to_string();
+    horizon_errors_total().with_label_values(&[label.as_str()]).inc();
+}
+
 // ── /metrics HTTP endpoint ────────────────────────────────────────────────────
 
 /// Serve the Prometheus `/metrics` endpoint on `addr`.
@@ -239,6 +261,64 @@ pub async fn serve_metrics(addr: SocketAddr) -> Result<()> {
 }
 
 async fn handle_metrics(
-  
+    _req: Request<hyper::body::Incoming>,
+) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    init_build_info();
+    use prometheus::Encoder;
+    let encoder = prometheus::TextEncoder::new();
+    let mut buf = Vec::new();
+    encoder
+        .encode(&prometheus::gather(), &mut buf)
+        .unwrap_or_default();
+    Ok(Response::builder()
+        .status(200)
+        .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(Full::new(Bytes::from(buf)))
+        .unwrap())
+}
 
-/* … truncated 975 chars — edit only what you need near the top … */
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn metrics_endpoint_content_type_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        serve_metrics(addr).await.unwrap();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{}/metrics", addr))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.starts_with("text/plain"), "unexpected content-type: {ct}");
+    }
+
+    #[test]
+    fn horizon_errors_counter_registers_with_status_code_label() {
+        inc_horizon_error(404);
+        inc_horizon_error(500);
+        let families = prometheus::gather();
+        let family = families
+            .iter()
+            .find(|f| f.get_name() == "txwatch_horizon_errors_total")
+            .expect("txwatch_horizon_errors_total should be registered");
+        let labels: Vec<String> = family
+            .get_metric()
+            .iter()
+            .flat_map(|m| m.get_label().iter().map(|l| l.get_name().to_string()))
+            .collect();
+        assert!(labels.iter().any(|l| l == "status_code"));
+    }
+}

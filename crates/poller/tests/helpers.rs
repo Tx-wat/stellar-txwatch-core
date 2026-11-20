@@ -17,8 +17,15 @@ pub fn contract(webhook_url: &str, rules: Vec<AlertRule>) -> WatchedContract {
         rules,
         webhook_url: webhook_url.to_string(),
         webhook_secret: None,
+        webhook_rule_filter: Vec::new(),
+        webhook_timeout_seconds: None,
+        allow_internal_webhook_urls: false,
+        horizon_url: None,
         test_horizon_base_url: None,
         max_alerts_per_cycle: None,
+        tags: Vec::new(),
+        tls: None,
+        webhook_tls_cert_pem: None,
     }
 }
 
