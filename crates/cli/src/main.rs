@@ -104,6 +104,7 @@ const VERSION: &str = concat!(
 #[command(
     name    = "txwatch",
     version = VERSION,
+    disable_version_flag = true,
     about   = "Stellar Soroban contract monitor & webhook alert engine"
 )]
 struct Cli {
