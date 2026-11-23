@@ -159,6 +159,10 @@ enum Command {
         /// Send a HEAD/OPTIONS request to each webhook URL and warn on unreachable endpoints.
         #[arg(long)]
         check_webhooks: bool,
+
+        /// Output format for the summary: human-readable `text` (default) or `json`.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        output: OutputFormat,
     },
 
     /// Send a test webhook payload to a URL and exit
@@ -197,6 +201,35 @@ enum Command {
         #[arg(long, value_name = "TOML")]
         output: PathBuf,
     },
+}
+
+/// Output format for the `validate` subcommand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+/// Builds the machine-readable `validate --output json` document.
+fn validate_json(cfg: &AppConfig) -> serde_json::Value {
+    let contracts: Vec<_> = cfg
+        .contracts
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "label": c.label,
+                "contract_id": c.contract_id,
+                "network": c.network.as_str(),
+                "webhook_url": c.webhook_url,
+                "rules": c.rules,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "valid": true,
+        "poll_interval_seconds": cfg.poll_interval_seconds,
+        "contracts": contracts,
+    })
 }
 
 // ── JSON import schema ────────────────────────────────────────────────────────
@@ -337,10 +370,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Validate { check_webhooks } => {
+        Command::Validate { check_webhooks, output } => {
             let cfg = AppConfig::from_file(&cli.config)
                 .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
-            print!("{}", ValidateSummary { config: &cfg });
+            match output {
+                OutputFormat::Text => print!("{}", ValidateSummary { config: &cfg }),
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&validate_json(&cfg))?)
+                }
+            }
 
             if check_webhooks {
                 let client = Client::builder()
