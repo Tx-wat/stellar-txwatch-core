@@ -2431,6 +2431,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tracing-test",
  "txwatch-config",
  "txwatch-notifier",
  "txwatch-rules",

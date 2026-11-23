@@ -954,7 +954,7 @@ fn reset_idle_counter(contract_id: &str) {
 
             if dry_run {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
-                    tx = %payload.transaction_hash, "dry-run enabled: not sending webhook");
+                    tx = %payload.transaction_hash, "[dry-run] rule matched; not sending webhook");
             } else {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
