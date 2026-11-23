@@ -160,6 +160,11 @@ enum Command {
         #[arg(long)]
         check_webhooks: bool,
 
+        /// GET /accounts/{contract_id} on each contract's Horizon and warn (not error)
+        /// when the contract is not found on the configured network.
+        #[arg(long)]
+        check_contracts: bool,
+
         /// Output format for the summary: human-readable `text` (default) or `json`.
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         output: OutputFormat,
@@ -370,7 +375,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Validate { check_webhooks, output } => {
+        Command::Validate { check_webhooks, check_contracts, output } => {
             let cfg = AppConfig::from_file(&cli.config)
                 .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
             match output {
@@ -396,6 +401,36 @@ async fn main() -> Result<()> {
                         }
                         Ok(true) => {
                             info!(webhook_url = %c.webhook_url, contract = %c.label, "webhook reachable");
+                        }
+                    }
+                }
+            }
+
+            if check_contracts {
+                let client = Client::builder()
+                    .timeout(Duration::from_secs(15))
+                    .build()
+                    .context("failed to build HTTP client")?;
+
+                for c in &cfg.contracts {
+                    let horizon = c
+                        .horizon_url
+                        .as_deref()
+                        .unwrap_or_else(|| c.network.horizon_base_url());
+                    match check_contract_exists(&client, horizon, &c.contract_id).await {
+                        Ok(true) => {
+                            info!(contract = %c.label, network = %c.network, "contract found on network");
+                        }
+                        Ok(false) => {
+                            warn!(
+                                contract = %c.label,
+                                contract_id = %c.contract_id,
+                                network = %c.network,
+                                "contract not found on network; check contract_id / network"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(contract = %c.label, network = %c.network, error = %e, "contract existence check failed");
                         }
                     }
                 }
@@ -513,6 +548,20 @@ async fn main() -> Result<()> {
 async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
     let resp = client.head(url).send().await?;
     Ok(!resp.status().is_server_error())
+}
+
+/// Queries `GET {horizon}/accounts/{contract_id}`. Returns `Ok(false)` on 404
+/// (contract not present on that network) and `Ok(true)` on any success status.
+async fn check_contract_exists(client: &Client, horizon: &str, contract_id: &str) -> Result<bool> {
+    let url = format!("{}/accounts/{}", horizon.trim_end_matches('/'), contract_id);
+    let resp = client.get(&url).send().await?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("Horizon returned HTTP {} for {}", resp.status(), url);
+    }
+    Ok(true)
 }
 
 /// Runs the continuous watch loop (default behavior).
