@@ -379,7 +379,12 @@ async fn main() -> Result<()> {
 
             // Prefer the explicit --secret flag, otherwise fall back to the
             // webhook_secret configured for the first contract.
-            let secret = secret.or_else(|| first_contract.webhook_secret.clone());
+            let secret = secret.or_else(|| {
+                first_contract
+                    .webhook_secret
+                    .as_ref()
+                    .map(|s| s.expose_secret().to_owned())
+            });
 
             let client = Client::builder()
                 .timeout(Duration::from_secs(timeout))
