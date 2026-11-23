@@ -470,7 +470,8 @@ async fn poll_cycle(
             }
             let result = poll_contract(&client, &client, &contract, &mut local, dry_run).await;
             match &result {
-                Ok((txs, alerts)) => {
+                Ok((txs, alerts, suppressed)) => {
+                    counters.interval_suppressed.fetch_add(*suppressed, Ordering::Relaxed);
                     counters.transactions.fetch_add(*txs, Ordering::Relaxed);
                     counters.alerts.fetch_add(*alerts, Ordering::Relaxed);
                     counters.interval_transactions.fetch_add(*txs, Ordering::Relaxed);
@@ -617,7 +618,7 @@ impl HorizonClient for Client {
             anyhow::bail!("Horizon returned HTTP {} for {}", response.status(), url);
         }
 
-        let page: HorizonPage = response
+        let page: HorizonPage<HorizonTransactionWithOps> = response
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;
@@ -825,7 +826,7 @@ async fn poll_contract(
             anyhow::bail!("Horizon returned HTTP {} for {}", response.status(), url);
         }
 
-        let page: HorizonPage = response
+        let page: HorizonPage<HorizonTransactionWithOps> = response
             .json()
             .await
             .with_context(|| format!("failed to parse Horizon response from {}", url))?;

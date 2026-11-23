@@ -2,10 +2,11 @@ use std::{fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 use txwatch_config::AppConfig;
+use serde::Deserialize;
 use txwatch_notifier::{build_client, send_webhook_once, test_payload_with_network};
 
 mod stream;
@@ -294,11 +295,6 @@ impl fmt::Display for ValidateSummary<'_> {
                 label = c.label
             )?;
             writeln!(f, "    contract_id  : {}", c.contract_id)?;
-            writeln!(
-                f,
-                "    description  : {}",
-                c.description.as_deref().unwrap_or("none")
-            )?;
             writeln!(f, "    webhook_url  : {}", c.webhook_url)?;
             writeln!(
                 f,
@@ -341,8 +337,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Validate { check_webhooks } => {
-            let cfg = AppConfig::from_file(&cli.config)?;
-            println!("{}", ValidateSummary { config: &cfg });
+            let cfg = AppConfig::from_file(&cli.config)
+                .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
+            print!("{}", ValidateSummary { config: &cfg });
 
             if check_webhooks {
                 let client = Client::builder()
@@ -358,27 +355,35 @@ async fn main() -> Result<()> {
                         Ok(false) => {
                             warn!(webhook_url = %c.webhook_url, contract = %c.label, "webhook endpoint is unreachable");
                         }
-                        Ok(true) => {}
+                        Ok(true) => {
+                            info!(webhook_url = %c.webhook_url, contract = %c.label, "webhook reachable");
+                        }
                     }
                 }
             }
+            Ok(())
         }
 
         Command::TestWebhook { url, label, secret, timeout } => {
-            let cfg = AppConfig::from_file(&cli.config)?;
-            if cfg.contracts.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "config has no contracts; cannot derive network for test-webhook"
-                ));
-            }
-            let first_contract = &cfg.contracts[0];
-            let payload = test_payload_with_network(&label, &first_contract.network);
+            let cfg = AppConfig::from_file(&cli.config)
+                .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
+            let first_contract = cfg.contracts.first().ok_or_else(|| {
+                anyhow::anyhow!("config has no contracts; cannot derive network for test-webhook")
+            })?;
+            let payload = test_payload_with_network(
+                &label,
+                &url,
+                &first_contract.network,
+                first_contract.network.horizon_base_url(),
+            );
 
             // Prefer the explicit --secret flag, otherwise fall back to the
             // webhook_secret configured for the first contract.
             let secret = secret.or_else(|| first_contract.webhook_secret.clone());
 
-            let client = build_client(Duration::from_secs(timeout))
+            let client = Client::builder()
+                .timeout(Duration::from_secs(timeout))
+                .build()
                 .context("failed to build HTTP client")?;
 
             info!(url = %url, timeout_secs = timeout, "sending test webhook");
@@ -388,7 +393,8 @@ async fn main() -> Result<()> {
 
             match secret.as_deref() {
                 Some(s) => {
-                    let signature = txwatch_notifier::sign_payload(&payload, s);
+                    let body = serde_json::to_vec(&payload)?;
+                    let signature = txwatch_notifier::sign_payload(s, &body);
                     println!("X-TxWatch-Signature: {}", signature);
                     println!(
                         "Test webhook delivered successfully to {} (signed with HMAC-SHA256)",
@@ -396,12 +402,10 @@ async fn main() -> Result<()> {
                     );
                 }
                 None => {
-                    println!(
-                        "Test webhook delivered successfully to {} (unsigned)",
-                        url
-                    );
+                    println!("Test webhook delivered successfully to {} (unsigned)", url);
                 }
             }
+            Ok(())
         }
 
         Command::Import { from, output } => {
@@ -430,6 +434,7 @@ async fn main() -> Result<()> {
                 from.display(),
                 output.display()
             );
+            Ok(())
         }
 
         Command::Watch {
@@ -440,118 +445,30 @@ async fn main() -> Result<()> {
             stream_token,
             contracts,
         } => {
-            let cfg = AppConfig::from_file(&cli.config)
+            let mut cfg = AppConfig::from_file(&cli.config)
                 .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
+            if let Some(labels) = &contracts {
+                cfg.contracts.retain(|c| labels.iter().any(|l| l == &c.label));
+            }
+
             if poll_once {
-                run_poll_once(cfg, dry_run, from_beginning, contracts).await?;
+                let failed = txwatch_poller::run_once(cfg, dry_run).await?;
+                info!(failed, "poll-once: single cycle complete");
                 return Ok(());
             }
 
-            run_watch(
-                cli.config,
-                cfg,
-                dry_run,
-                from_beginning,
-                stream_addr,
-                stream_token,
-                contracts,
-            )
-            .await
-        }
-        Command::Validate { check_webhooks } => {
-            let cfg = AppConfig::from_file(&cli.config)
-                .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
-            print!("{}", ValidateSummary { config: &cfg });
-
-            if check_webhooks {
-                let client = build_client(Duration::from_secs(15))?;
-                for c in &cfg.contracts {
-                    match client.head(&c.webhook_url).send().await {
-                        Ok(resp) if resp.status().is_success() || resp.status() == StatusCode::METHOD_NOT_ALLOWED => {
-                            info!(label = %c.label, url = %c.webhook_url, "webhook reachable");
-                        }
-                        Ok(resp) => {
-                            warn!(label = %c.label, url = %c.webhook_url, status = %resp.status(), "webhook returned non-success status");
-                        }
-                        Err(e) => {
-                            warn!(label = %c.label, url = %c.webhook_url, error = %e, "webhook unreachable");
-                        }
-                    }
-                }
-            }
-            Ok(())
-        }
-        Command::TestWebhook {
-            url,
-            label,
-            secret,
-            timeout,
-        } => {
-            let client = build_client(Duration::from_secs(timeout))?;
-            let payload = test_payload_with_network(&label, "testnet");
-            send_webhook_once(&client, &url, &payload, secret.as_deref()).await?;
-            info!(url = %url, "test webhook delivered");
-            Ok(())
+            run_watch(cli.config, cfg, dry_run, from_beginning, stream_addr, stream_token).await
         }
     }
 }
 
-/// Runs a single poll cycle across all (optionally filtered) contracts, logs a
-/// summary, and returns. Used by `watch --poll-once` for cron/CI deployments.
-async fn run_poll_once(
-    cfg: AppConfig,
-    dry_run: bool,
-    from_beginning: bool,
-    contracts: Option<Vec<String>>,
-) -> Result<()> {
-    let selected: Vec<_> = cfg
-        .contracts
-        .iter()
-        .filter(|c| match &contracts {
-            Some(labels) => labels.iter().any(|l| l == &c.label),
-            None => true,
-        })
-        .collect();
-
-    info!(
-        contracts = selected.len(),
-        dry_run,
-        from_beginning,
-        "poll-once: starting single cycle"
-    );
-
-    let client = build_client(Duration::from_secs(15))?;
-    let mut succeeded = 0usize;
-    let mut failed = 0usize;
-
-    for c in &selected {
-        match txwatch_poller::poll_contract_once(&client, c, dry_run, from_beginning).await {
-            Ok(stats) => {
-                succeeded += 1;
-                info!(
-                    label = %c.label,
-                    fetched = stats.fetched,
-                    matched = stats.matched,
-                    sent = stats.sent,
-                    "poll-once: contract cycle complete"
-                );
-            }
-            Err(e) => {
-                failed += 1;
-                warn!(label = %c.label, error = %e, "poll-once: contract cycle failed");
-            }
-        }
-    }
-
-    info!(
-        contracts = selected.len(),
-        succeeded,
-        failed,
-        "poll-once: single cycle complete"
-    );
-
-    Ok(())
+/// Sends a HEAD request to `url` and reports whether the endpoint responded.
+/// Any HTTP response (including 405 Method Not Allowed) counts as reachable;
+/// only 5xx responses and transport errors are treated as unreachable.
+async fn check_webhook_reachable(client: &Client, url: &str) -> Result<bool> {
+    let resp = client.head(url).send().await?;
+    Ok(!resp.status().is_server_error())
 }
 
 /// Runs the continuous watch loop (default behavior).
@@ -562,21 +479,28 @@ async fn run_watch(
     from_beginning: bool,
     stream_addr: Option<std::net::SocketAddr>,
     stream_token: Option<String>,
-    contracts: Option<Vec<String>>,
 ) -> Result<()> {
-    let shared = Arc::new(RwLock::new(cfg));
+    // The hot-reload watcher keeps its own copy (AppConfig is not Clone).
+    let shared = Arc::new(RwLock::new(AppConfig::from_file(&config_path)?));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     spawn_config_watcher(config_path, Arc::clone(&shared), shutdown_rx.clone());
 
+    // Keep the sender alive for the lifetime of the watch loop.
+    let (_alert_tx, alert_rx) = tokio::sync::broadcast::channel::<String>(256);
     if let Some(addr) = stream_addr {
-        stream::spawn_stream_server(addr, stream_token, Arc::clone(&shared));
+        stream::run_sse_server(addr, stream_token, alert_rx).await?;
     }
 
-    let _ = (dry_run, from_beginning, contracts);
+    let poller = tokio::spawn(txwatch_poller::run_with_options(
+        cfg,
+        dry_run,
+        from_beginning,
+        shutdown_rx,
+    ));
 
     tokio::signal::ctrl_c().await.ok();
     info!("shutdown signal received");
     let _ = shutdown_tx.send(true);
-    Ok(())
+    poller.await.context("poller task panicked")?
 }
