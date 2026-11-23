@@ -17,7 +17,7 @@ use std::fs;
 use tokio::sync::{oneshot, watch};
 use tracing::{debug, error, info, warn};
 use txwatch_config::{AppConfig, WatchedContract};
-use txwatch_notifier::{build_tls_client, send_webhook};
+use txwatch_notifier::{build_tls_client, send_webhook_with_headers};
 use txwatch_rules::{evaluate, EnrichedTransaction, HorizonTransaction};
 
 // ── Circuit breaker ───────────────────────────────────────────────────────────
@@ -716,6 +716,22 @@ fn initial_cursors(cfg: &AppConfig) -> HashMap<String, String> {
 
 // ── Per-contract poll ─────────────────────────────────────────────────────────
 
+fn enrich_transaction(
+    contract: &WatchedContract,
+    tx: HorizonTransaction,
+    function_names: Vec<String>,
+    amount_stroops: Option<u64>,
+) -> Result<EnrichedTransaction> {
+    let hash = tx.hash.clone();
+    tracing::info_span!("enrich_transaction", contract = %contract.label).in_scope(|| {
+        EnrichedTransaction::from_horizon(tx, function_names, amount_stroops, None).map_err(|error| {
+            warn!(contract = %contract.label, tx = %hash, error = %error,
+                "skipping transaction due to enrichment error");
+            error
+        })
+    })
+}
+
 /// Returns `(transactions_processed, alerts_fired, alerts_suppressed_by_cap)`.
 ///
 /// Uses `join=operations` on the transactions endpoint so that Horizon returns
@@ -725,7 +741,7 @@ fn initial_cursors(cfg: &AppConfig) -> HashMap<String, String> {
 ///
 /// `horizon` serves the Horizon reads and `client` sends webhooks. They are
 /// separate so the Horizon side can be replaced in tests (#302).
-#[tracing::instrument(skip(horizon, client, contract, cursors), fields(
+#[tracing::instrument(skip(client, webhook_client, contract, cursors), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
     network     = %contract.network.as_str(),
@@ -741,6 +757,17 @@ async fn poll_contract(
     cursors:        &mut HashMap<String, String>,
     dry_run:        bool,
 ) -> Result<(u64, u64, u64)> {
+    let protected_client;
+    let webhook_client = if contract.webhook_headers.is_empty() {
+        webhook_client
+    } else {
+        // Arbitrary credentials must never be forwarded to a redirect target.
+        protected_client = match &contract.tls {
+            Some(tls) => build_tls_client(tls)?,
+            None => txwatch_notifier::build_client()?,
+        };
+        &protected_client
+    };
     let start_time = std::time::Instant::now();
     let cursor = cursors
         .get(&contract.contract_id)
@@ -882,15 +909,15 @@ fn reset_idle_counter(contract_id: &str) {
             }
         };
 
-        let enriched = match EnrichedTransaction::from_horizon(record.tx, function_names, amount_stroops, None) {
+        let enriched = match enrich_transaction(contract, record.tx, function_names, amount_stroops)
+        {
             Ok(t) => t,
-            Err(e) => {
+            Err(_) => {
                 // Skip-and-advance (#305): the cursor was already moved past this
                 // transaction above. Retrying would pin the cursor on a record that
                 // can never be parsed and stall every transaction after it, so the
                 // skip is counted instead and operators can alert on the metric.
-                warn!(contract = %contract.label, tx = %tx_hash, error = %e,
-                    "skipping transaction due to enrichment error");
+
                 #[cfg(feature = "metrics")]
                 metrics::inc_enrichment_errors();
                 continue;
@@ -935,8 +962,8 @@ fn reset_idle_counter(contract_id: &str) {
                 // drop the sender externally.
                 let (_shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
                 std::mem::forget(_shutdown_tx);
-                if let Err(e) = send_webhook(
-                    webhook_client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(),
+                if let Err(e) = send_webhook_with_headers(
+                    webhook_client, &contract.webhook_url, &payload, contract.webhook_secret.as_deref(), &contract.webhook_headers, contract.webhook_compress,
                     shutdown_rx,
                 ).await {
                     error!(contract = %contract.label, rule = %payload.rule_triggered,
@@ -1101,6 +1128,19 @@ mod tests {
             rules,
             webhook_url: webhook_url.to_string(),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_cycle: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: horizon_override,
         }
     }
@@ -1157,6 +1197,19 @@ mod tests {
             rules:       vec![AlertRule::FunctionCalled { function_name: "withdraw".into() }],
             webhook_url: format!("{}/hook", receiver.uri()),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_cycle: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
@@ -1218,6 +1271,18 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: format!("{}/hook", receiver.uri()),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: Some(2),
         };
@@ -1359,6 +1424,18 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: None,
         };
@@ -1391,6 +1468,19 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_cycle: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: Some(server.uri()),
         };
 
@@ -1425,6 +1515,18 @@ mod tests {
             rules: vec![],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: None,
         };
@@ -1473,6 +1575,18 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: None,
         };
@@ -1539,9 +1653,52 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: None,
             max_alerts_per_cycle: None,
         }
+    }
+
+    #[test]
+    fn enrichment_warning_includes_contract_label_and_span() {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let logs = Capture::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let mut tx = scripted_tx("invalid-timestamp", "1").tx;
+        tx.created_at = "invalid".into();
+        let mut contract = test_contract("unused");
+        contract.label = "example-contract".into();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(enrich_transaction(&contract, tx, Vec::new(), None).is_err());
+        });
+        let message = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(message.contains("enrich_transaction{contract=example-contract}"), "{message}");
+        assert!(message.contains("skipping transaction due to enrichment error"));
+        assert!(message.matches("contract=example-contract").count() >= 2, "{message}");
     }
 
     #[tokio::test]
@@ -1583,6 +1740,18 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: "https://hooks.example.com/test".into(),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: None,
         };
@@ -1657,6 +1826,18 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/a".into(),
                     webhook_secret: None,
+                    webhook_headers: Default::default(),
+                    horizon_url: None,
+                    max_alerts_per_minute: None,
+                    cursor_alias: None,
+                    webhook_timeout_seconds: None,
+                    allow_internal_webhook_urls: None,
+                    tags: None,
+                    tls: None,
+                    webhook_tls_cert_pem: None,
+                    webhook_rule_filter: Vec::new(),
+                    webhook_compress: false,
+                    enabled: true,
                     test_horizon_base_url: None,
                     max_alerts_per_cycle: None,
                 },
@@ -1667,6 +1848,18 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/b".into(),
                     webhook_secret: None,
+                    webhook_headers: Default::default(),
+                    horizon_url: None,
+                    max_alerts_per_minute: None,
+                    cursor_alias: None,
+                    webhook_timeout_seconds: None,
+                    allow_internal_webhook_urls: None,
+                    tags: None,
+                    tls: None,
+                    webhook_tls_cert_pem: None,
+                    webhook_rule_filter: Vec::new(),
+                    webhook_compress: false,
+                    enabled: true,
                     test_horizon_base_url: None,
                     max_alerts_per_cycle: None,
                 },
@@ -1677,6 +1870,18 @@ mod tests {
                     rules:       vec![txwatch_config::AlertRule::AnyTransaction],
                     webhook_url: "https://hooks.example.com/c".into(),
                     webhook_secret: None,
+                    webhook_headers: Default::default(),
+                    horizon_url: None,
+                    max_alerts_per_minute: None,
+                    cursor_alias: None,
+                    webhook_timeout_seconds: None,
+                    allow_internal_webhook_urls: None,
+                    tags: None,
+                    tls: None,
+                    webhook_tls_cert_pem: None,
+                    webhook_rule_filter: Vec::new(),
+                    webhook_compress: false,
+                    enabled: true,
                     test_horizon_base_url: None,
                     max_alerts_per_cycle: None,
                 },
@@ -1754,6 +1959,18 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: format!("{}/hooks", receiver.uri()),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: None,
         };
@@ -1887,6 +2104,19 @@ mod tests {
             rules:       vec![AlertRule::AnyTransaction],
             webhook_url: format!("{}/hooks", receiver.uri()),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            horizon_url: None,
+            max_alerts_per_cycle: None,
+            max_alerts_per_minute: None,
+            cursor_alias: None,
+            webhook_timeout_seconds: None,
+            allow_internal_webhook_urls: None,
+            tags: None,
+            tls: None,
+            webhook_tls_cert_pem: None,
+            webhook_rule_filter: Vec::new(),
+            webhook_compress: false,
+            enabled: true,
             test_horizon_base_url: Some(server.uri()),
         };
         let mut cursors: HashMap<String, String> = HashMap::new();

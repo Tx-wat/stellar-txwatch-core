@@ -17,7 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use txwatch_config::{ContractType, Network, TlsConfig};
 use txwatch_rules::AlertPayload;
 
@@ -313,6 +314,27 @@ pub async fn send_webhook(
     send_webhook_with_backoff(client, url, payload, secret, RETRY_BASE_DELAY, shutdown).await
 }
 
+/// Deliver an alert with per-contract HTTP headers. Use a redirect-disabled webhook client.
+pub async fn send_webhook_with_headers(
+    client: &Client,
+    url: &str,
+    payload: &AlertPayload,
+    secret: Option<&str>,
+    headers: &HashMap<String, String>,
+    compress: bool,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<DeliveryResult> {
+    txwatch_config::validate_webhook_headers(headers)?;
+    let mut fields = HeaderMap::new();
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes())?;
+        let mut value = HeaderValue::from_str(value).map_err(|_| anyhow!("invalid webhook header value"))?;
+        value.set_sensitive(true);
+        fields.insert(name, value);
+    }
+    send_webhook_with_backoff_opts(client, url, payload, secret, compress, fields, RETRY_BASE_DELAY, shutdown).await
+}
+
 /// Convenience wrapper around [`send_webhook`] for one-shot callers that have no
 /// meaningful shutdown signal to wire up (e.g. the CLI's `test-webhook` command).
 ///
@@ -341,7 +363,7 @@ async fn send_webhook_with_backoff(
     mut shutdown:  oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
     send_webhook_with_backoff_opts(
-        client, url, payload, secret, false, backoff_base, shutdown,
+        client, url, payload, secret, false, HeaderMap::new(), backoff_base, shutdown,
     )
     .await
 }
@@ -365,6 +387,7 @@ async fn send_webhook_with_backoff_opts(
     payload:       &AlertPayload,
     secret:        Option<&str>,
     compress:      bool,
+    headers:       HeaderMap,
     backoff_base:  Duration,
     mut shutdown:  oneshot::Receiver<()>,
 ) -> Result<DeliveryResult> {
@@ -399,6 +422,7 @@ async fn send_webhook_with_backoff_opts(
 
         let mut req = client
             .post(url)
+            .headers(headers.clone())
             .header("Content-Type", "application/json")
             .header("X-TxWatch-Version", env!("CARGO_PKG_VERSION"))
             .header("X-TxWatch-Idempotency-Key", idempotency_key)
@@ -409,7 +433,7 @@ async fn send_webhook_with_backoff_opts(
         }
 
         if let Some(s) = secret {
-            let sig = sign_payload(s, body.as_bytes());
+            let sig = sign_payload(s, json_body.as_bytes());
             req = req.header("X-TxWatch-Signature", format!("sha256={}", sig));
         }
 
@@ -755,7 +779,7 @@ pub(crate) async fn send_webhook_with_compression_test(
 ) -> Result<DeliveryResult> {
     let (_tx, rx) = oneshot::channel();
     std::mem::forget(_tx);
-    send_webhook_with_backoff_opts(client, url, payload, secret, compress, backoff_base, rx).await
+    send_webhook_with_backoff_opts(client, url, payload, secret, compress, HeaderMap::new(), backoff_base, rx).await
 }
 
 #[cfg(test)]
@@ -764,6 +788,23 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn sends_custom_headers_with_webhook() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::header("x-api-key", "test-key"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let headers = HashMap::from([("X-Api-Key".into(), "test-key".into())]);
+        let client = build_client().unwrap();
+        send_webhook_with_headers(&client, &server.uri(), &sample_payload(), None, &headers, false, dummy_shutdown())
+            .await
+            .unwrap();
+    }
 
     // ── TLS integration test helpers (Issues #278, #362, #466) ────────────────
     //

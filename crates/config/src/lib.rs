@@ -185,6 +185,7 @@ pub enum AlertRule {
         threshold_stroops: Option<u64>,
     },
     FunctionCalled      { function_name: String },
+    FunctionCallCount { function_name: String, min_count: u32 },
     AdminFunctionCalled { function_names: Vec<String> },
     /// Fires when the transaction's fee exceeds the threshold.
     /// Specify either `threshold_stroops` (raw stroops) or `threshold_xlm` (whole XLM,
@@ -261,6 +262,11 @@ impl AlertRule {
                         "contract '{}': FunctionCalled function_name must not be empty",
                         contract_label
                     );
+                }
+            }
+            AlertRule::FunctionCallCount { function_name, min_count } => {
+                if function_name.trim().is_empty() || *min_count == 0 {
+                    bail!("contract '{}': FunctionCallCount requires a nonblank function_name and min_count > 0", contract_label);
                 }
             }
             AlertRule::AdminFunctionCalled { function_names } => {
@@ -401,6 +407,9 @@ impl AlertRule {
             AlertRule::FunctionCalled { function_name } => {
                 format!("FunctionCalled({})", function_name)
             }
+            AlertRule::FunctionCallCount { function_name, min_count } => {
+                format!("FunctionCallCount({}, >= {})", function_name, min_count)
+            }
             AlertRule::AdminFunctionCalled { function_names } => {
                 format!("AdminFunctionCalled([{}])", function_names.join(", "))
             }
@@ -438,6 +447,7 @@ impl AlertRule {
             AlertRule::SorobanInvocation => "SorobanInvocation".into(),
             AlertRule::LargeTransfer { .. } => "LargeTransfer".into(),
             AlertRule::FunctionCalled { .. } => "FunctionCalled".into(),
+            AlertRule::FunctionCallCount { .. } => "FunctionCallCount".into(),
             AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
             AlertRule::HighFee { .. } => "HighFee".into(),
             AlertRule::SourceAccountMatch { .. } => "SourceAccountMatch".into(),
@@ -533,7 +543,7 @@ impl TlsConfig {
 
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatchedContract {
     pub label: String,
@@ -544,6 +554,8 @@ pub struct WatchedContract {
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
     pub webhook_secret: Option<String>,
+    #[serde(default)]
+    pub webhook_headers: HashMap<String, String>,
     /// Test-only: override the Horizon base URL. Never read from TOML (`serde(skip)`) —
     /// set programmatically in tests. Production code must leave this `None`.
     #[serde(skip, default)]
@@ -555,6 +567,10 @@ pub struct WatchedContract {
     /// Unset means unlimited (or the global cap, if configured).
     #[serde(default)]
     pub max_alerts_per_cycle: Option<u64>,
+    #[serde(default)]
+    pub max_alerts_per_minute: Option<u64>,
+    #[serde(default)]
+    pub cursor_alias: Option<String>,
     /// Per-contract webhook delivery timeout in seconds (Issue #462).
     /// Unset means the global `webhook_timeout_seconds` applies.
     #[serde(default)]
@@ -586,6 +602,41 @@ pub struct WatchedContract {
     /// removing it from the config (Issue #532). Defaults to `true`.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+}
+
+impl std::fmt::Debug for WatchedContract {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("WatchedContract")
+            .field("label", &self.label)
+            .field("contract_id", &self.contract_id)
+            .field("network", &self.network)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Check HTTP field syntax and reserve headers owned by the delivery transport.
+pub fn validate_webhook_headers(headers: &HashMap<String, String>) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (name, value) in headers {
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^`_|~".contains(&b)) {
+            bail!("webhook header names must be valid HTTP tokens");
+        }
+        let canonical = name.to_ascii_lowercase();
+        if canonical.starts_with("x-txwatch-") || matches!(canonical.as_str(),
+            "content-type" | "content-length" | "content-encoding" | "host" |
+            "connection" | "transfer-encoding" | "upgrade" | "trailer" | "te" |
+            "keep-alive" | "proxy-connection" | "proxy-authorization" | "expect")
+        {
+            bail!("webhook header '{}' is reserved", name);
+        }
+        if !seen.insert(canonical) {
+            bail!("duplicate webhook header '{}'", name);
+        }
+        if value.bytes().any(|b| b < 32 && b != b'\t' || b == 127) {
+            bail!("webhook header '{}' has an invalid value", name);
+        }
+    }
+    Ok(())
 }
 
 fn default_enabled() -> bool {
@@ -638,6 +689,9 @@ impl WatchedContract {
                 self.contract_id
             );
         }
+
+        validate_webhook_headers(&self.webhook_headers)
+            .with_context(|| format!("contract '{}': invalid webhook_headers", self.label))?;
 
         let parsed_url = Url::parse(&self.webhook_url).map_err(|e| {
             anyhow::anyhow!(
@@ -1010,6 +1064,11 @@ impl AppConfig {
                 }
                 contract.webhook_secret = Some(resolved);
             }
+            for (name, value) in &mut contract.webhook_headers {
+                *value = resolve_env_interpolation(value).map_err(|_| {
+                    anyhow::anyhow!("contract '{}': could not resolve webhook header '{}'", contract.label, name)
+                })?;
+            }
             contract.webhook_url = resolve_env_interpolation(&contract.webhook_url)?;
         }
         Ok(())
@@ -1303,6 +1362,9 @@ mod tests {
             rules: vec![AlertRule::AnyTransaction],
             webhook_url: "https://example.com/hook".into(),
             webhook_secret: None,
+            webhook_headers: Default::default(),
+            max_alerts_per_minute: None,
+            cursor_alias: None,
             test_horizon_base_url: None,
             horizon_url: None,
             max_alerts_per_cycle: None,
@@ -1410,6 +1472,8 @@ webhook_url = "https://example.com/hook"
         explicit_true.allow_internal_webhook_urls = Some(true);
 
         let mut cfg = AppConfig {
+            http_user_agent: None,
+            webhook_timeout_seconds: None,
             poll_interval_seconds: 10,
             contracts: vec![unset, explicit_false, explicit_true],
             cursor_file: None,
@@ -1552,6 +1616,7 @@ webhook_url = "https://example.com/hook"
     #[test]
     fn rejects_zero_global_max_alerts_per_cycle() {
         let mut cfg = AppConfig {
+            http_user_agent: None,
             poll_interval_seconds: 10,
             contracts: vec![valid_contract()],
             cursor_file: None,
@@ -1608,6 +1673,7 @@ webhook_url = "https://example.com/hook"
     #[test]
     fn rejects_zero_global_webhook_timeout_seconds() {
         let mut cfg = AppConfig {
+            http_user_agent: None,
             poll_interval_seconds: 10,
             contracts: vec![valid_contract()],
             cursor_file: None,
@@ -2064,6 +2130,8 @@ webhook_url = "https://example.com/hook"
 
     fn app_config_with_cursor(cursor_file: String) -> AppConfig {
         AppConfig {
+            http_user_agent: None,
+            max_alerts_per_cycle: None,
             poll_interval_seconds: 10,
             contracts: vec![valid_contract()],
             cursor_file: Some(cursor_file),
@@ -2323,6 +2391,7 @@ webhook_url = "https://example.com/hook"
     fn rejects_duplicate_labels() {
         let c = valid_contract();
         let mut cfg = AppConfig {
+            http_user_agent: None,
             poll_interval_seconds: 10,
             contracts: vec![c.clone(), c],
             http_pool_max_idle_per_host: None,
@@ -2340,6 +2409,8 @@ webhook_url = "https://example.com/hook"
 
     fn config_with(contracts: Vec<WatchedContract>) -> AppConfig {
         AppConfig {
+            http_user_agent: None,
+            max_alerts_per_cycle: None,
             poll_interval_seconds: 10,
             contracts,
             cursor_file: None,
@@ -2389,6 +2460,7 @@ webhook_url = "https://example.com/hook"
     #[test]
     fn appconfig_validate_rejects_empty_contracts() {
         let mut cfg = AppConfig {
+            http_user_agent: None,
             poll_interval_seconds: 10,
             contracts: vec![],
             http_pool_max_idle_per_host: None,
@@ -2664,6 +2736,9 @@ webhook_url = "https://example.com/hook"
                     rules: vec![AlertRule::AnyTransaction],
                     webhook_url: "https://example.com/hook".into(),
                     webhook_secret: None,
+                    webhook_headers: Default::default(),
+                    max_alerts_per_minute: None,
+                    cursor_alias: None,
                     test_horizon_base_url: None,
                     horizon_url: None,
                     max_alerts_per_cycle: None,
@@ -2675,12 +2750,12 @@ webhook_url = "https://example.com/hook"
                     webhook_rule_filter: Vec::new(),
                     webhook_compress: false,
                     enabled: true,
-            enabled: true,
                 }
             })
             .collect();
 
         AppConfig {
+            http_user_agent: None,
             poll_interval_seconds: 10,
             contracts,
             cursor_file: None,
@@ -2819,7 +2894,7 @@ webhook_url = "https://example.com/hook"
     #[test]
     fn config_watcher_errors_on_missing_path() {
         let missing = std::env::temp_dir().join("txwatch-no-such-config-538.toml");
-        let err = ConfigWatcher::new(&missing).unwrap_err();
+        let err = ConfigWatcher::new(&missing).err().expect("missing config must fail");
         assert!(
             format!("{:#}", err).contains("cannot resolve config path"),
             "got: {:#}",
@@ -2873,5 +2948,33 @@ webhook_url = "https://example.com/hook"
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         assert!(out.contains("webhook secret loaded from env var TXWATCH_TEST_LOG_SECRET"), "got: {out}");
         assert!(!out.contains("super-secret-value"), "secret leaked: {out}");
+    }
+}
+
+#[cfg(test)]
+mod issue_regressions {
+    use super::*;
+
+    #[test]
+    fn function_call_count_rejects_invalid_configuration() {
+        for (name, min_count) in [(" ", 1), ("transfer", 0)] {
+            assert!(AlertRule::FunctionCallCount {
+                function_name: name.into(), min_count,
+            }.validate("example").is_err());
+        }
+        assert!(AlertRule::FunctionCallCount {
+            function_name: "transfer".into(), min_count: 2,
+        }.validate("example").is_ok());
+    }
+
+    #[test]
+    fn validates_header_names_values_and_transport_fields() {
+        for (name, value) in [("Bad Name", "x"), ("X-Api-Key", "x\r\ny"), ("X-TxWatch-Signature", "x"), ("Host", "x")] {
+            assert!(validate_webhook_headers(&HashMap::from([(name.into(), value.into())])).is_err());
+        }
+        assert!(validate_webhook_headers(&HashMap::from([("X-Api-Key".into(), "secret".into())])).is_ok());
+        assert!(validate_webhook_headers(&HashMap::from([
+            ("X-Api-Key".into(), "first".into()), ("x-api-key".into(), "second".into()),
+        ])).is_err());
     }
 }
