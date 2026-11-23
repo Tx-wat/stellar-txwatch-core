@@ -510,6 +510,12 @@ fn eval_rule(
             .iter()
             .any(|f| f == function_name.as_str()),
 
+        AlertRule::FunctionCallCount { function_name, min_count } => {
+            *min_count > 0
+                && tx.function_names.iter().filter(|name| *name == function_name).count()
+                    >= *min_count as usize
+        }
+
         AlertRule::AdminFunctionCalled { function_names } => tx
             .function_names
             .iter()
@@ -908,6 +914,17 @@ mod tests {
     }
 
     use txwatch_config::{AlertRule, Network};
+
+    #[test]
+    fn function_call_count_matches_exact_name_at_or_above_minimum() {
+        for (names, expected) in [(&["transfer", "Transfer"][..], false), (&["transfer", "transfer"][..], true), (&["transfer", "transfer", "transfer"][..], true)] {
+            let tx = make_tx(true, names, None);
+            let alerts = run(&[AlertRule::FunctionCallCount {
+                function_name: "transfer".into(), min_count: 2,
+            }], &tx);
+            assert_eq!(!alerts.is_empty(), expected);
+        }
+    }
 
     fn make_tx(
         successful: bool,
