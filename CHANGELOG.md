@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- JSON Schema export with `txwatch schema` and a CI check for configuration schema drift (#522)
 - Four additional alert rule types: `InsufficientFunds`, `SorobanInvocation`, `SourceAccountMatch`, `TimeWindow`
 - mTLS support for webhook delivery, including pinned-certificate verification
 - SSRF guard for webhook URLs, rejecting requests to private/internal addresses

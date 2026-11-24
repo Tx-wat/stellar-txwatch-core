@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use serde_json::{json, Value};
 use txwatch_config::{AlertRule, AppConfig, Network};
@@ -182,4 +182,18 @@ fn schema_generation_is_deterministic() {
     let second =
         serde_json::to_string_pretty(&AppConfig::json_schema()).expect("schema should serialize");
     assert_eq!(first, second);
+}
+
+#[test]
+fn schema_matches_committed_snapshot() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/schema.json");
+    let raw = fs::read_to_string(path).expect("config/schema.json should exist");
+    let snapshot: Value =
+        serde_json::from_str(&raw).expect("config/schema.json should contain a valid JSON Schema");
+    assert_eq!(
+        schema(),
+        snapshot,
+        "Configuration schema drift detected. Regenerate config/schema.json with: \
+         cargo run --locked --quiet -p txwatch-config --example export_schema > config/schema.json"
+    );
 }

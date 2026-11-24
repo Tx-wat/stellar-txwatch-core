@@ -7,6 +7,47 @@ most common configuration errors.
 > Environment variables (such as `TXWATCH_CONFIG`, `RUST_LOG`, and `OTEL_*`)
 > are documented separately in [environment-variables.md](environment-variables.md).
 
+## JSON Schema
+
+JSON Schema describes the fields and types in a configuration. Export the schema
+from the installed binary:
+
+```bash
+txwatch schema > txwatch.schema.json
+```
+
+The command prints a JSON Schema draft-07 document to stdout. It does not read
+a configuration file, resolve environment variables, or contact the network.
+The `--config` flag and `TXWATCH_CONFIG` variable do not affect the output.
+
+The repository also includes [config/schema.json](../config/schema.json). In a
+TOML editor with JSON Schema support, associate this schema with your configuration
+file to enable autocomplete and type checks. For example, create `.taplo.toml`
+at the repository root for Taplo-based editors:
+
+```toml
+[[rule]]
+include = ["config/*.toml"]
+
+[rule.schema]
+path = "./config/schema.json"
+```
+
+The schema comes from `AppConfig` and its nested Rust types. It preserves field
+names, required fields, defaults, network names, and tagged alert rules.
+It excludes the internal `test_horizon_base_url` field.
+
+The schema describes the configuration structure. Runtime validation also checks
+value ranges, cross-field rules, environment variables, and files on disk. Continue
+to run this command before monitoring:
+
+```bash
+txwatch --config config/my-config.toml validate
+```
+
+See [CONTRIBUTING.md](../CONTRIBUTING.md#configuration-schema) to regenerate the
+committed schema after configuration changes.
+
 ## Top-level options
 
 | Key | Type | Description |

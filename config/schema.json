@@ -1,0 +1,550 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AppConfig",
+  "type": "object",
+  "required": [
+    "contracts",
+    "poll_interval_seconds"
+  ],
+  "properties": {
+    "allow_internal_webhook_urls": {
+      "description": "Allow webhook URLs resolving to localhost or private IP ranges for every contract (Issue #346). Per-contract settings take precedence.",
+      "default": null,
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "contracts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/WatchedContract"
+      }
+    },
+    "cursor_file": {
+      "description": "Optional path to a JSON file used to persist the cursor map across restarts. When set, the poller will load cursors from this file on startup and write the updated cursor map after each poll cycle. If absent, cursors default to the Horizon keyword `now` and are not persisted.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "horizon_startup_check": {
+      "description": "Run an optional Horizon connectivity probe at startup (Issue #380). Warn-only: a failed probe never aborts the poller. Default: false.",
+      "default": false,
+      "type": "boolean"
+    },
+    "http_connection_verbose": {
+      "description": "Enable verbose output for HTTP connection pool debug information. Only useful for troubleshooting connection issues. Default: false.",
+      "default": null,
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "http_pool_max_idle_per_host": {
+      "description": "Maximum number of idle connections per host in the HTTP connection pool. Lower values reduce memory usage; higher values improve throughput for many contracts. Default: 10.",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint",
+      "minimum": 0.0
+    },
+    "http_tcp_keepalive_secs": {
+      "description": "TCP keepalive interval in seconds for idle HTTP connections. Helps detect stalled connections quickly; 0 disables keepalive. Default: 30 seconds.",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "http_user_agent": {
+      "description": "Configurable HTTP User-Agent header for Horizon requests (Issue #340). Defaults to `txwatch/<version>` when unset.",
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "max_alerts_per_cycle": {
+      "description": "Maximum webhooks sent per contract in a single poll cycle. Alerts above the cap are logged and suppressed, not silently dropped. Unset (default) means unlimited. A contract's own `max_alerts_per_cycle` takes precedence over this value.",
+      "default": null,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "poll_interval_seconds": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "webhook_timeout_seconds": {
+      "description": "Webhook delivery timeout in seconds (Issue #462). Applies to every contract unless overridden by a contract's own `webhook_timeout_seconds`. Defaults to 15 seconds for backward compatibility.",
+      "default": 15,
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "AlertRule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "AnyTransaction"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "TransactionFailed"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Fires when a transaction fails because the source account cannot cover the fee (Horizon result code `txINSUFFICIENT_BALANCE`). Other failures do not match.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "InsufficientFunds"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Fires when the transaction invokes any Soroban host function, regardless of name.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "SorobanInvocation"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Fires when a transfer of at least the threshold occurs. Specify either `threshold_stroops` (raw stroops) or `threshold_xlm` (whole XLM, converted to stroops during validation); the two are mutually exclusive.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "threshold_stroops": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "threshold_xlm": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "LargeTransfer"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "function_name",
+            "type"
+          ],
+          "properties": {
+            "function_name": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "FunctionCalled"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "function_name",
+            "min_count",
+            "type"
+          ],
+          "properties": {
+            "function_name": {
+              "type": "string"
+            },
+            "min_count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "FunctionCallCount"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "function_names",
+            "type"
+          ],
+          "properties": {
+            "function_names": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "AdminFunctionCalled"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Fires when the transaction's fee exceeds the threshold. Specify either `threshold_stroops` (raw stroops) or `threshold_xlm` (whole XLM, converted to stroops during validation); the two are mutually exclusive.",
+          "type": "object",
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "threshold_stroops": {
+              "default": 0,
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "threshold_xlm": {
+              "default": null,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "HighFee"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Fires when the transaction's source account equals `source_account`.",
+          "type": "object",
+          "required": [
+            "source_account",
+            "type"
+          ],
+          "properties": {
+            "source_account": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "SourceAccountMatch"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Restricts alert firing to a specific time window and days of week (Issue #343).",
+          "type": "object",
+          "required": [
+            "hours_utc",
+            "type"
+          ],
+          "properties": {
+            "hours_utc": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "TimeWindow"
+              ]
+            },
+            "weekdays": {
+              "default": [],
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "wrap_rule": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        },
+        {
+          "description": "Fires when the transaction's ledger sequence is within `from..=to` (Issue #499).",
+          "type": "object",
+          "required": [
+            "from",
+            "to",
+            "type"
+          ],
+          "properties": {
+            "from": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "to": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "LedgerSequenceRange"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "Network": {
+      "type": "string",
+      "enum": [
+        "mainnet",
+        "testnet",
+        "futurenet"
+      ]
+    },
+    "TlsConfig": {
+      "description": "Optional mutual-TLS settings for webhook delivery to one contract. All paths point to PEM files and are checked for existence at validation time. The private key contents are never logged.",
+      "type": "object",
+      "required": [
+        "client_cert",
+        "client_key"
+      ],
+      "properties": {
+        "ca_cert": {
+          "description": "Optional PEM CA bundle used to validate the webhook server's certificate.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_cert": {
+          "description": "PEM client certificate presented to the webhook receiver.",
+          "type": "string"
+        },
+        "client_key": {
+          "description": "PEM private key (PKCS#8) matching `client_cert`.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "WatchedContract": {
+      "type": "object",
+      "required": [
+        "contract_id",
+        "label",
+        "network",
+        "rules",
+        "webhook_url"
+      ],
+      "properties": {
+        "allow_internal_webhook_urls": {
+          "description": "Allow webhook URLs resolving to localhost or private IP ranges (Issue #346).",
+          "default": null,
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "contract_id": {
+          "type": "string"
+        },
+        "cursor_alias": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "description": "Set to `false` to temporarily stop monitoring this contract without removing it from the config (Issue #532). Defaults to `true`.",
+          "default": true,
+          "type": "boolean"
+        },
+        "horizon_url": {
+          "description": "Optional per-contract Horizon base URL override (Issue #268).",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "max_alerts_per_cycle": {
+          "description": "Maximum webhooks sent for this contract in a single poll cycle (Issue #269). Unset means unlimited (or the global cap, if configured).",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "max_alerts_per_minute": {
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "network": {
+          "$ref": "#/definitions/Network"
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/AlertRule"
+          }
+        },
+        "tags": {
+          "description": "Optional key/value tags attached to this contract, e.g. `tags = { team = \"defi\" }`. Keys and values are validated by `validate_tag_part`.",
+          "default": null,
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "tls": {
+          "description": "Optional mutual-TLS settings for webhook delivery (Issue #278).",
+          "default": null,
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TlsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "webhook_compress": {
+          "description": "Gzip-compress webhook request bodies (Issue #540). When enabled, the body is sent with `Content-Encoding: gzip`. Defaults to `false`.",
+          "default": false,
+          "type": "boolean"
+        },
+        "webhook_headers": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "webhook_rule_filter": {
+          "description": "Optional allow-list of rule types whose alerts are delivered to this contract's webhook (Issue #553). Entries are matched against `AlertRule::rule_type()` (e.g. `\"LargeTransfer\"`, `\"HighFee\"`). An empty list (the default) means every rule type is delivered.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "webhook_secret": {
+          "description": "Optional secret sent as X-TxWatch-Secret header on every webhook POST. Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = \"${MY_SECRET}\"`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "webhook_timeout_seconds": {
+          "description": "Per-contract webhook delivery timeout in seconds (Issue #462). Unset means the global `webhook_timeout_seconds` applies.",
+          "default": null,
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0.0
+        },
+        "webhook_tls_cert_pem": {
+          "description": "Optional inline PEM-encoded client certificate for webhook mTLS.",
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "webhook_url": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
