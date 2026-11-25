@@ -9,7 +9,9 @@ publish   = false
 txwatch-config = { path = "../config" }
 txwatch-rules = { path = "../rules" }
 reqwest       = { workspace = true, features = ["native-tls"] }
+serde         = { workspace = true }
 serde_json    = { workspace = true }
+flate2        = "1"
 anyhow        = { workspace = true }
 tokio         = { workspace = true }
 tracing       = { workspace = true }
