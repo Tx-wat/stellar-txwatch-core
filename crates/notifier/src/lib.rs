@@ -713,7 +713,7 @@ pub fn test_payload_with_network(
     AlertPayload {
         label:               label.to_string(),
         contract_id:         contract_id.into(),
-        contract_type:       ContractType::from_contract_id(contract_id),
+        contract_type:       ContractType::from_contract_id(contract_id).unwrap_or(ContractType::Soroban),
         network:             network.clone(),
         rule_type:           "TestWebhook".into(),
         rule_triggered:      "TestWebhook".into(),
@@ -732,6 +732,7 @@ pub fn test_payload_with_network(
         explorer_link:       format!("https://stellar.expert/explorer/{}/tx/{}", explorer_network, tx_hash),
         ledger_sequence:     None,
         source_account:      None,
+        tags:                None,
     }
     .with_label(format!("{} (test-webhook to {})", label, webhook_url))
 }

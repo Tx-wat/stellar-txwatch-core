@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use txwatch_config::{AlertRule, ContractType};
+use txwatch_config::{AlertRule, ContractType, Network};
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -161,6 +161,9 @@ pub struct HorizonTransaction {
     /// so a custom deserializer accepts both forms.
     #[serde(default, deserialize_with = "deserialize_optional_u32")]
     pub ledger: Option<u32>,
+    /// Stellar account that signed and submitted this transaction.
+    #[serde(default)]
+    pub source_account: Option<String>,
 }
 
 /// Deserialize an `Option<u32>` from either a JSON integer or a string containing
@@ -221,6 +224,8 @@ pub struct EnrichedTransaction {
     pub result_code: Option<i32>,
     /// Stellar account that signed and submitted this transaction.
     pub source_account: Option<String>,
+    /// Ledger sequence number this transaction was included in.
+    pub ledger_sequence: Option<u32>,
 }
 
 impl EnrichedTransaction {
@@ -263,6 +268,7 @@ impl EnrichedTransaction {
             memo:          tx.memo,
             result_code,
             source_account: tx.source_account,
+            ledger_sequence: tx.ledger,
         })
     }
 }
@@ -435,8 +441,9 @@ pub fn evaluate_with_tracker(
             Ok(true) => Some(AlertPayload {
                 label: label.to_string(),
                 contract_id: contract_id.to_string(),
-                contract_type: ContractType::from_contract_id(contract_id),
-                network: network.to_string(),
+                contract_type: ContractType::from_contract_id(contract_id)
+                    .unwrap_or(ContractType::Soroban),
+                network: network.clone(),
                 rule_type: rule.rule_type(),
                 rule_triggered: rule.label(),
                 transaction_hash: tx.hash.clone(),
@@ -454,6 +461,7 @@ pub fn evaluate_with_tracker(
                 explorer_link: explorer_link.clone(),
                 ledger_sequence: tx.ledger_sequence,
                 source_account: tx.source_account.clone(),
+                tags: tags.cloned(),
             }),
             Ok(false) => None,
             Err(e) => {
@@ -619,6 +627,17 @@ pub fn eval_time_window(
     }
 }
 
+/// Per-contract context needed to build an [`AlertPayload`].
+#[derive(Debug, Clone, Copy)]
+pub struct PayloadContext<'a> {
+    pub label: &'a str,
+    pub contract_id: &'a str,
+    pub network: &'a Network,
+    pub horizon_base: &'a str,
+    pub explorer_base: &'a str,
+    pub tags: Option<&'a HashMap<String, String>>,
+}
+
 impl AlertPayload {
     /// Build the webhook payload for `rule` matching `tx` on the contract described by `ctx`.
     pub fn new(ctx: &PayloadContext<'_>, tx: &EnrichedTransaction, rule: &AlertRule) -> Self {
@@ -627,8 +646,9 @@ impl AlertPayload {
         Self {
             label: ctx.label.to_string(),
             contract_id: ctx.contract_id.to_string(),
-            contract_type: ContractType::from_contract_id(ctx.contract_id),
-            network: ctx.network.to_string(),
+            contract_type: ContractType::from_contract_id(ctx.contract_id)
+                .unwrap_or(ContractType::Soroban),
+            network: ctx.network.clone(),
             rule_type: rule.rule_type(),
             rule_triggered: rule.label(),
             transaction_hash: tx.hash.clone(),

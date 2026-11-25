@@ -167,6 +167,35 @@ cargo test -p txwatch-poller   # includes integration tests
 
 Add `-- --nocapture` to see log output while tests run.
 
+## Configuration schema
+
+`config/schema.json` is generated from the configuration types with `schemars`.
+If you change configuration fields, Serde attributes, or schema descriptions,
+regenerate this file from the repository root:
+
+```bash
+cargo run --locked --quiet -p txwatch-config --example export_schema > config/schema.json
+```
+
+The example uses the same `AppConfig::json_schema()` helper as `txwatch schema`.
+It builds only the configuration crate. Do not edit the generated JSON by hand.
+
+Run the focused schema tests:
+
+```bash
+cargo test --locked -p txwatch-config --test schema
+```
+
+CI runs these tests in the `config-schema` job. The snapshot test fails if the
+generated schema differs from `config/schema.json`. Review the schema changes and
+include the regenerated file in your pull request.
+
+Run the command tests when the CLI builds:
+
+```bash
+cargo test --locked -p txwatch --test schema
+```
+
 ## Dependency checks
 
 CI runs [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) on every pull

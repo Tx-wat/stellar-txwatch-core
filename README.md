@@ -215,6 +215,7 @@ log stream.
 txwatch [--config <path>] <command>
 
 Commands:
+  schema                              Print JSON Schema for AppConfig
   watch [--dry-run] [--from-beginning]  Start the polling engine
   validate [--check-webhooks]           Validate the config file and print a summary
   test-webhook --url <URL>              Send a test payload to a webhook URL and exit
@@ -222,6 +223,19 @@ Commands:
 
 `--config` defaults to `config/example.toml`. It can also be set with the
 `TXWATCH_CONFIG` environment variable; the `--config` flag takes precedence when both are set.
+
+Export the configuration schema for editor autocomplete and type checks:
+
+```bash
+txwatch schema > txwatch.schema.json
+# Or run from source:
+cargo run --locked --quiet -p txwatch -- schema > txwatch.schema.json
+```
+
+`schema` prints only JSON and does not read a configuration file. It ignores
+`--config` and `TXWATCH_CONFIG`. The repository includes [config/schema.json](config/schema.json)
+for TOML editors with JSON Schema support. See [the schema guide](docs/configuration.md#json-schema)
+for usage and [CONTRIBUTING.md](CONTRIBUTING.md#configuration-schema) for regeneration instructions.
 
 Optional OpenTelemetry trace export: build with `--features opentelemetry` and set
 `OTEL_EXPORTER_OTLP_ENDPOINT`. See [docs/configuration.md](docs/configuration.md#opentelemetry-trace-export-optional).
