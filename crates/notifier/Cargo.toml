@@ -22,7 +22,7 @@ chrono        = { workspace = true }
 hmac          = { workspace = true }
 sha2          = { workspace = true }
 hex           = { workspace = true }
-prometheus    = { version = "0.13", default-features = false, optional = true }
+prometheus    = { version = "0.14", default-features = false, optional = true }
 
 [dev-dependencies]
 wiremock      = "0.6"
