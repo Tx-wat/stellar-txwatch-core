@@ -542,6 +542,60 @@ impl TlsConfig {
     }
 }
 
+// ── SecretString ──────────────────────────────────────────────────────────────
+
+/// A string holding sensitive material (e.g. a webhook signing secret).
+///
+/// `Debug` and `Display` always print `<redacted>`, so the value can never leak
+/// through `{:?}` / `{}` formatting in logs, panics or error contexts. Use
+/// [`SecretString::expose_secret`] (or deref to `&str`) at the single point
+/// where the raw value is actually needed, e.g. HMAC signing.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the raw secret value. Never log the result.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for SecretString {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl fmt::Display for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
 #[derive(Clone, Deserialize, JsonSchema)]
@@ -554,7 +608,8 @@ pub struct WatchedContract {
     pub webhook_url: String,
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
-    pub webhook_secret: Option<String>,
+    /// Wrapped in [`SecretString`] so `{:?}` formatting never prints the value.
+    pub webhook_secret: Option<SecretString>,
     #[serde(default)]
     pub webhook_headers: HashMap<String, String>,
     /// Test-only: override the Horizon base URL. Never read from TOML (`serde(skip)`) —
@@ -1070,7 +1125,7 @@ impl AppConfig {
                     // Log only the variable name, never the resolved value.
                     tracing::debug!("webhook secret loaded from env var {}", var);
                 }
-                contract.webhook_secret = Some(resolved);
+                contract.webhook_secret = Some(SecretString::from(resolved));
             }
             for (name, value) in &mut contract.webhook_headers {
                 *value = resolve_env_interpolation(value).map_err(|_| {
