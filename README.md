@@ -571,7 +571,7 @@ Build with the `metrics` feature to expose Prometheus counters and an HTTP `/met
 cargo build -p txwatch-poller --features metrics
 ```
 
-Metrics registered:
+Counters registered:
 
 | Counter | Description |
 |---|---|
@@ -582,6 +582,10 @@ Metrics registered:
 | `txwatch_enrichment_errors_total` | Transactions skipped because enrichment failed (e.g. an unparseable `created_at`). The cursor still advances past them, so they are not retried. |
 | `txwatch_config_reload_total` | Total config loads and reloads (starts at 1 at startup; hot-reload support #227) |
 | `txwatch_config_reload_errors_total` | Total hot-reloads rejected because the new config failed to parse or validate (previous config stays active) |
+
+The `txwatch_webhook_latency_ms` histogram records each regular or batched HTTP attempt
+from request send until response headers arrive (or a transport error occurs). Retries are
+observed separately; retry backoff and response-body reading are excluded.
 
 To start the `/metrics` endpoint, call `txwatch_poller::serve_metrics(addr)` before `run_with`.
 The endpoint serves the standard Prometheus text exposition format and can be scraped by any

@@ -7,7 +7,7 @@ publish = false
 
 [features]
 # Enable Prometheus metrics counters and optional /metrics HTTP endpoint.
-metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "txwatch-notifier/metrics"]
 
 [dependencies]
 txwatch-config   = { path = "../config" }

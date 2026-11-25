@@ -2441,6 +2441,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "prometheus",
  "rcgen",
  "reqwest",
  "rustls-pemfile",

@@ -15,6 +15,7 @@
 //!
 //! And one histogram:
 //! - `txwatch_horizon_latency_seconds`  — Horizon API request duration, labelled by `endpoint`
+//! - `txwatch_webhook_latency_ms`       — webhook HTTP attempt latency in milliseconds
 //!
 //! An optional HTTP `/metrics` endpoint can be started by calling [`serve_metrics`].
 //! It serves the Prometheus text exposition format on the configured bind address.

@@ -14,6 +14,8 @@ use sha2::Sha256;
 use std::fs;
 use std::io::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "metrics")]
+use std::time::Instant;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, span, warn, Level};
 use serde::Serialize;
@@ -23,6 +25,26 @@ use txwatch_config::{ContractType, Network, TlsConfig};
 use txwatch_rules::AlertPayload;
 
 const MAX_RETRIES: u32 = 3;
+
+#[cfg(feature = "metrics")]
+fn webhook_latency_histogram() -> &'static prometheus::Histogram {
+    use std::sync::OnceLock;
+
+    static HISTOGRAM: OnceLock<prometheus::Histogram> = OnceLock::new();
+    HISTOGRAM.get_or_init(|| {
+        prometheus::register_histogram!(
+            "txwatch_webhook_latency_ms",
+            "Webhook HTTP attempt latency in milliseconds, from request send until response headers or transport error",
+            vec![5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0]
+        )
+        .expect("register txwatch_webhook_latency_ms")
+    })
+}
+
+#[cfg(feature = "metrics")]
+fn observe_webhook_latency(elapsed: Duration) {
+    webhook_latency_histogram().observe(elapsed.as_secs_f64() * 1_000.0);
+}
 
 /// Batched webhook body sent when `batch_alerts_per_tx` is enabled (Issue #557).
 ///
@@ -437,7 +459,12 @@ async fn send_webhook_with_backoff_opts(
             req = req.header("X-TxWatch-Signature", format!("sha256={}", sig));
         }
 
-        match req.send().await {
+        let request_started = Instant::now();
+        let response = req.send().await;
+        #[cfg(feature = "metrics")]
+        observe_webhook_latency(request_started.elapsed());
+
+        match response {
             Ok(resp) if resp.status().is_success() => {
                 let final_status = resp.status().as_u16();
                 span.record("status", final_status);
@@ -532,6 +559,22 @@ async fn send_webhook_with_backoff_opts(
     Err(err)
 }
 
+#[cfg(all(test, feature = "metrics"))]
+mod webhook_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn webhook_latency_histogram_registers_and_observes() {
+        observe_webhook_latency(Duration::from_millis(42));
+
+        let family = prometheus::gather()
+            .into_iter()
+            .find(|family| family.get_name() == "txwatch_webhook_latency_ms")
+            .expect("webhook latency histogram should be registered");
+        assert!(family.get_metric()[0].get_histogram().get_sample_count() >= 1);
+    }
+}
+
 /// POST a [`BatchedAlertPayload`] to `url`, retrying up to `MAX_RETRIES` times
 /// with exponential backoff (Issue #557).
 ///
@@ -592,7 +635,12 @@ async fn send_batched_webhook_with_backoff(
             req = req.header("X-TxWatch-Signature", format!("sha256={}", sig));
         }
 
-        match req.send().await {
+        let request_started = Instant::now();
+        let response = req.send().await;
+        #[cfg(feature = "metrics")]
+        observe_webhook_latency(request_started.elapsed());
+
+        match response {
             Ok(resp) if resp.status().is_success() => {
                 let final_status = resp.status().as_u16();
                 span.record("status", final_status);
