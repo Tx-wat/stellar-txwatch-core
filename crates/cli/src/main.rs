@@ -122,6 +122,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print JSON Schema for AppConfig (no config file is required)
+    Schema,
+
     /// Start the polling engine (watches all contracts in the config)
     Watch {
         /// Do not actually send webhooks; only log matched rules
@@ -365,14 +368,17 @@ impl fmt::Display for ValidateSummary<'_> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // Schema output is machine-readable: do not initialize stdout logging for it.
+    if !matches!(&cli.command, Command::Schema) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+    }
 
     match cli.command {
         Command::Validate { check_webhooks, check_contracts, output } => {
