@@ -95,6 +95,7 @@ independent: `rules`, `webhook_url`, and `network` apply only to that contract.
 | `allow_internal_webhook_urls` | no | Per-contract opt-out of SSRF protection for local webhook development. Overrides the top-level setting. |
 | `webhook_timeout_seconds` | no | Per-contract override of the webhook delivery timeout, in seconds. Falls back to the top-level `webhook_timeout_seconds` (default: `15`). |
 | `max_alerts_per_minute` | no | Per-contract alert rate limit, in alerts per minute. When unset, no per-contract limit is applied (only the global `max_alerts_per_cycle` applies). See [Alert rate limiting](#alert-rate-limiting). |
+| `alert_cooldown_secs` | no | Suppress repeated alerts with the same rule type for this many seconds. Unset disables cooldown; cooldown state is in-memory and resets when TxWatch restarts. |
 | `cursor_alias` | no | Former `label` of this contract, used to migrate the persisted cursor when a contract is renamed. See [Migrating cursors for renamed contracts](#migrating-cursors-for-renamed-contracts). |
 | `tags` | array of strings (optional) | Arbitrary labels attached to this contract, included in alert payloads for routing/filtering. |
 
@@ -125,6 +126,15 @@ Behavior:
   `WARN` level with the contract label and the number of suppressed alerts, so
   you can detect and tune overly broad rules.
 - The limit is independent of the global `max_alerts_per_cycle`; both apply.
+
+### Alert cooldown
+
+Set `alert_cooldown_secs` on a contract to deliver at most one alert for each
+rule type during the configured interval. For example, `alert_cooldown_secs = 300`
+allows one `LargeTransfer` alert and one `FunctionCalled` alert every five minutes;
+one rule type does not suppress another. Cooldown timestamps are kept in memory
+and reset when TxWatch restarts. Cooldown begins when delivery is attempted, even
+if the webhook ultimately fails; dry-run matches do not start a cooldown.
 
 ### Migrating cursors for renamed contracts
 

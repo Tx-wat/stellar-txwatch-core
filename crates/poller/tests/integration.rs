@@ -66,6 +66,7 @@ async fn run_polls_once_and_fires_webhook() {
         contracts: vec![contract],
         cursor_file: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -129,6 +130,7 @@ async fn poll_includes_fee_charged_and_fires_high_fee_rule() {
         contracts: vec![contract],
         cursor_file: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -168,6 +170,7 @@ async fn cursor_file_is_loaded_and_used_for_initial_cursor() {
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -445,6 +448,7 @@ fn cursor_advances_after_each_transaction() {
         webhook_headers: Default::default(),
         horizon_url: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
         webhook_timeout_seconds: None,
         allow_internal_webhook_urls: None,
         tags: None,
@@ -597,6 +601,7 @@ async fn run_polls_once_and_skips_webhook_in_dry_run() {
         contracts: vec![contract],
         cursor_file: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run_with(cfg, true)).await;
@@ -658,6 +663,7 @@ async fn large_transfer_poll_fires_webhook_and_advances_cursor() {
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
     };
 
     let _ = tokio::time::timeout(Duration::from_millis(1500), txwatch_poller::run(cfg)).await;
@@ -727,6 +733,7 @@ async fn horizon_link_uses_canonical_url_not_mock_server() {
         contracts: vec![contract],
         cursor_file: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -820,6 +827,7 @@ async fn contracts_polled_concurrently() {
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
     };
 
     let start   = std::time::Instant::now();
@@ -894,6 +902,7 @@ async fn cursor_file_is_written_after_poll_cycle() {
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
     };
 
     // Run two poll cycles (1.5 s > 1 s interval means at least one full cycle).
@@ -974,6 +983,7 @@ async fn cursor_is_read_back_by_contract_id_not_label() {
         contracts: vec![contract],
         cursor_file: Some(cursor_path_str.clone()),
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -1048,6 +1058,7 @@ async fn circuit_breaker_skips_contract_after_consecutive_failures() {
         contracts: vec![contract],
         cursor_file: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -1111,6 +1122,7 @@ async fn per_contract_horizon_url_override_is_used() {
         contracts: vec![contract],
         cursor_file: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -1168,6 +1180,7 @@ async fn circuit_breaker_recovers_after_successful_response() {
         contracts: vec![contract],
         cursor_file: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -1255,6 +1268,7 @@ async fn rate_limit_suppresses_excess_alerts() {
         contracts: vec![contract],
         cursor_file: None,
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
@@ -1310,6 +1324,7 @@ async fn cursor_alias_fallback_resumes_from_aliased_token() {
         contracts: vec![contract],
         cursor_file: Some(tmp.to_string_lossy().to_string()),
         max_alerts_per_cycle: None,
+        alert_cooldown_secs: None,
         http_pool_max_idle_per_host: None,
         http_tcp_keepalive_secs: None,
         http_connection_verbose: None,
