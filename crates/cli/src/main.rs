@@ -159,6 +159,9 @@ enum Command {
         check_webhooks: bool,
     },
 
+    /// Check that the container's PID 1 process is alive
+    Healthcheck,
+
     /// Send a test webhook payload to a URL and exit
     ///
     /// Exit codes: 0 = webhook delivered, 1 = delivery failed (unreachable or HTTP error)
@@ -328,6 +331,20 @@ impl fmt::Display for ValidateSummary<'_> {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+fn check_container_process() -> Result<()> {
+    let stat = std::fs::read_to_string("/proc/1/stat")
+        .context("cannot read /proc/1/stat; healthcheck must run inside a Linux container")?;
+    let state = stat
+        .rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .context("cannot parse state from /proc/1/stat")?;
+
+    if matches!(state, "Z" | "X" | "x") {
+        anyhow::bail!("container PID 1 is not running (state {state})");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -340,6 +357,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Healthcheck => check_container_process(),
+
         Command::Validate { check_webhooks } => {
             let cfg = AppConfig::from_file(&cli.config)?;
             println!("{}", ValidateSummary { config: &cfg });
