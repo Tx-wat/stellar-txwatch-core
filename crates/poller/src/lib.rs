@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::atomic::Ordering,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -66,6 +66,24 @@ impl CircuitBreaker {
         } else {
             false
         }
+    }
+}
+
+/// Per-contract cooldown timestamps, keyed by alert rule type.
+#[derive(Clone, Default)]
+struct AlertCooldowns {
+    last_alert_by_rule: HashMap<String, Instant>,
+}
+
+impl AlertCooldowns {
+    fn is_active(&self, rule_type: &str, cooldown_secs: u64, now: Instant) -> bool {
+        self.last_alert_by_rule
+            .get(rule_type)
+            .is_some_and(|last| now.saturating_duration_since(*last) < Duration::from_secs(cooldown_secs))
+    }
+
+    fn record(&mut self, rule_type: &str, now: Instant) {
+        self.last_alert_by_rule.insert(rule_type.to_string(), now);
     }
 }
 
@@ -306,6 +324,7 @@ async fn run_internal(
     let counters      = Arc::new(Counters::default());
     let n_contracts   = cfg.contracts.len();
     let mut breakers: HashMap<String, CircuitBreaker> = HashMap::new();
+    let mut alert_cooldowns: HashMap<String, AlertCooldowns> = HashMap::new();
 
     let contracts_list = cfg.contracts.iter().map(|c| c.label.as_str()).collect::<Vec<_>>().join(", ");
     let mut networks: Vec<&str> = cfg.contracts.iter().map(|c| c.network.as_str()).collect();
@@ -410,6 +429,7 @@ async fn run_internal(
             &counters,
             MAX_CONCURRENT_POLLS,
             &mut breakers,
+            &mut alert_cooldowns,
         )
         .await;
         tokio::select! {
@@ -442,6 +462,7 @@ async fn poll_cycle(
     counters:       &Arc<Counters>,
     max_concurrent: usize,
     breakers:       &mut HashMap<String, CircuitBreaker>,
+    alert_cooldowns: &mut HashMap<String, AlertCooldowns>,
 ) {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
     let mut set = tokio::task::JoinSet::new();
@@ -462,13 +483,25 @@ async fn poll_cycle(
         let counters  = Arc::clone(counters);
         let semaphore = Arc::clone(&semaphore);
         let cursor    = cursors.get(&contract.contract_id).cloned();
+        let mut local_cooldowns = alert_cooldowns
+            .get(&contract.contract_id)
+            .cloned()
+            .unwrap_or_default();
         set.spawn(async move {
             let _permit = semaphore.acquire_owned().await.ok();
             let mut local: HashMap<String, String> = HashMap::new();
             if let Some(c) = cursor {
                 local.insert(contract.contract_id.clone(), c);
             }
-            let result = poll_contract(&client, &client, &contract, &mut local, dry_run).await;
+            let result = poll_contract_with_cooldowns(
+                &client,
+                &client,
+                &contract,
+                &mut local,
+                &mut local_cooldowns,
+                dry_run,
+            )
+            .await;
             match &result {
                 Ok((txs, alerts)) => {
                     counters.transactions.fetch_add(*txs, Ordering::Relaxed);
@@ -485,14 +518,21 @@ async fn poll_cycle(
                 }
                 Err(e) => error!(error = %e, "contract polling task failed"),
             }
-            (contract.contract_id.clone(), contract.label.clone(), result.is_ok(), local)
+            (
+                contract.contract_id.clone(),
+                contract.label.clone(),
+                result.is_ok(),
+                local,
+                local_cooldowns,
+            )
         });
     }
 
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok((contract_id, label, ok, local)) => {
+            Ok((contract_id, label, ok, local, local_cooldowns)) => {
                 cursors.extend(local);
+                alert_cooldowns.insert(contract_id.clone(), local_cooldowns);
                 let breaker = breakers.entry(contract_id).or_default();
                 if ok {
                     if breaker.record_success() {
@@ -732,16 +772,30 @@ fn enrich_transaction(
     })
 }
 
-/// Returns `(transactions_processed, alerts_fired, alerts_suppressed_by_cap)`.
-///
-/// Uses `join=operations` on the transactions endpoint so that Horizon returns
-/// operations inline, eliminating one HTTP request per transaction (#23).
-/// Falls back to a separate `/transactions/{hash}/operations` fetch only when
-/// the inline `operations` array is absent (older Horizon versions).
-///
-/// `horizon` serves the Horizon reads and `client` sends webhooks. They are
-/// separate so the Horizon side can be replaced in tests (#302).
-#[tracing::instrument(skip(client, webhook_client, contract, cursors), fields(
+/// Poll a contract once with fresh cooldown state. The long-running poll loop
+/// calls `poll_contract_with_cooldowns` with state retained between cycles.
+async fn poll_contract(
+    client: &Client,
+    webhook_client: &Client,
+    contract: &WatchedContract,
+    cursors: &mut HashMap<String, String>,
+    dry_run: bool,
+) -> Result<(u64, u64, u64)> {
+    poll_contract_with_cooldowns(
+        client,
+        webhook_client,
+        contract,
+        cursors,
+        &mut AlertCooldowns::default(),
+        dry_run,
+    )
+    .await
+}
+
+/// Returns `(transactions_processed, alerts_fired, alerts_suppressed)`.
+/// Uses inline Horizon operations when available and applies per-rule cooldowns
+/// before dispatching matching alerts.
+#[tracing::instrument(skip(client, webhook_client, contract, cursors, cooldowns), fields(
     contract    = %contract.label,
     contract_id = %contract.contract_id,
     network     = %contract.network.as_str(),
@@ -750,11 +804,12 @@ fn enrich_transaction(
     duration_ms = tracing::field::Empty,
     outcome     = tracing::field::Empty,
 ))]
-async fn poll_contract(
+async fn poll_contract_with_cooldowns(
     client:         &Client,
     webhook_client: &Client,
     contract:       &WatchedContract,
     cursors:        &mut HashMap<String, String>,
+    cooldowns:      &mut AlertCooldowns,
     dry_run:        bool,
 ) -> Result<(u64, u64, u64)> {
     let protected_client;
@@ -947,6 +1002,19 @@ fn reset_idle_counter(contract_id: &str) {
                 suppressed += 1;
                 continue;
             }
+            let cooldown_now = Instant::now();
+            if contract.alert_cooldown_secs.is_some_and(|cooldown_secs| {
+                cooldowns.is_active(&payload.rule_type, cooldown_secs, cooldown_now)
+            }) {
+                suppressed += 1;
+                debug!(
+                    contract = %contract.label,
+                    rule_type = %payload.rule_type,
+                    cooldown_secs = ?contract.alert_cooldown_secs,
+                    "alert suppressed by per-rule cooldown"
+                );
+                continue;
+            }
             alert_count += 1;
             info!(contract = %contract.label, rule = %payload.rule_triggered,
                 tx = %payload.transaction_hash, "rule matched");
@@ -955,6 +1023,11 @@ fn reset_idle_counter(contract_id: &str) {
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "dry-run enabled: not sending webhook");
             } else {
+                if contract.alert_cooldown_secs.is_some() {
+                    // Start cooldown on alert dispatch, even if delivery ultimately fails,
+                    // so repeated matches do not amplify webhook outages.
+                    cooldowns.record(&payload.rule_type, cooldown_now);
+                }
                 info!(contract = %contract.label, rule = %payload.rule_triggered,
                     tx = %payload.transaction_hash, "rule fired — sending webhook");
                 // #260: create a per-delivery oneshot. The sender is kept alive so the
@@ -976,8 +1049,14 @@ fn reset_idle_counter(contract_id: &str) {
     }
 
     if suppressed > 0 {
-        warn!(contract = %contract.label, cap = ?contract.max_alerts_per_cycle, suppressed,
-            "alert cap reached: {} additional alerts suppressed this cycle", suppressed);
+        warn!(
+            contract = %contract.label,
+            cap = ?contract.max_alerts_per_cycle,
+            cooldown_secs = ?contract.alert_cooldown_secs,
+            suppressed,
+            "{} alerts suppressed by the per-cycle cap or rule cooldown",
+            suppressed
+        );
     }
 
     if tx_count > 0 {
@@ -1105,6 +1184,32 @@ mod tests {
         serde_json::json!({ "_embedded": { "records": [] } })
     }
 
+    #[test]
+    fn alert_cooldown_is_scoped_to_rule_type_and_expires_at_deadline() {
+        let started = Instant::now();
+        let mut cooldowns = AlertCooldowns::default();
+
+        assert!(!cooldowns.is_active("AnyTransaction", 60, started));
+        cooldowns.record("AnyTransaction", started);
+
+        assert!(cooldowns.is_active(
+            "AnyTransaction",
+            60,
+            started + Duration::from_secs(59)
+        ));
+        assert!(!cooldowns.is_active(
+            "AnyTransaction",
+            60,
+            started + Duration::from_secs(60)
+        ));
+        assert!(!cooldowns.is_active("FunctionCalled", 60, started + Duration::from_secs(1)));
+        assert!(!AlertCooldowns::default().is_active(
+            "AnyTransaction",
+            60,
+            started + Duration::from_secs(1)
+        ));
+    }
+
     fn ops_page(function_name: &str) -> serde_json::Value {
         serde_json::json!({
             "_embedded": {
@@ -1131,6 +1236,7 @@ mod tests {
             webhook_headers: Default::default(),
             horizon_url: None,
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
             max_alerts_per_minute: None,
             cursor_alias: None,
             webhook_timeout_seconds: None,
@@ -1200,6 +1306,7 @@ mod tests {
             webhook_headers: Default::default(),
             horizon_url: None,
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
             max_alerts_per_minute: None,
             cursor_alias: None,
             webhook_timeout_seconds: None,
@@ -1285,6 +1392,7 @@ mod tests {
             enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: Some(2),
+            alert_cooldown_secs: None,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
@@ -1294,6 +1402,75 @@ mod tests {
         assert_eq!(txs, 3);
         assert_eq!(alerts, 2, "only the first two alerts should be sent");
         assert_eq!(suppressed, 1, "the third alert should be suppressed, not dropped silently");
+    }
+
+    #[tokio::test]
+    async fn alert_cooldown_suppresses_repeats_per_rule_type() {
+        let server = MockServer::start().await;
+        let records: Vec<serde_json::Value> = (1..=3)
+            .map(|i| {
+                serde_json::json!({
+                    "hash": format!("cooldowntx{i}"),
+                    "created_at": "2024-06-01T10:00:00Z",
+                    "successful": true,
+                    "paging_token": format!("{i}"),
+                    "operations": [{ "type": "invoke_host_function", "function": "withdraw" }]
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "_embedded": { "records": records } }),
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("/accounts/.*/transactions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(empty_page()))
+            .mount(&server)
+            .await;
+
+        let receiver = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(2)
+            .mount(&receiver)
+            .await;
+
+        let client = Client::new();
+        let mut contract = make_contract(
+            "cooled",
+            CONTRACT_ID,
+            Network::Testnet,
+            &format!("{}/hook", receiver.uri()),
+            vec![
+                AlertRule::AnyTransaction,
+                AlertRule::FunctionCalled {
+                    function_name: "withdraw".into(),
+                },
+            ],
+            Some(server.uri()),
+        );
+        contract.alert_cooldown_secs = Some(60);
+
+        let mut cursors = HashMap::from([(contract.contract_id.clone(), "now".to_string())]);
+        let mut cooldowns = AlertCooldowns::default();
+        let (txs, alerts, suppressed) = poll_contract_with_cooldowns(
+            &client,
+            &client,
+            &contract,
+            &mut cursors,
+            &mut cooldowns,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(txs, 3);
+        assert_eq!(alerts, 2, "the first alert for each rule type should be sent");
+        assert_eq!(suppressed, 4, "later alerts of either rule type should be suppressed");
     }
 
     #[tokio::test]
@@ -1438,6 +1615,7 @@ mod tests {
             enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
         };
 
         // 429 is handled with a back-off and returns Ok((0,0,0)), not an error
@@ -1471,6 +1649,7 @@ mod tests {
             webhook_headers: Default::default(),
             horizon_url: None,
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
             max_alerts_per_minute: None,
             cursor_alias: None,
             webhook_timeout_seconds: None,
@@ -1529,6 +1708,7 @@ mod tests {
             enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
         };
 
         let started = tokio::time::Instant::now();
@@ -1589,6 +1769,7 @@ mod tests {
             enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
         };
 
         let err = poll_contract(&client, &client, &contract, &mut cursors, false).await.unwrap_err();
@@ -1667,6 +1848,7 @@ mod tests {
             enabled: true,
             test_horizon_base_url: None,
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
         }
     }
 
@@ -1754,6 +1936,7 @@ mod tests {
             enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
         };
 
         let (tx_count, _alerts, _suppressed) = poll_contract(&client, &client, &contract, &mut cursors, true)
@@ -1840,6 +2023,7 @@ mod tests {
                     enabled: true,
                     test_horizon_base_url: None,
                     max_alerts_per_cycle: None,
+                    alert_cooldown_secs: None,
                 },
                 WatchedContract {
                     label:       "Contract B".into(),
@@ -1862,6 +2046,7 @@ mod tests {
                     enabled: true,
                     test_horizon_base_url: None,
                     max_alerts_per_cycle: None,
+                    alert_cooldown_secs: None,
                 },
                 WatchedContract {
                     label:       "Contract C".into(),
@@ -1884,6 +2069,7 @@ mod tests {
                     enabled: true,
                     test_horizon_base_url: None,
                     max_alerts_per_cycle: None,
+                    alert_cooldown_secs: None,
                 },
             ],
         };
@@ -1973,6 +2159,7 @@ mod tests {
             enabled: true,
             test_horizon_base_url: Some(server.uri()),
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
         };
         let mut cursors: HashMap<String, String> = HashMap::new();
         cursors.insert(contract.contract_id.clone(), "now".to_string());
@@ -2107,6 +2294,7 @@ mod tests {
             webhook_headers: Default::default(),
             horizon_url: None,
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
             max_alerts_per_minute: None,
             cursor_alias: None,
             webhook_timeout_seconds: None,

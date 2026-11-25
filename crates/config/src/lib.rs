@@ -567,6 +567,10 @@ pub struct WatchedContract {
     /// Unset means unlimited (or the global cap, if configured).
     #[serde(default)]
     pub max_alerts_per_cycle: Option<u64>,
+    /// Suppress repeated alerts of the same rule type for this many seconds.
+    /// Unset disables cooldown suppression. The timer is in-memory and resets on restart.
+    #[serde(default)]
+    pub alert_cooldown_secs: Option<u64>,
     #[serde(default)]
     pub max_alerts_per_minute: Option<u64>,
     #[serde(default)]
@@ -757,6 +761,13 @@ impl WatchedContract {
         if self.max_alerts_per_cycle == Some(0) {
             bail!(
                 "contract '{}': max_alerts_per_cycle must be >= 1 when set",
+                self.label
+            );
+        }
+
+        if self.alert_cooldown_secs == Some(0) {
+            bail!(
+                "contract '{}': alert_cooldown_secs must be >= 1 when set",
                 self.label
             );
         }
@@ -1368,6 +1379,7 @@ mod tests {
             test_horizon_base_url: None,
             horizon_url: None,
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
             tags: None,
@@ -1583,6 +1595,37 @@ webhook_url = "https://example.com/hook"
         let mut c = valid_contract();
         assert!(c.max_alerts_per_cycle.is_none());
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn alert_cooldown_secs_defaults_to_none_and_parses_from_toml() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let contract: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(contract.alert_cooldown_secs, None);
+
+        let contract: WatchedContract = toml::from_str(
+            &raw.replace("webhook_url =", "alert_cooldown_secs = 60\nwebhook_url ="),
+        )
+        .unwrap();
+        assert_eq!(contract.alert_cooldown_secs, Some(60));
+    }
+
+    #[test]
+    fn rejects_zero_alert_cooldown_secs() {
+        let mut contract = valid_contract();
+        contract.alert_cooldown_secs = Some(0);
+        let err = contract.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("alert_cooldown_secs must be >= 1"),
+            "got: {err}"
+        );
     }
 
     /// #269: the global cap and per-contract override both parse from TOML.
@@ -2742,6 +2785,7 @@ webhook_url = "https://example.com/hook"
                     test_horizon_base_url: None,
                     horizon_url: None,
                     max_alerts_per_cycle: None,
+                    alert_cooldown_secs: None,
                     webhook_timeout_seconds: None,
                     allow_internal_webhook_urls: None,
                     tags: None,
