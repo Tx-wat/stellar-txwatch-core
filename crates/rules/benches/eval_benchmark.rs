@@ -19,6 +19,7 @@ fn make_transactions(count: usize) -> Vec<EnrichedTransaction> {
             function_names: vec!["transfer".into()],
             amount_stroops: Some((i as u64 % 2_000) * 10_000_000),
             fee_charged_stroops: Some(100 + (i as u64 % 500)),
+            signer_count: Some((i % 5) as u32),
         })
         .collect()
 }

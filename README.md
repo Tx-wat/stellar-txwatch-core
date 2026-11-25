@@ -314,6 +314,7 @@ webhook_url = "https://hooks.example.com/my-webhook"
 | `FunctionCalled` | A specific Soroban function is invoked |
 | `AdminFunctionCalled` | Any function in a named list is invoked |
 | `HighFee` | Transaction fee exceeds configured threshold |
+| `MultiSigThreshold` | More than `min_signers` decorated signature entries are attached to the transaction envelope |
 
 See [docs/alert-rules.md](docs/alert-rules.md) for full details.
 
