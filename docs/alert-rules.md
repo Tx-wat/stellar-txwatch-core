@@ -137,6 +137,24 @@ type           = "SourceAccountMatch"
 source_account = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
 ```
 
+### `MultiSigThreshold`
+
+| Field         | Type | Required | Description |
+|---------------|------|----------|-------------|
+| `min_signers` | u32  | yes      | Alert when the envelope contains more than this many attached signature entries (> 0) |
+
+Matches when the transaction envelope contains more than `min_signers` decorated signature
+entries. These are signatures attached to the submitted envelope, not a count of all signers
+configured on the Stellar account. For fee-bump transactions, signatures on both the outer
+fee-bump envelope and inner transaction envelope are counted. Transactions with missing or
+invalid `envelope_xdr` do not match.
+
+```toml
+[[contracts.rules]]
+type        = "MultiSigThreshold"
+min_signers = 2
+```
+
 ### `HighFee`
 
 | Field                | Type | Required | Description                                                   |

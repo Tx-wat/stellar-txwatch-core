@@ -250,6 +250,7 @@ impl EnrichedTransaction {
         })?;
 
         let result_code = tx.result_xdr.as_deref().and_then(transaction_result_code);
+        let signer_count = tx.envelope_xdr.as_deref().and_then(transaction_signer_count);
 
         Ok(Self {
             hash:          tx.hash,
@@ -271,6 +272,32 @@ impl EnrichedTransaction {
             ledger_sequence: tx.ledger,
         })
     }
+}
+
+/// Extract the number of attached signature entries from a base64 XDR envelope.
+/// Invalid or missing XDR returns `None`; fee-bump counts include both envelope levels.
+pub fn transaction_signer_count(envelope_xdr: &str) -> Option<u32> {
+    use stellar_xdr::curr::{Limits, ReadXdr, TransactionEnvelope};
+
+    const MAX_ENVELOPE_BYTES: usize = 1_048_576;
+    let envelope = TransactionEnvelope::from_xdr_base64(
+        envelope_xdr.trim(),
+        Limits { depth: 64, len: MAX_ENVELOPE_BYTES },
+    )
+    .ok()?;
+
+    let count = match envelope {
+        TransactionEnvelope::TxV0(envelope) => envelope.signatures.len(),
+        TransactionEnvelope::Tx(envelope) => envelope.signatures.len(),
+        TransactionEnvelope::TxFeeBump(envelope) => {
+            use stellar_xdr::curr::FeeBumpTransactionInnerTx;
+            let inner_count = match envelope.tx.inner_tx {
+                FeeBumpTransactionInnerTx::Tx(inner) => inner.signatures.len(),
+            };
+            envelope.signatures.len().checked_add(inner_count)?
+        }
+    };
+    u32::try_from(count).ok()
 }
 
 /// `TransactionResultCode::txINSUFFICIENT_BALANCE` from Stellar-transaction.x.
@@ -549,6 +576,11 @@ fn eval_rule(
         AlertRule::SourceAccountMatch { source_account } => {
             tx.source_account.as_deref() == Some(source_account.as_str())
         }
+
+        AlertRule::MultiSigThreshold { min_signers } => tx
+            .signer_count
+            .map(|count| count > *min_signers)
+            .unwrap_or(false),
 
         AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
             eval_time_window(hours_utc, weekdays, wrap_rule.as_deref(), tx, chrono::Utc::now())?
@@ -946,6 +978,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn multi_sig_threshold_fires_only_above_minimum() {
+        let rule = AlertRule::MultiSigThreshold { min_signers: 2 };
+
+        for (signer_count, expected) in [
+            (Some(1), false),
+            (Some(2), false),
+            (Some(3), true),
+            (None, false),
+        ] {
+            let mut tx = make_tx(true, &[], None);
+            tx.signer_count = signer_count;
+            let alerts = run(std::slice::from_ref(&rule), &tx);
+            assert_eq!(
+                !alerts.is_empty(),
+                expected,
+                "unexpected result for signer_count {:?}",
+                signer_count
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_signer_count_reads_signature_vector_from_envelope_xdr() {
+        let envelope = test_envelope_xdr_with_signatures(3);
+        assert_eq!(transaction_signer_count(&envelope), Some(3));
+        assert_eq!(transaction_signer_count("not base64 XDR"), None);
+    }
+
+    /// Builds a minimal valid V1 transaction envelope with the requested number
+    /// of decorated signatures. Its transaction has no operations or preconditions.
+    fn test_envelope_xdr_with_signatures(signature_count: u32) -> String {
+        use base64::Engine;
+
+        let mut xdr = Vec::new();
+        // TransactionEnvelope::Tx discriminant.
+        xdr.extend_from_slice(&2_i32.to_be_bytes());
+        // MuxedAccount::Ed25519, followed by the key bytes.
+        xdr.extend_from_slice(&0_i32.to_be_bytes());
+        xdr.extend_from_slice(&[0; 32]);
+        // Transaction fee and sequence number.
+        xdr.extend_from_slice(&0_u32.to_be_bytes());
+        xdr.extend_from_slice(&0_i64.to_be_bytes());
+        // Preconditions::None, Memo::None, empty operations, TransactionExt::V0.
+        xdr.extend_from_slice(&0_i32.to_be_bytes());
+        xdr.extend_from_slice(&0_i32.to_be_bytes());
+        xdr.extend_from_slice(&0_u32.to_be_bytes());
+        xdr.extend_from_slice(&0_i32.to_be_bytes());
+        // DecoratedSignature vector.
+        xdr.extend_from_slice(&signature_count.to_be_bytes());
+        for _ in 0..signature_count {
+            xdr.extend_from_slice(&[0; 4]); // SignatureHint
+            xdr.extend_from_slice(&1_u32.to_be_bytes()); // one-byte signature
+            xdr.push(0);
+            xdr.extend_from_slice(&[0; 3]); // XDR padding
+        }
+
+        base64::engine::general_purpose::STANDARD.encode(xdr)
+    }
+
     fn make_tx(
         successful: bool,
         function_names: &[&str],
@@ -966,6 +1058,7 @@ mod tests {
             memo: None,
             result_code: None,
             source_account: None,
+            signer_count: None,
         }
     }
 
@@ -1706,6 +1799,7 @@ mod tests {
                 memo: None,
                 result_code: None,
                 source_account: None,
+                signer_count: None,
             };
             let mut payloads = evaluate(
                 "L", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",

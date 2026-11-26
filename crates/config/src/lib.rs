@@ -199,6 +199,8 @@ pub enum AlertRule {
     },
     /// Fires when the transaction's source account equals `source_account`.
     SourceAccountMatch { source_account: String },
+    /// Fires when more than `min_signers` signature entries are attached to the transaction envelope.
+    MultiSigThreshold { min_signers: u32 },
     /// Restricts alert firing to a specific time window and days of week (Issue #343).
     TimeWindow {
         hours_utc: String,
@@ -391,6 +393,11 @@ impl AlertRule {
                     );
                 }
             }
+            AlertRule::MultiSigThreshold { min_signers } => {
+                if *min_signers == 0 {
+                    bail!("contract '{}': MultiSigThreshold min_signers must be > 0", contract_label);
+                }
+            }
         }
         Ok(())
     }
@@ -424,6 +431,9 @@ impl AlertRule {
             AlertRule::SourceAccountMatch { source_account } => {
                 format!("SourceAccountMatch({})", source_account)
             }
+            AlertRule::MultiSigThreshold { min_signers } => {
+                format!("MultiSigThreshold(>{} signers)", min_signers)
+            }
             AlertRule::TimeWindow { hours_utc, weekdays, wrap_rule } => {
                 if let Some(wrapped) = wrap_rule {
                     format!("TimeWindow({}, [{}], wrap={})", hours_utc, weekdays.join(", "), wrapped)
@@ -452,6 +462,7 @@ impl AlertRule {
             AlertRule::AdminFunctionCalled { .. } => "AdminFunctionCalled".into(),
             AlertRule::HighFee { .. } => "HighFee".into(),
             AlertRule::SourceAccountMatch { .. } => "SourceAccountMatch".into(),
+            AlertRule::MultiSigThreshold { .. } => "MultiSigThreshold".into(),
             AlertRule::TimeWindow { .. } => "TimeWindow".into(),
             AlertRule::LedgerSequenceRange { .. } => "LedgerSequenceRange".into(),
         }
@@ -2346,6 +2357,25 @@ webhook_url = "https://example.com/hook"
         let rule: AlertRule = toml::from_str("type = \"InsufficientFunds\"").unwrap();
         assert!(matches!(rule, AlertRule::InsufficientFunds));
         assert_eq!(rule.label(), "InsufficientFunds");
+    }
+
+    #[test]
+    fn multi_sig_threshold_rule_parses_from_toml() {
+        let rule: AlertRule = toml::from_str(
+            "type = \"MultiSigThreshold\"\nmin_signers = 2",
+        )
+        .unwrap();
+        assert!(matches!(rule, AlertRule::MultiSigThreshold { min_signers: 2 }));
+        assert_eq!(rule.label(), "MultiSigThreshold(>2 signers)");
+        assert_eq!(rule.rule_type(), "MultiSigThreshold");
+    }
+
+    #[test]
+    fn multi_sig_threshold_rejects_zero_min_signers() {
+        let mut contract = valid_contract();
+        contract.rules = vec![AlertRule::MultiSigThreshold { min_signers: 0 }];
+        let error = contract.validate().unwrap_err();
+        assert!(error.to_string().contains("min_signers must be > 0"));
     }
 
     #[test]
