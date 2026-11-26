@@ -12,6 +12,8 @@ pub(crate) struct Counters {
     pub(crate) interval_alerts: AtomicU64,
     /// Number of Horizon 429 Too Many Requests responses observed.
     pub(crate) horizon_rate_limits: AtomicU64,
+    /// Alerts suppressed by `max_alerts_per_cycle` since the last summary.
+    pub(crate) interval_suppressed: AtomicU64,
     /// Per-contract `(transactions, alerts)` since the last summary, keyed by label.
     interval_per_contract: Mutex<HashMap<String, (u64, u64)>>,
 }

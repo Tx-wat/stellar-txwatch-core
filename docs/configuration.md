@@ -7,6 +7,47 @@ most common configuration errors.
 > Environment variables (such as `TXWATCH_CONFIG`, `RUST_LOG`, and `OTEL_*`)
 > are documented separately in [environment-variables.md](environment-variables.md).
 
+## JSON Schema
+
+JSON Schema describes the fields and types in a configuration. Export the schema
+from the installed binary:
+
+```bash
+txwatch schema > txwatch.schema.json
+```
+
+The command prints a JSON Schema draft-07 document to stdout. It does not read
+a configuration file, resolve environment variables, or contact the network.
+The `--config` flag and `TXWATCH_CONFIG` variable do not affect the output.
+
+The repository also includes [config/schema.json](../config/schema.json). In a
+TOML editor with JSON Schema support, associate this schema with your configuration
+file to enable autocomplete and type checks. For example, create `.taplo.toml`
+at the repository root for Taplo-based editors:
+
+```toml
+[[rule]]
+include = ["config/*.toml"]
+
+[rule.schema]
+path = "./config/schema.json"
+```
+
+The schema comes from `AppConfig` and its nested Rust types. It preserves field
+names, required fields, defaults, network names, and tagged alert rules.
+It excludes the internal `test_horizon_base_url` field.
+
+The schema describes the configuration structure. Runtime validation also checks
+value ranges, cross-field rules, environment variables, and files on disk. Continue
+to run this command before monitoring:
+
+```bash
+txwatch --config config/my-config.toml validate
+```
+
+See [CONTRIBUTING.md](../CONTRIBUTING.md#configuration-schema) to regenerate the
+committed schema after configuration changes.
+
 ## Top-level options
 
 | Key | Type | Description |
@@ -54,6 +95,7 @@ independent: `rules`, `webhook_url`, and `network` apply only to that contract.
 | `allow_internal_webhook_urls` | no | Per-contract opt-out of SSRF protection for local webhook development. Overrides the top-level setting. |
 | `webhook_timeout_seconds` | no | Per-contract override of the webhook delivery timeout, in seconds. Falls back to the top-level `webhook_timeout_seconds` (default: `15`). |
 | `max_alerts_per_minute` | no | Per-contract alert rate limit, in alerts per minute. When unset, no per-contract limit is applied (only the global `max_alerts_per_cycle` applies). See [Alert rate limiting](#alert-rate-limiting). |
+| `alert_cooldown_secs` | no | Suppress repeated alerts with the same rule type for this many seconds. Unset disables cooldown; cooldown state is in-memory and resets when TxWatch restarts. |
 | `cursor_alias` | no | Former `label` of this contract, used to migrate the persisted cursor when a contract is renamed. See [Migrating cursors for renamed contracts](#migrating-cursors-for-renamed-contracts). |
 | `tags` | array of strings (optional) | Arbitrary labels attached to this contract, included in alert payloads for routing/filtering. |
 
@@ -84,6 +126,15 @@ Behavior:
   `WARN` level with the contract label and the number of suppressed alerts, so
   you can detect and tune overly broad rules.
 - The limit is independent of the global `max_alerts_per_cycle`; both apply.
+
+### Alert cooldown
+
+Set `alert_cooldown_secs` on a contract to deliver at most one alert for each
+rule type during the configured interval. For example, `alert_cooldown_secs = 300`
+allows one `LargeTransfer` alert and one `FunctionCalled` alert every five minutes;
+one rule type does not suppress another. Cooldown timestamps are kept in memory
+and reset when TxWatch restarts. Cooldown begins when delivery is attempted, even
+if the webhook ultimately fails; dry-run matches do not start a cooldown.
 
 ### Migrating cursors for renamed contracts
 

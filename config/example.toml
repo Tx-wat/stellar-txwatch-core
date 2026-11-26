@@ -11,6 +11,7 @@ webhook_url = "https://hooks.example.com/my-webhook"
 # webhook_secret = "my-secret-token"   # optional: HMAC-SHA256 signature sent as X-TxWatch-Signature header
 # horizon_url = "https://horizon-testnet.stellar.org"   # optional: per-contract Horizon URL override (defaults to the network's public Horizon)
 # webhook_rule_filter = ["LargeTransfer", "TransactionFailed"]   # optional: only deliver alerts whose rule_type is in this list; empty list (default) delivers all rule types
+# alert_cooldown_secs = 300   # optional: suppress repeated alerts of the same rule type for 5 minutes
 
   [[contracts.rules]]
   type          = "LargeTransfer"

@@ -345,6 +345,7 @@ mod tests {
             webhook_headers: Default::default(),
             horizon_url: None,
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
             max_alerts_per_minute: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,

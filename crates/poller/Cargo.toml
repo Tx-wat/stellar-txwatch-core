@@ -7,7 +7,7 @@ publish = false
 
 [features]
 # Enable Prometheus metrics counters and optional /metrics HTTP endpoint.
-metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+metrics = ["dep:prometheus", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "txwatch-notifier/metrics"]
 
 [dependencies]
 txwatch-config   = { path = "../config" }
@@ -28,4 +28,5 @@ http-body-util   = { version = "0.1", optional = true }
 [dev-dependencies]
 wiremock         = "0.6"
 tracing-subscriber = { workspace = true }
+tracing-test     = { version = "0.2", features = ["no-env-filter"] }
 tokio            = { workspace = true }

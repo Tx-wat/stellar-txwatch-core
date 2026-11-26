@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_path_to_error::Deserializer as PathDeserializer;
@@ -97,7 +98,7 @@ impl fmt::Display for ContractType {
 
 // ── Network ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
     Mainnet,
@@ -165,7 +166,7 @@ impl FromStr for Network {
 
 // ── AlertRule ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum AlertRule {
     AnyTransaction,
@@ -473,7 +474,7 @@ impl AlertRule {
 /// Optional mutual-TLS settings for webhook delivery to one contract.
 /// All paths point to PEM files and are checked for existence at validation time.
 /// The private key contents are never logged.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// PEM client certificate presented to the webhook receiver.
@@ -552,9 +553,63 @@ impl TlsConfig {
     }
 }
 
+// ── SecretString ──────────────────────────────────────────────────────────────
+
+/// A string holding sensitive material (e.g. a webhook signing secret).
+///
+/// `Debug` and `Display` always print `<redacted>`, so the value can never leak
+/// through `{:?}` / `{}` formatting in logs, panics or error contexts. Use
+/// [`SecretString::expose_secret`] (or deref to `&str`) at the single point
+/// where the raw value is actually needed, e.g. HMAC signing.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the raw secret value. Never log the result.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for SecretString {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl fmt::Display for SecretString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 // ── WatchedContract ───────────────────────────────────────────────────────────
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WatchedContract {
     pub label: String,
@@ -564,7 +619,8 @@ pub struct WatchedContract {
     pub webhook_url: String,
     /// Optional secret sent as X-TxWatch-Secret header on every webhook POST.
     /// Supports `${ENV_VAR}` interpolation (e.g. `webhook_secret = "${MY_SECRET}"`).
-    pub webhook_secret: Option<String>,
+    /// Wrapped in [`SecretString`] so `{:?}` formatting never prints the value.
+    pub webhook_secret: Option<SecretString>,
     #[serde(default)]
     pub webhook_headers: HashMap<String, String>,
     /// Test-only: override the Horizon base URL. Never read from TOML (`serde(skip)`) —
@@ -578,6 +634,10 @@ pub struct WatchedContract {
     /// Unset means unlimited (or the global cap, if configured).
     #[serde(default)]
     pub max_alerts_per_cycle: Option<u64>,
+    /// Suppress repeated alerts of the same rule type for this many seconds.
+    /// Unset disables cooldown suppression. The timer is in-memory and resets on restart.
+    #[serde(default)]
+    pub alert_cooldown_secs: Option<u64>,
     #[serde(default)]
     pub max_alerts_per_minute: Option<u64>,
     #[serde(default)]
@@ -772,6 +832,13 @@ impl WatchedContract {
             );
         }
 
+        if self.alert_cooldown_secs == Some(0) {
+            bail!(
+                "contract '{}': alert_cooldown_secs must be >= 1 when set",
+                self.label
+            );
+        }
+
         if self.webhook_timeout_seconds == Some(0) {
             bail!(
                 "contract '{}': webhook_timeout_seconds must be >= 1 when set",
@@ -904,7 +971,7 @@ pub const MAX_CONTRACTS: usize = 100;
 //    needless ceremony and break test ergonomics across the workspace.
 // 3. Deserialization: Serde deserialization directly into the struct remains idiomatic and clean;
 //    runtime validation via `validate()` provides richer error reporting with field contexts.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub poll_interval_seconds: u64,
@@ -1065,6 +1132,13 @@ fn resolve_env_interpolation(value: &str) -> Result<String> {
 }
 
 impl AppConfig {
+    /// Generate a JSON Schema for the configuration's deserialized structure.
+    /// Runtime checks such as file existence and cross-field validation still
+    /// require `validate()` or `from_file()`.
+    pub fn json_schema() -> schemars::schema::RootSchema {
+        schemars::schema_for!(Self)
+    }
+
     fn resolve_env_vars(&mut self) -> Result<()> {
         for contract in &mut self.contracts {
             if let Some(secret) = &contract.webhook_secret {
@@ -1073,7 +1147,7 @@ impl AppConfig {
                     // Log only the variable name, never the resolved value.
                     tracing::debug!("webhook secret loaded from env var {}", var);
                 }
-                contract.webhook_secret = Some(resolved);
+                contract.webhook_secret = Some(SecretString::from(resolved));
             }
             for (name, value) in &mut contract.webhook_headers {
                 *value = resolve_env_interpolation(value).map_err(|_| {
@@ -1379,6 +1453,7 @@ mod tests {
             test_horizon_base_url: None,
             horizon_url: None,
             max_alerts_per_cycle: None,
+            alert_cooldown_secs: None,
             webhook_timeout_seconds: None,
             allow_internal_webhook_urls: None,
             tags: None,
@@ -1594,6 +1669,37 @@ webhook_url = "https://example.com/hook"
         let mut c = valid_contract();
         assert!(c.max_alerts_per_cycle.is_none());
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn alert_cooldown_secs_defaults_to_none_and_parses_from_toml() {
+        let raw = r#"
+            label = "x"
+            contract_id = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            network = "testnet"
+            webhook_url = "https://example.com/hook"
+            [[rules]]
+            type = "AnyTransaction"
+        "#;
+        let contract: WatchedContract = toml::from_str(raw).unwrap();
+        assert_eq!(contract.alert_cooldown_secs, None);
+
+        let contract: WatchedContract = toml::from_str(
+            &raw.replace("webhook_url =", "alert_cooldown_secs = 60\nwebhook_url ="),
+        )
+        .unwrap();
+        assert_eq!(contract.alert_cooldown_secs, Some(60));
+    }
+
+    #[test]
+    fn rejects_zero_alert_cooldown_secs() {
+        let mut contract = valid_contract();
+        contract.alert_cooldown_secs = Some(0);
+        let err = contract.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("alert_cooldown_secs must be >= 1"),
+            "got: {err}"
+        );
     }
 
     /// #269: the global cap and per-contract override both parse from TOML.
@@ -2772,6 +2878,7 @@ webhook_url = "https://example.com/hook"
                     test_horizon_base_url: None,
                     horizon_url: None,
                     max_alerts_per_cycle: None,
+                    alert_cooldown_secs: None,
                     webhook_timeout_seconds: None,
                     allow_internal_webhook_urls: None,
                     tags: None,

@@ -17,4 +17,6 @@ RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf && \
 # Runtime stage: distroless base (CA certificates, no shell, non-root user)
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /build/txwatch /usr/local/bin/txwatch
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/txwatch", "healthcheck"]
 ENTRYPOINT ["txwatch"]

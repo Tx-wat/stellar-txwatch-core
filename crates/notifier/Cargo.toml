@@ -5,11 +5,16 @@ license = "Apache-2.0"
 edition = "2021"
 publish   = false
 
+[features]
+metrics = ["dep:prometheus"]
+
 [dependencies]
 txwatch-config = { path = "../config" }
 txwatch-rules = { path = "../rules" }
 reqwest       = { workspace = true, features = ["native-tls"] }
+serde         = { workspace = true }
 serde_json    = { workspace = true }
+flate2        = "1"
 anyhow        = { workspace = true }
 tokio         = { workspace = true }
 tracing       = { workspace = true }
@@ -17,6 +22,7 @@ chrono        = { workspace = true }
 hmac          = { workspace = true }
 sha2          = { workspace = true }
 hex           = { workspace = true }
+prometheus    = { version = "0.13", default-features = false, optional = true }
 
 [dev-dependencies]
 wiremock      = "0.6"
